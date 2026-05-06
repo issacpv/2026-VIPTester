@@ -131,3 +131,83 @@ def test_build_with_ground_face_pins_those_tiles(main_window):
     ds = build_dynamics_simulator_from_lattice(lattice)
     # At least one tile should be pinned for any non-degenerate lattice.
     assert len(ds.fixed_tiles) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Mode toggle (Kinematic / Dynamic) — added in M2.7
+# ---------------------------------------------------------------------------
+
+def test_panel_has_mode_toggle(main_window):
+    panel = main_window.simulation_panel
+    assert hasattr(panel, "mode_kinematic_radio")
+    assert hasattr(panel, "mode_dynamic_radio")
+    assert panel.mode_kinematic_radio.isChecked()  # default
+    assert not panel.mode_dynamic_radio.isChecked()
+
+
+def test_dynamics_config_box_visible_only_in_dynamic_mode(main_window):
+    """Use ``isHidden`` (explicit show/hide state) rather than
+    ``isVisible`` because under ``QT_QPA_PLATFORM=offscreen`` the dock's
+    parent isn't on-screen, so ``isVisible`` reports False even for
+    widgets that are explicitly shown."""
+    panel = main_window.simulation_panel
+    assert panel._dynamics_config_box.isHidden()
+    panel.mode_dynamic_radio.setChecked(True)
+    assert not panel._dynamics_config_box.isHidden()
+    panel.mode_kinematic_radio.setChecked(True)
+    assert panel._dynamics_config_box.isHidden()
+
+
+def test_running_dynamic_auto_switches_to_dynamic_mode(main_window):
+    panel = main_window.simulation_panel
+    panel._lattice.dynamics_state["config"]["duration"] = 0.05
+    assert panel._scrub_mode == "kinematic"
+    panel.run_dynamic_button.click()
+    assert panel._scrub_mode == "dynamic"
+    assert panel.mode_dynamic_radio.isChecked()
+
+
+def test_slider_in_dynamic_mode_scrubs_through_time(main_window):
+    """Moving the slider in dynamic mode should change the View3D pose
+    by indexing into ``dynamics_result.poses`` rather than the
+    kinematic ``sim_result``."""
+    panel = main_window.simulation_panel
+    panel._lattice.dynamics_state["config"]["duration"] = 0.05
+    panel.run_dynamic_button.click()
+    res = panel._dynamics_result
+    assert res is not None and res.poses.shape[0] >= 2
+
+    # Move the slider to 50%; the resolved index should be near n/2.
+    midpoint = int((panel.slider.minimum() + panel.slider.maximum()) / 2)
+    panel.slider.setValue(midpoint)
+    # Verify panel's internal dispatcher routed via dynamic path.
+    assert panel._scrub_mode == "dynamic"
+
+
+def test_ground_face_combo_writes_through_to_lattice(main_window):
+    panel = main_window.simulation_panel
+    panel.mode_dynamic_radio.setChecked(True)   # so the combo is visible & wired
+    # Pick "-y" via its data role.
+    idx = panel.ground_face_combo.findData("-y")
+    assert idx >= 0
+    panel.ground_face_combo.setCurrentIndex(idx)
+    assert panel._lattice.dynamics_state["ground_face"] == "-y"
+
+    # Reset to none.
+    idx = panel.ground_face_combo.findData("none")
+    panel.ground_face_combo.setCurrentIndex(idx)
+    assert panel._lattice.dynamics_state["ground_face"] is None
+
+
+def test_ground_face_change_invalidates_dynamic_result(main_window):
+    """Changing the ground face mid-session should drop a stale
+    dynamics result so the readout doesn't lie about the new config."""
+    panel = main_window.simulation_panel
+    panel._lattice.dynamics_state["config"]["duration"] = 0.05
+    panel.run_dynamic_button.click()
+    assert panel._dynamics_result is not None
+
+    panel.mode_dynamic_radio.setChecked(True)
+    idx = panel.ground_face_combo.findData("-y")
+    panel.ground_face_combo.setCurrentIndex(idx)
+    assert panel._dynamics_result is None

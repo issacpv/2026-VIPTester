@@ -37,6 +37,9 @@ from PyQt6.QtWidgets import (
     QSlider,
     QDoubleSpinBox,
     QPushButton,
+    QRadioButton,
+    QButtonGroup,
+    QComboBox,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvas
@@ -127,6 +130,11 @@ class SimulationPanel(QDockWidget):
         # ---- M2 dynamic-sim state ----------------------------------------
         self._dynamics_result = None      # most recent DynamicsResult, if any
         self._dynamics_error  = None      # exception text from last Run Dynamic
+        # Which trajectory the slider scrubs / the plot shows. Set by
+        # the Mode radio at the top of the panel; defaults to the
+        # existing kinematic behaviour so nothing changes for users
+        # who never click Dynamic.
+        self._scrub_mode      = "kinematic"  # "kinematic" or "dynamic"
 
         # ---- play state --------------------------------------------------
         self._play_timer = QTimer(self)
@@ -139,7 +147,9 @@ class SimulationPanel(QDockWidget):
         outer = QVBoxLayout(body)
         outer.setContentsMargins(8, 8, 8, 8)
 
+        self._build_mode_toggle(outer)
         self._build_run_row(outer)
+        self._build_dynamics_config_box(outer)
         self._build_joint_slider_box(outer)
         self._build_plot(outer)
         self._build_readout(outer)
@@ -153,6 +163,53 @@ class SimulationPanel(QDockWidget):
     # ==================================================================
     # Construction helpers
     # ==================================================================
+
+    def _build_mode_toggle(self, outer):
+        """Mode radio: Kinematic / Dynamic. Drives which trajectory
+        the slider scrubs and what the plot displays."""
+        row = QWidget(self)
+        layout = QHBoxLayout(row); layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel("<b>Mode:</b>"))
+        self.mode_kinematic_radio = QRadioButton("Kinematic", row)
+        self.mode_dynamic_radio   = QRadioButton("Dynamic",   row)
+        self.mode_kinematic_radio.setChecked(True)
+        self.mode_kinematic_radio.setToolTip(
+            "Quasi-static θ-sweep — Poisson's ratio, locking criterion")
+        self.mode_dynamic_radio.setToolTip(
+            "Newtonian dynamic sim — scrub slider through time")
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self.mode_kinematic_radio, 0)
+        self._mode_group.addButton(self.mode_dynamic_radio,   1)
+        self._mode_group.idToggled.connect(self._on_mode_toggled)
+        layout.addWidget(self.mode_kinematic_radio)
+        layout.addWidget(self.mode_dynamic_radio)
+        layout.addStretch(1)
+        outer.addWidget(row)
+
+    def _build_dynamics_config_box(self, outer):
+        """Compact dynamics config: ground-face dropdown.
+
+        Force-vector editing is intentionally not in v1 — users edit
+        ``lattice.dynamics_state['forces']`` via Python or preset JSON.
+        Adding a force-table widget is a separate patch (deferred from
+        the original M2 plan).
+        """
+        self._dynamics_config_box = QGroupBox("Dynamics setup", self)
+        form = QFormLayout(self._dynamics_config_box)
+
+        self.ground_face_combo = QComboBox(self._dynamics_config_box)
+        for label in ("none", "+x", "-x", "+y", "-y", "+z", "-z"):
+            self.ground_face_combo.addItem(label, label)
+        self.ground_face_combo.setToolTip(
+            "Which face of the lattice's bbox sits on the ground plane. "
+            "Tiles touching that face are auto-pinned during the sim.")
+        self.ground_face_combo.currentIndexChanged.connect(
+            self._on_ground_face_changed)
+        form.addRow(QLabel("Ground face"), self.ground_face_combo)
+
+        outer.addWidget(self._dynamics_config_box)
+        # Hidden by default; only visible in Dynamic mode.
+        self._dynamics_config_box.setVisible(False)
 
     def _build_run_row(self, outer):
         row = QWidget(self)
@@ -282,6 +339,12 @@ class SimulationPanel(QDockWidget):
         try:
             self.slider.setValue(int(round(slider_deg * _SLIDER_SCALE)))
             self.spin.setValue(slider_deg)
+            # Sync the ground-face combo from the lattice's dynamics_state.
+            gf = self._lattice.dynamics_state.get("ground_face")
+            target = "none" if gf is None else str(gf)
+            gi = self.ground_face_combo.findData(target)
+            if gi >= 0:
+                self.ground_face_combo.setCurrentIndex(gi)
         finally:
             self._suspend = False
         self._drive_pose_from_slider(slider_deg)
@@ -375,12 +438,22 @@ class SimulationPanel(QDockWidget):
         try:
             ds = build_dynamics_simulator_from_lattice(self._lattice)
             self._dynamics_result = ds.simulate()
+            # Stash the tile system so the slider can drive the View3D
+            # without rebuilding it. The dynamics solver and kinematic
+            # solver use the same ``TileSystem.from_lattice`` output.
+            self._tile_system = ds.tile_system
         except Exception as exc:
             self._dynamics_error = (
                 f"{type(exc).__name__}: {exc}\n\n"
                 f"{traceback.format_exc().splitlines()[-1]}"
             )
             self._dynamics_result = None
+        # If the user ran Dynamic explicitly, switch the scrub to
+        # Dynamic mode so they can see the trajectory.
+        if self._dynamics_result is not None and not self.mode_dynamic_radio.isChecked():
+            self.mode_dynamic_radio.setChecked(True)
+        self._update_plot()
+        self._drive_pose_from_slider(self._slider_value_deg())
         self._update_state_dependent_ui()
 
     # ==================================================================
@@ -388,6 +461,14 @@ class SimulationPanel(QDockWidget):
     # ==================================================================
 
     def _update_plot(self) -> None:
+        # Pick what to plot based on the current scrub mode.
+        if self._scrub_mode == "dynamic":
+            self._update_plot_dynamic()
+            return
+        self._update_plot_kinematic()
+
+    def _update_plot_kinematic(self) -> None:
+        self._ax.set_xlabel("Joint angle θ (degrees)")
         if self._sim_result is None:
             if self._plot_line is not None:
                 self._plot_line.remove()
@@ -405,6 +486,36 @@ class SimulationPanel(QDockWidget):
             (self._plot_line,) = self._ax.plot(x_deg, y, color="steelblue")
         else:
             self._plot_line.set_data(x_deg, y)
+        self._ax.relim(); self._ax.autoscale_view(scalex=False, scaley=True)
+        self._ax.set_xlim(_SLIDER_MIN_DEG, _SLIDER_MAX_DEG)
+        self._canvas.draw_idle()
+
+    def _update_plot_dynamic(self) -> None:
+        """Plot bbox extent (along the dynamic sim's load axis) vs.
+        slider scrub position. The slider here is a 0–100% time
+        cursor, mapped onto ``[_SLIDER_MIN_DEG, _SLIDER_MAX_DEG]`` so
+        the same widget can drive either trajectory."""
+        self._ax.set_xlabel("Time (slider 0–100%)")
+        if self._dynamics_result is None:
+            if self._plot_line is not None:
+                self._plot_line.remove()
+                self._plot_line = None
+            self._canvas.draw_idle()
+            return
+        r = self._dynamics_result
+        # Pick the same axial direction the dynamics solver used (gravity
+        # / load-axis convention: axis-1 in 2D, axis-1 in 3D).
+        axial = 1
+        n = r.bbox_extents.shape[0]
+        if n < 2:
+            return
+        scrub_pos = np.linspace(_SLIDER_MIN_DEG, _SLIDER_MAX_DEG, n)
+        y = r.bbox_extents[:, axial]
+        if self._plot_line is None:
+            (self._plot_line,) = self._ax.plot(scrub_pos, y, color="darkorange")
+        else:
+            self._plot_line.set_data(scrub_pos, y)
+            self._plot_line.set_color("darkorange")
         self._ax.relim(); self._ax.autoscale_view(scalex=False, scaley=True)
         self._ax.set_xlim(_SLIDER_MIN_DEG, _SLIDER_MAX_DEG)
         self._canvas.draw_idle()
@@ -584,13 +695,46 @@ class SimulationPanel(QDockWidget):
 
     def _drive_pose_from_slider(self, slider_deg: float) -> None:
         """If a fresh simulation result is present, render the pose at
-        the trajectory sample nearest the slider's θ. Always update
-        the plot marker (so the marker still tracks the slider even
-        when no result is available)."""
+        the trajectory sample nearest the slider's position. Always
+        update the plot marker (so the marker still tracks the slider
+        even when no result is available).
+
+        Dispatches on ``self._scrub_mode``:
+
+        - ``"kinematic"`` — slider degrees map to θ via the SPEC §6.2
+          convention helpers; pose comes from
+          ``self._sim_result.poses``.
+        - ``"dynamic"``   — slider degrees are treated as a 0–100% scrub
+          across the trajectory time grid; pose comes from
+          ``self._dynamics_result.poses``.
+        """
         self._update_marker(slider_deg)
-        if self._sim_result is None or self._is_outdated:
-            return
         if self._view_3d is None:
+            return
+        if self._scrub_mode == "dynamic":
+            if self._dynamics_result is None:
+                return
+            poses = self._dynamics_result.poses
+            n = poses.shape[0]
+            if n == 0:
+                return
+            frac = max(0.0, min(1.0,
+                                 (slider_deg - _SLIDER_MIN_DEG)
+                                 / max(_SLIDER_MAX_DEG - _SLIDER_MIN_DEG, 1e-9)))
+            idx = int(round(frac * (n - 1)))
+            try:
+                # Reuse the kinematic tile_system if present (the
+                # dynamics solver is built on the same TileSystem).
+                ts = self._tile_system
+                if ts is None:
+                    from auxetic import TileSystem
+                    ts = TileSystem.from_lattice(self._lattice)
+                self._view_3d.show_pose(ts, poses[idx])
+            except Exception:
+                pass
+            return
+        # Kinematic (default).
+        if self._sim_result is None or self._is_outdated:
             return
         theta_rad = slider_to_simulator_theta(slider_deg)
         idx = int(np.argmin(np.abs(self._sim_result.theta_samples - theta_rad)))
@@ -599,6 +743,40 @@ class SimulationPanel(QDockWidget):
                                      self._sim_result.poses[idx])
         except Exception:
             pass
+
+    # ==================================================================
+    # Mode toggle handler
+    # ==================================================================
+
+    def _on_mode_toggled(self, button_id: int, checked: bool) -> None:
+        if not checked:
+            return   # only react to the "becoming-checked" half of the toggle
+        self._scrub_mode = "dynamic" if button_id == 1 else "kinematic"
+        self._dynamics_config_box.setVisible(self._scrub_mode == "dynamic")
+        # Refresh the plot for the new mode and re-drive the slider so
+        # the View3D pose updates to the right trajectory.
+        self._update_plot()
+        self._drive_pose_from_slider(self._slider_value_deg())
+        self._update_state_dependent_ui()
+
+    # ==================================================================
+    # Ground-face handler
+    # ==================================================================
+
+    def _on_ground_face_changed(self, _idx: int) -> None:
+        if self._suspend:
+            return
+        label = str(self.ground_face_combo.currentData())
+        new_value = None if label == "none" else label
+        # Direct mutation of dynamics_state — this isn't a
+        # geometry-changing edit so it doesn't go through the undo
+        # stack. (Force-list edits will, when that UI lands.)
+        if self._lattice.dynamics_state.get("ground_face") != new_value:
+            self._lattice.dynamics_state["ground_face"] = new_value
+            # Clear stale dynamic result; user must rerun.
+            self._dynamics_result = None
+            self._dynamics_error  = None
+            self._update_state_dependent_ui()
 
     # ==================================================================
     # Play / animate
