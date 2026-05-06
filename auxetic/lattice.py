@@ -1,0 +1,489 @@
+"""High-level Lattice class.
+
+A Lattice owns the point cloud, its triangulation, the shrink ratio, and
+the mode. It also owns the **rigid lattice rotation** and the **joint
+angle** as two distinct fields per SPEC §6.3 — these mean different
+things and must never be conflated:
+
+- ``rigid_rotation`` (SPEC §6.1) — orients the whole lattice in world
+  space. Applied at render time and at export time. Does **not** modify
+  ``points``.
+- ``joint_angle``   (SPEC §6.2) — internal kirigami DOF in radians.
+  Affects tile positions via the simulation (not yet implemented).
+- ``flipped``       — special-cased mirror; redundant-with-rotation
+  but stored separately so the UI can show a "flipped" indicator
+  without inspecting the quaternion.
+
+The class exposes:
+
+- ``regenerate()`` — re-roll points from scratch (using ``mode``,
+  ``n_points``, and the optional ``seed``); also (re)captures
+  ``points_original``.
+- ``regenerate_from_points(new_points)`` — keep the user's edits and
+  re-triangulate around them. Does NOT touch ``points_original``.
+- ``reset_to_original()`` — restore ``points`` to the snapshot taken
+  during the last ``regenerate()`` (or load).
+- ``world_transform()`` — 4×4 homogeneous matrix combining ``flipped``
+  and ``rigid_rotation``, applied around the lattice centroid (0.5,
+  0.5, 0.5). Joint angle is **not** part of this matrix (per SPEC §6.3).
+- ``transformed_points()`` — points after ``world_transform`` (used by
+  views and exports). Stored points are never modified.
+- ``to_stl()`` / ``to_obj()`` / ``to_scad()`` / ``to_kirigami()`` —
+  exporters that consume the current points + triangulation, with
+  ``world_transform`` applied to vertex positions per SPEC §9.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Iterable
+
+import numpy as np
+from scipy.spatial import Delaunay
+from scipy.spatial.transform import Rotation
+
+from . import geometry as _geom
+from . import tiles as _tiles
+from . import export as _export
+
+
+# Modes whose points live in 3D (n×3); everything else is 2D (n×2).
+# Modes 7, 8, 9 are mesh-import variants of 1, 2, 3 respectively.
+_3D_MODES = (3, 6, 9)
+_DELAUNAY_MODES = (1, 2, 3, 7, 8, 9)  # modes that re-Delaunay on each retriangulation
+
+# Lattice-space centroid that all rigid rotations / flips pivot around.
+_CENTROID = np.array([0.5, 0.5, 0.5])
+
+
+class Lattice:
+    def __init__(self, mode=1, n_points=5, ratio=0.35, nz_layers=2, seed=None,
+                 ngon_thickness: float | None = None,
+                 hub_size_factor: float | None = None,
+                 joint_sphere_radius: float | None = None,
+                 strut_radius: float | None = None,
+                 # M1 generation extensions — every default below is the
+                 # "no change vs. V20" value, so the regression suite
+                 # produces byte-identical output without these kwargs.
+                 density_axis: str = "none",
+                 density_law:  str = "uniform",
+                 density_strength: float = 1.0,
+                 edge_flips=None,
+                 mesh_path: str | None = None,
+                 mesh_vertices: np.ndarray | None = None,
+                 unit_scale_cm: float = 1.0):
+        self.mode      = mode
+        self.n_points  = n_points
+        self.ratio     = ratio
+        self.nz_layers = nz_layers
+        self.seed      = seed
+
+        # Shape parameters per SPEC §5.1's ``shape_params`` block.
+        self.ngon_thickness      = (_geom.NGON_THICKNESS      if ngon_thickness      is None else float(ngon_thickness))
+        self.hub_size_factor     = (_geom.HUB_SIZE_FACTOR     if hub_size_factor     is None else float(hub_size_factor))
+        self.joint_sphere_radius = (_geom.JOINT_SPHERE_RADIUS if joint_sphere_radius is None else float(joint_sphere_radius))
+        self.strut_radius        = (_geom.STRUT_RADIUS        if strut_radius        is None else float(strut_radius))
+
+        # ---- M1 generation extensions ------------------------------------
+        # Density gradient — biases random sample distribution along an
+        # axis. Active only for random Delaunay modes (1, 2, 3); grid and
+        # mesh-import modes ignore these knobs.
+        self.density_axis     = str(density_axis)
+        self.density_law      = str(density_law)
+        self.density_strength = float(density_strength)
+
+        # Set of (i, j) edge tuples (i < j) currently flipped from the
+        # canonical Delaunay diagonal. Applied by ``apply_edge_flips``
+        # after each (re)triangulation. 2D-only; ignored for 3D modes.
+        self.edge_flips: set[tuple[int, int]] = set()
+        if edge_flips:
+            for e in edge_flips:
+                a, b = sorted((int(e[0]), int(e[1])))
+                self.edge_flips.add((a, b))
+
+        # Mesh-import state. ``mesh_vertices`` is normalised to [0, 1]^3
+        # by ``Lattice.from_mesh``; ``mesh_path`` is informational.
+        self.mesh_path = mesh_path
+        self.mesh_vertices = (np.asarray(mesh_vertices, dtype=float)
+                              if mesh_vertices is not None else None)
+
+        # Lattice unit -> physical scale. Used by the M2 dynamic
+        # simulator to convert default forces/masses into SI; the
+        # geometry pipeline itself is unit-agnostic.
+        self.unit_scale_cm = float(unit_scale_cm)
+
+        # ---- M2 dynamic-simulator state ---------------------------------
+        # Stored as a plain dict so save/load pickup is straightforward.
+        # Defaults are tuned for STABILITY rather than realism: zero
+        # gravity and modest constraint stiffness so a "Run Dynamic"
+        # click on a fresh lattice doesn't immediately blow up under
+        # explicit Euler. Users opt in to gravity / stiffer constraints
+        # after they've added forces and a ground face.
+        self.dynamics_state: dict = {
+            "forces":              [],     # list of dicts (see preset v4)
+            "ground_face":         None,   # "+x"/"-x"/"+y"/"-y"/"+z"/"-z"
+            "pre_rotation_quat":   None,   # override view_state.rigid_rotation_quat
+            "pre_joint_angle_deg": None,   # override view_state.joint_angle_deg
+            "fixed_tiles":         [],
+            "config": {
+                "dt":                       1.0e-3,
+                "duration":                 1.0,
+                "joint_stiffness":          1.0e2,
+                "joint_damping":            2.0e0,
+                "gravity_cm_per_s2":        [0.0, 0.0, 0.0],
+                "convergence_kinetic_thresh": 1.0e-5,
+            },
+        }
+
+        # ---- SPEC §6: rotation + joint state ----------------------------
+        # Two distinct concepts per §6.3 — kept in separate fields and
+        # never combined into a single value at any layer (package, GUI,
+        # preset).
+        self.rigid_rotation: Rotation = Rotation.identity()  # §6.1
+        self.joint_angle:    float    = 0.0                  # §6.2 (radians)
+        self.flipped:        bool     = False                # §6.1 special case
+
+        self.metadata: dict = {
+            "name":     "",
+            "created":  "",
+            "modified": "",
+            "notes":    "",
+        }
+
+        self.points: np.ndarray | None = None
+        self.tri = None
+        self.points_original: np.ndarray | None = None
+
+        self._strut_curves    = None
+        self._solid_triangles = None
+        self._joint_positions = None
+
+        self.regenerate()
+
+    # ==================================================================
+    # Construction from imported meshes (modes 7, 8, 9)
+    # ==================================================================
+
+    @classmethod
+    def from_mesh(cls, path, *,
+                   dim,
+                   decimate_to: int | None = None,
+                   ratio: float = 0.35,
+                   nz_layers: int = 2,
+                   seed: int | None = None,
+                   ngon_thickness: float | None = None,
+                   hub_size_factor: float | None = None,
+                   joint_sphere_radius: float | None = None,
+                   strut_radius: float | None = None,
+                   unit_scale_cm: float = 1.0) -> "Lattice":
+        """Build a Lattice from an STL or OBJ file's vertices.
+
+        ``dim`` selects the lattice dimensionality (and therefore which
+        of mode 7 / 8 / 9 is used). Accepts ``2`` / ``"2D"``,
+        ``2.5`` / ``"2.5D"``, or ``3`` / ``"3D"``.
+
+        ``decimate_to`` caps the number of vertices used after dedup;
+        ``None`` means keep them all (use with care for large meshes —
+        Delaunay scales poorly).
+        """
+        from . import mesh_io as _mesh_io
+
+        raw = _mesh_io.read_mesh_vertices(str(path))
+        if raw.shape[0] == 0:
+            raise ValueError(f"No vertices found in mesh: {path!r}")
+        if decimate_to is not None and raw.shape[0] > decimate_to:
+            raw = _mesh_io.decimate_uniform(raw, n=int(decimate_to), seed=seed)
+        norm = _mesh_io.normalize_to_unit_cube(raw)
+
+        mode_map = {2: 7, "2D": 7, "2d": 7,
+                    2.5: 8, "2.5D": 8, "2.5d": 8,
+                    3: 9, "3D": 9, "3d": 9}
+        mode = mode_map.get(dim)
+        if mode is None:
+            raise ValueError(
+                f"dim must be 2, 2.5, 3, or '2D'/'2.5D'/'3D'; got {dim!r}")
+
+        return cls(
+            mode=mode,
+            n_points=int(norm.shape[0]),
+            ratio=ratio,
+            nz_layers=nz_layers,
+            seed=seed,
+            ngon_thickness=ngon_thickness,
+            hub_size_factor=hub_size_factor,
+            joint_sphere_radius=joint_sphere_radius,
+            strut_radius=strut_radius,
+            mesh_path=str(path),
+            mesh_vertices=norm,
+            unit_scale_cm=unit_scale_cm,
+        )
+
+    # ==================================================================
+    # view_state — SPEC §5.1's serializable view block, derived from
+    # the §6 fields. Implemented as a property so a Stage 4 caller
+    # that does ``lat.view_state = {dict}`` still works (the setter
+    # parses the dict back into the real fields).
+    # ==================================================================
+
+    @property
+    def view_state(self) -> dict:
+        """SPEC §5.1 view_state, derived from the §6 fields each call."""
+        quat_xyzw = self.rigid_rotation.as_quat()  # scipy default: [x, y, z, w]
+        quat_wxyz = [float(quat_xyzw[3]), float(quat_xyzw[0]),
+                     float(quat_xyzw[1]), float(quat_xyzw[2])]
+        return {
+            "rigid_rotation_quat": quat_wxyz,
+            "flipped":             bool(self.flipped),
+            "joint_angle_deg":     math.degrees(float(self.joint_angle)),
+        }
+
+    @view_state.setter
+    def view_state(self, value: dict) -> None:
+        if not isinstance(value, dict):
+            raise TypeError("view_state must be a dict")
+        if "rigid_rotation_quat" in value:
+            wxyz = value["rigid_rotation_quat"]
+            xyzw = [float(wxyz[1]), float(wxyz[2]),
+                    float(wxyz[3]), float(wxyz[0])]
+            self.rigid_rotation = Rotation.from_quat(xyzw)
+        if "flipped" in value:
+            self.flipped = bool(value["flipped"])
+        if "joint_angle_deg" in value:
+            self.joint_angle = math.radians(float(value["joint_angle_deg"]))
+
+    # ==================================================================
+    # Internal helpers
+    # ==================================================================
+
+    def _clear_caches(self):
+        self._strut_curves    = None
+        self._solid_triangles = None
+        self._joint_positions = None
+
+    def _set_points_and_tri(self, points: np.ndarray, tri) -> None:
+        self.points   = points
+        self.tri      = tri
+        self.n_points = len(points)
+        self._clear_caches()
+
+    def _triangulate(self, points: np.ndarray):
+        if self.mode in _DELAUNAY_MODES:
+            tri = Delaunay(points)
+        elif self.tri is not None and self.points is not None and len(points) == len(self.points):
+            # Grid modes (4, 5, 6) keep their canonical symmetric simplices
+            # when the user just edits a point — re-Delaunay would discard
+            # the grid's deliberate diagonal layout.
+            tri = self.tri
+        else:
+            tri = Delaunay(points)
+        if self.edge_flips:
+            tri = _geom.apply_edge_flips(tri, points, self.edge_flips)
+        return tri
+
+    # ==================================================================
+    # Re-roll / edit / reset
+    # ==================================================================
+
+    def regenerate(self):
+        if self.seed is not None:
+            np.random.seed(self.seed)
+        if self.mode in (7, 8, 9):
+            if self.mesh_vertices is None:
+                raise RuntimeError(
+                    f"mode {self.mode} requires mesh_vertices — "
+                    f"construct via Lattice.from_mesh()."
+                )
+            points, tri = _geom.points_from_mesh_vertices(
+                self.mesh_vertices, self.mode)
+        else:
+            points, tri = _geom.generate_points(
+                self.n_points, self.mode,
+                density_axis=self.density_axis,
+                density_law=self.density_law,
+                density_strength=self.density_strength,
+            )
+        if self.edge_flips:
+            tri = _geom.apply_edge_flips(tri, points, self.edge_flips)
+        self._set_points_and_tri(points, tri)
+        self.points_original = points.copy()
+        return self
+
+    def regenerate_from_points(self, new_points: np.ndarray) -> None:
+        new_points = np.asarray(new_points, dtype=float)
+        expected_dim = 3 if self.mode in _3D_MODES else 2
+        if new_points.ndim != 2 or new_points.shape[1] != expected_dim:
+            raise ValueError(
+                f"regenerate_from_points: expected (N, {expected_dim}) array "
+                f"for mode {self.mode}, got shape {new_points.shape}"
+            )
+        new_tri = self._triangulate(new_points)
+        self._set_points_and_tri(new_points, new_tri)
+
+    def reset_to_original(self) -> None:
+        """Restore ``self.points`` to the cached ``points_original``.
+
+        ``points_original`` is rewritten by ``regenerate()`` and by the
+        preset loader (which sets it to the as-loaded points). After
+        loading a saved preset, "Reset to Original" returns to the
+        **as-loaded** state, not the as-randomly-generated state from a
+        previous session. ``points_original`` is intentionally not
+        stored in presets — it tracks the most recent regenerate/load
+        checkpoint.
+
+        Note: ``reset_to_original`` does not touch ``rigid_rotation``,
+        ``flipped``, or ``joint_angle`` — those are orientation /
+        simulation state, not point edits."""
+        if self.points_original is None:
+            return
+        original = self.points_original.copy()
+        new_tri = self._triangulate(original)
+        self._set_points_and_tri(original, new_tri)
+
+    # ==================================================================
+    # SPEC §6: world transform (rigid rotation + flip)
+    # ==================================================================
+
+    def world_transform(self, *,
+                         rigid_rotation: Rotation | None = None,
+                         flipped: bool | None = None) -> np.ndarray:
+        """4×4 homogeneous matrix combining ``flipped`` and
+        ``rigid_rotation`` around the lattice centroid (0.5, 0.5, 0.5).
+
+        Order per the SPEC §6 mandate: translate centroid to origin →
+        apply flip → apply rigid_rotation → translate back.
+
+        Joint angle is **not** included — per SPEC §6.3 it is a
+        separate concept that affects tile positions via the simulation,
+        not the rigid orientation.
+
+        Optional ``rigid_rotation`` / ``flipped`` overrides allow a
+        view to compute a live-preview transform during a drag without
+        mutating the lattice."""
+        rigid = self.rigid_rotation if rigid_rotation is None else rigid_rotation
+        flip  = self.flipped         if flipped        is None else flipped
+
+        # T(-c)
+        T_minus = np.eye(4)
+        T_minus[:3, 3] = -_CENTROID
+
+        # Flip = 180° about X when set; identity otherwise. SPEC §6.1
+        # specifies this exact representation.
+        if flip:
+            R_flip_3 = Rotation.from_euler("x", 180, degrees=True).as_matrix()
+        else:
+            R_flip_3 = np.eye(3)
+        R_flip = np.eye(4)
+        R_flip[:3, :3] = R_flip_3
+
+        # Rigid rotation
+        R_rigid = np.eye(4)
+        R_rigid[:3, :3] = rigid.as_matrix()
+
+        # T(+c)
+        T_plus = np.eye(4)
+        T_plus[:3, 3] = _CENTROID
+
+        return T_plus @ R_rigid @ R_flip @ T_minus
+
+    def has_nontrivial_transform(self) -> bool:
+        """True if ``world_transform()`` is *not* the identity matrix.
+        Used by the export path to short-circuit the transform when
+        nothing has actually been rotated — otherwise float drift would
+        break byte-identical export round-trips on identity rotation."""
+        if self.flipped:
+            return True
+        return float(self.rigid_rotation.magnitude()) > 1e-12
+
+    @staticmethod
+    def _apply_matrix(M: np.ndarray, points: np.ndarray) -> np.ndarray:
+        """Apply 4×4 ``M`` to a (N, D) point array (D ∈ {2, 3}). When
+        D=2 the points are lifted to z=0 for the transform and the
+        z-component is dropped on return."""
+        pts = np.asarray(points, dtype=float)
+        if pts.ndim != 2:
+            raise ValueError(f"_apply_matrix expects (N, D) array, got {pts.shape}")
+        n, d = pts.shape
+        if d == 2:
+            pts3 = np.hstack([pts, np.zeros((n, 1))])
+        elif d == 3:
+            pts3 = pts
+        else:
+            raise ValueError(f"_apply_matrix: unsupported point dim {d}")
+        homo = np.hstack([pts3, np.ones((n, 1))])
+        out  = (M @ homo.T).T[:, :3]
+        return out[:, :2] if d == 2 else out
+
+    def transformed_points(self) -> np.ndarray:
+        """``points`` after applying ``world_transform``. Same dim as
+        canonical points (Nx2 or Nx3). Stored points unchanged."""
+        return self._apply_matrix(self.world_transform(), self.points)
+
+    def _transform_collection(self, collection: Iterable, M: np.ndarray) -> list:
+        """Map ``_apply_matrix`` over an iterable of point arrays
+        (e.g. triangle list, strut curves, tile vertex arrays)."""
+        return [self._apply_matrix(M, np.asarray(item, dtype=float))
+                for item in collection]
+
+    # ==================================================================
+    # Export pipeline — applies world_transform per SPEC §9
+    # ==================================================================
+
+    def _ensure_export_geometry(self):
+        if self._strut_curves is None:
+            (self._strut_curves,
+             self._solid_triangles,
+             self._joint_positions) = _geom.collect_export_geometry(
+                self.points, self.tri, self.ratio, self.mode, self.nz_layers)
+
+    def build_export_triangles(self, **kwargs):
+        """Final triangle list including strut tubes + joint spheres."""
+        self._ensure_export_geometry()
+        return _geom.build_export_triangles(
+            self._strut_curves,
+            self._solid_triangles,
+            self._joint_positions,
+            **kwargs)
+
+    def to_stl(self, path, verbose=True, **build_kwargs):
+        triangles = self.build_export_triangles(verbose=verbose, **build_kwargs)
+        if self.has_nontrivial_transform():
+            triangles = self._transform_collection(triangles, self.world_transform())
+        _export.export_stl_direct(path, triangles, verbose=verbose)
+        return triangles
+
+    def to_obj(self, path, verbose=True, **build_kwargs):
+        triangles = self.build_export_triangles(verbose=verbose, **build_kwargs)
+        if self.has_nontrivial_transform():
+            triangles = self._transform_collection(triangles, self.world_transform())
+        _export.export_obj_direct(path, triangles, verbose=verbose)
+        return triangles
+
+    def to_scad(self, path, verbose=True, **build_kwargs):
+        self._ensure_export_geometry()
+        strut_curves = self._strut_curves
+        triangles = self.build_export_triangles(verbose=verbose, **build_kwargs)
+        if self.has_nontrivial_transform():
+            M = self.world_transform()
+            strut_curves = self._transform_collection(strut_curves, M)
+            triangles    = self._transform_collection(triangles, M)
+        _export.export_to_scad(path, strut_curves, triangles,
+                               mode=self.mode, n_points=self.n_points,
+                               ratio=self.ratio, verbose=verbose)
+        return triangles
+
+    def collect_kirigami(self):
+        tiles, source = _tiles.collect_kirigami_tiles(
+            self.points, self.tri, self.ratio, self.mode, self.nz_layers)
+        constraints = _tiles.build_kirigami_constraints(tiles, source)
+        return tiles, source, constraints
+
+    def to_kirigami(self, vertices_path, constraints_path, verbose=True):
+        """Kirigami export. Per SPEC §9, vertices are emitted in the
+        oriented frame; constraints are connectivity (tile/vertex
+        indices) so they're unaffected by rotation."""
+        tiles, source, constraints = self.collect_kirigami()
+        if self.has_nontrivial_transform():
+            tiles = self._transform_collection(tiles, self.world_transform())
+        _export.export_kirigami_vertices(vertices_path, tiles, verbose=verbose)
+        _export.export_kirigami_constraints(constraints_path, constraints, verbose=verbose)
+        return tiles, constraints

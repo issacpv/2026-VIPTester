@@ -1,0 +1,693 @@
+"""Newtonian rigid-body simulator for kirigami lattices (M2).
+
+This is the *dynamic* counterpart to :mod:`auxetic.simulation`. The
+kinematic solver in ``simulation.py`` answers "what does the lattice
+look like at a given joint angle θ" by projecting onto the constraint
+manifold; this module answers "how does the lattice respond when I
+apply a force here, with mass and time and contact" by integrating
+Newton's equations.
+
+Algorithm
+---------
+Semi-implicit Euler with **Baumgarte-stabilized soft constraints**.
+Tile constraints (the ``Constraint`` records that pin one tile vertex
+to another) are enforced by a penalty potential rather than projected
+hard each step — gives a single explicit time-step formulation that
+matches the rest of the geometry pipeline's numpy/scipy stack with no
+new dependencies (no PyBullet, no MuJoCo).
+
+For each constraint with residual ``r = (R_a v_a + t_a) - (R_b v_b + t_b)``,
+the generalised force in pose-space is
+
+    F_q = -k * Jᵀ r   -   c * Jᵀ J ẋ
+
+where ``J`` is the constraint Jacobian and ``ẋ`` is the pose-rate
+(reused from :class:`auxetic.simulation.Simulator`). The first term is
+a spring pulling the residual to zero; the second damps motion along
+the same direction. The pair behaves like a critically damped
+oscillator when ``c ≈ 2*sqrt(k * m_eff)``.
+
+Pose layout
+-----------
+Same as :class:`Simulator`:
+
+- 2D: ``[tx, ty, θ]`` per tile (3 DOFs)
+- 3D: ``[tx, ty, tz, rx, ry, rz]`` per tile (6 DOFs; axis-angle)
+
+Velocity has the same shape — translational for the translation DOFs,
+**world-frame** angular velocity for the rotation DOFs. We compose
+rotations through scipy's :class:`Rotation` rather than treating the
+axis-angle rate as ``vel[3:6]`` directly, so large rotations stay
+numerically clean.
+
+Units
+-----
+Lattice space is unit-less (``[0, 1]^3`` per :file:`CLAUDE.md`); the
+``unit_scale_cm`` field on the lattice maps lattice units to cm. This
+module accepts forces in Newtons, masses in kilograms, gravity in
+m/s² — the integrator consumes only *consistent* units, so as long as
+the user's masses, forces, and dt agree the result is meaningful.
+The :class:`DynamicsConfig` defaults assume 1 lattice unit = 1 cm and
+plate-like tiles, but every value is overridable.
+"""
+
+from __future__ import annotations
+
+import warnings
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+from .simulation import Constraint, Simulator, TileSystem
+
+
+# ---------------------------------------------------------------------------
+# Records
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TileMass:
+    """Inertial properties of a single tile.
+
+    ``mass`` is the scalar mass in kg.
+
+    ``inertia_iso`` is a single scalar moment of inertia used isotropically
+    — ``I_world = inertia_iso * I``. We pick isotropic instead of a full
+    body-frame tensor because (a) typical kirigami tiles are thin plates
+    where the dominant out-of-plane component dominates the dynamics,
+    and (b) it sidesteps the need to recompute ``R I_body Rᵀ`` every step.
+    Refine to a per-tile body-frame tensor only if the simplification
+    becomes a measurable bottleneck.
+    """
+    mass:        float
+    inertia_iso: float
+
+
+@dataclass(frozen=True)
+class ForceVector:
+    """An external force the user wants applied during the sim.
+
+    ``location_kind`` selects the attachment:
+    - ``"world"`` — fixed point in world space; force does NOT track
+      tile motion. Useful for "press here" scenarios.
+    - ``"tile_vertex"`` — attached to ``tiles[tile_index][vert_index]``;
+      the application point follows the tile, so a non-zero magnitude
+      ALSO induces torque on the tile.
+    - ``"tile_centroid"`` — attached to the tile's vertex centroid;
+      pure translation, no torque.
+
+    ``direction`` is auto-normalised at construction.
+    """
+    location_kind: str           # "world" | "tile_vertex" | "tile_centroid"
+    direction:     np.ndarray    # (dim,)
+    magnitude:     float
+    location_world: Optional[np.ndarray] = None  # (dim,), only for kind=world
+    tile_index:    int = -1                       # only for kind=tile_*
+    vert_index:    int = -1                       # only for kind=tile_vertex
+
+    def __post_init__(self):
+        d = np.asarray(self.direction, dtype=float).flatten()
+        n = float(np.linalg.norm(d))
+        if n < 1e-12:
+            raise ValueError("ForceVector direction must be non-zero")
+        # __post_init__ on frozen dataclasses requires object.__setattr__.
+        object.__setattr__(self, "direction", d / n)
+        if self.location_world is not None:
+            object.__setattr__(
+                self, "location_world",
+                np.asarray(self.location_world, dtype=float).flatten(),
+            )
+
+
+@dataclass(frozen=True)
+class GroundContact:
+    """A penalty-based ground plane.
+
+    The plane is ``{x : (x - plane_point) · plane_normal == 0}`` with
+    the half-space ``(x - plane_point) · plane_normal >= 0`` being
+    *outside* (allowed). Tile vertices that penetrate (negative signed
+    distance) get pushed back via:
+
+    - normal force = ``-k * d * n``   (penalty spring)
+    - normal damp  = ``-c * (v · n) * n``  (kills approach velocity)
+    - friction     = clamped Coulomb at the tangential vertex velocity.
+    """
+    plane_point:  np.ndarray
+    plane_normal: np.ndarray
+    stiffness:    float = 1.0e4
+    damping:      float = 50.0
+    friction_mu:  float = 0.3
+
+    def __post_init__(self):
+        n = np.asarray(self.plane_normal, dtype=float).flatten()
+        ln = float(np.linalg.norm(n))
+        if ln < 1e-12:
+            raise ValueError("GroundContact plane_normal must be non-zero")
+        object.__setattr__(self, "plane_normal", n / ln)
+        object.__setattr__(
+            self, "plane_point",
+            np.asarray(self.plane_point, dtype=float).flatten(),
+        )
+
+
+@dataclass
+class DynamicsConfig:
+    """Time-step and stiffness parameters for the integrator."""
+    dt:                 float       = 1.0e-3
+    duration:           float       = 2.0
+    joint_stiffness:    float       = 1.0e3
+    joint_damping:      float       = 5.0
+    gravity:            np.ndarray  = field(
+        default_factory=lambda: np.array([0.0, -9.81, 0.0]))
+    convergence_kinetic_thresh: float = 1.0e-5  # KE/initial_KE → "settled"
+
+
+@dataclass
+class DynamicsResult:
+    """Output of :meth:`DynamicsSimulator.simulate`."""
+    times:        np.ndarray   # (n_steps,)
+    poses:        np.ndarray   # (n_steps, n_tiles*dofs)
+    velocities:   np.ndarray   # (n_steps, n_tiles*dofs)
+    bbox_extents: np.ndarray   # (n_steps, dim)
+    final_compression: float
+    converged:    bool
+    energy_trace: dict         # {"kinetic": (n,), ...}
+
+
+# ---------------------------------------------------------------------------
+# DynamicsSimulator
+# ---------------------------------------------------------------------------
+
+class DynamicsSimulator:
+    """Newtonian rigid-body simulator for a constraint-graph
+    :class:`TileSystem`.
+
+    Wraps a :class:`auxetic.simulation.Simulator` to reuse its
+    constraint Jacobian / residual primitives unchanged — the kinematic
+    and dynamic solvers operate on the same algebraic objects, just at
+    different time-scales.
+    """
+
+    def __init__(self,
+                 tile_system: TileSystem,
+                 masses: List[TileMass],
+                 config: DynamicsConfig,
+                 forces: Optional[List[ForceVector]] = None,
+                 ground: Optional[GroundContact] = None,
+                 fixed_tiles: Optional[List[int]] = None):
+        if len(masses) != tile_system.n_tiles:
+            raise ValueError(
+                f"masses length {len(masses)} != n_tiles {tile_system.n_tiles}")
+        self.tile_system = tile_system
+        self.masses      = list(masses)
+        self.config      = config
+        self.forces      = list(forces or [])
+        self.ground      = ground
+        self.fixed_tiles = sorted(set(int(i) for i in (fixed_tiles or [])))
+
+        # Use a Simulator to get the residual/Jacobian primitives.
+        # The load_axis is irrelevant here — only used by Simulator's
+        # SPEC §7.5 metric — but the constructor demands a non-zero
+        # vector, so feed it gravity's direction (or any unit vec).
+        self._dim   = tile_system.dimension
+        self._dofs  = 3 if self._dim == 2 else 6
+        load_axis = np.zeros(self._dim)
+        if self._dim == 2:
+            load_axis[1] = -1.0   # -y
+        else:
+            load_axis[1] = -1.0   # -y, world up = +y
+        self._sim = Simulator(tile_system, load_axis=load_axis)
+
+        # Project gravity onto the simulation dimension. The user-facing
+        # config.gravity is a 3-vector for ergonomics.
+        g3 = np.asarray(config.gravity, dtype=float).flatten()
+        if g3.size < self._dim:
+            raise ValueError("config.gravity must be at least dim-D")
+        self._gravity = g3[:self._dim].copy()
+
+        # Per-tile mass-matrix diagonal in pose-space (one entry per DOF).
+        # Shape: (n_tiles * dofs,)
+        n_tiles = tile_system.n_tiles
+        Mdiag = np.empty(n_tiles * self._dofs, dtype=float)
+        for i, tm in enumerate(self.masses):
+            base = i * self._dofs
+            Mdiag[base + 0] = tm.mass
+            Mdiag[base + 1] = tm.mass
+            if self._dim == 2:
+                Mdiag[base + 2] = tm.inertia_iso
+            else:
+                Mdiag[base + 2] = tm.mass
+                Mdiag[base + 3] = tm.inertia_iso
+                Mdiag[base + 4] = tm.inertia_iso
+                Mdiag[base + 5] = tm.inertia_iso
+        # Fixed tiles get effectively-infinite mass: their generalised
+        # accelerations come out at zero, which is what we want.
+        for ti in self.fixed_tiles:
+            base = ti * self._dofs
+            Mdiag[base:base + self._dofs] = np.inf
+        self._Mdiag = Mdiag
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @property
+    def n_tiles(self) -> int:
+        return self.tile_system.n_tiles
+
+    @property
+    def n_dofs(self) -> int:
+        return self.tile_system.n_tiles * self._dofs
+
+    def rest_pose(self) -> np.ndarray:
+        return self._sim.rest_pose()
+
+    def step(self, pose: np.ndarray, vel: np.ndarray
+             ) -> tuple[np.ndarray, np.ndarray]:
+        """Advance one ``config.dt`` step. Pure function, no mutation."""
+        F_q = self._compute_generalised_force(pose, vel)
+        # a = M^-1 F_q. Inf entries (fixed tiles) → 0 acceleration.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            a = np.where(np.isinf(self._Mdiag), 0.0, F_q / self._Mdiag)
+        new_vel  = vel + a * self.config.dt
+        # Zero out fixed-tile velocities exactly (avoid float drift).
+        for ti in self.fixed_tiles:
+            base = ti * self._dofs
+            new_vel[base:base + self._dofs] = 0.0
+        new_pose = self._retract(pose, new_vel * self.config.dt)
+        return new_pose, new_vel
+
+    def simulate(self,
+                  initial_pose: Optional[np.ndarray] = None,
+                  initial_vel:  Optional[np.ndarray] = None,
+                  ) -> DynamicsResult:
+        """Run the integrator from ``t=0`` to ``config.duration``."""
+        n_steps = max(1, int(np.round(self.config.duration / self.config.dt))) + 1
+        times = np.linspace(0.0, self.config.duration, n_steps)
+
+        n_dof = self.n_dofs
+        pose = (np.asarray(initial_pose, dtype=float).copy()
+                if initial_pose is not None else np.zeros(n_dof))
+        vel  = (np.asarray(initial_vel, dtype=float).copy()
+                if initial_vel  is not None else np.zeros(n_dof))
+
+        poses      = np.empty((n_steps, n_dof), dtype=float)
+        velocities = np.empty((n_steps, n_dof), dtype=float)
+        bbox_extents = np.empty((n_steps, self._dim), dtype=float)
+        ke_trace   = np.empty(n_steps, dtype=float)
+
+        poses[0] = pose
+        velocities[0] = vel
+        bbox_extents[0] = self._bbox_extents(pose)
+        ke_trace[0] = self._kinetic_energy(vel)
+
+        initial_ke = max(ke_trace[0], 1.0e-12)
+        converged = False
+        for k in range(1, n_steps):
+            pose, vel = self.step(pose, vel)
+            poses[k]      = pose
+            velocities[k] = vel
+            bbox_extents[k] = self._bbox_extents(pose)
+            ke_trace[k]   = self._kinetic_energy(vel)
+            # Convergence: kinetic energy small fraction of initial,
+            # AND we've taken at least 10 steps to give the system
+            # time to actually accelerate before "settling".
+            if (k > 10
+                and ke_trace[k] < self.config.convergence_kinetic_thresh
+                                  * initial_ke):
+                converged = True
+                # Trim trailing slots (still report the full grid for
+                # debugging — set converged so callers can tell).
+                # We keep the loop running so the time grid stays
+                # consistent.
+
+        # Compression along the dominant load axis.
+        load_axis_idx = int(np.argmax(np.abs(self._sim.load_axis)))
+        ax0 = bbox_extents[0,  load_axis_idx]
+        ax1 = bbox_extents[-1, load_axis_idx]
+        final_compression = (
+            float((ax0 - ax1) / ax0) if abs(ax0) > 1e-12 else 0.0)
+
+        return DynamicsResult(
+            times=times,
+            poses=poses,
+            velocities=velocities,
+            bbox_extents=bbox_extents,
+            final_compression=final_compression,
+            converged=converged,
+            energy_trace={"kinetic": ke_trace},
+        )
+
+    # ------------------------------------------------------------------
+    # Generalised force assembly
+    # ------------------------------------------------------------------
+
+    def _compute_generalised_force(self, pose: np.ndarray,
+                                    vel: np.ndarray) -> np.ndarray:
+        """Sum of constraint, gravity, user-force, and contact
+        contributions in pose-space."""
+        F_q = np.zeros(self.n_dofs, dtype=float)
+        F_q += self._constraint_force(pose, vel)
+        F_q += self._gravity_force()
+        F_q += self._user_forces(pose)
+        if self.ground is not None:
+            F_q += self._contact_force(pose, vel)
+        return F_q
+
+    def _constraint_force(self, pose: np.ndarray,
+                           vel:  np.ndarray) -> np.ndarray:
+        """Baumgarte-stabilised constraint generalised force."""
+        if self.tile_system.n_constraints == 0:
+            return np.zeros(self.n_dofs, dtype=float)
+        r = self._sim.constraint_residual(pose)        # (n_c * dim,)
+        J = self._sim.assemble_jacobian(pose)          # (n_c*dim, n_dof)
+        k = self.config.joint_stiffness
+        c = self.config.joint_damping
+        return -(k * (J.T @ r) + c * (J.T @ (J @ vel)))
+
+    def _gravity_force(self) -> np.ndarray:
+        """Gravity acts at each tile's centroid as ``m * g`` (no torque
+        because the tile's mass distribution is treated as centred on
+        the centroid)."""
+        F_q = np.zeros(self.n_dofs, dtype=float)
+        for i, tm in enumerate(self.masses):
+            if i in self.fixed_tiles:
+                continue
+            base = i * self._dofs
+            F_q[base:base + self._dim] += tm.mass * self._gravity
+        return F_q
+
+    def _user_forces(self, pose: np.ndarray) -> np.ndarray:
+        """Apply each :class:`ForceVector`. Includes torque contribution
+        when the application point is offset from the tile centroid."""
+        F_q = np.zeros(self.n_dofs, dtype=float)
+        if not self.forces:
+            return F_q
+        for fv in self.forces:
+            F = fv.direction[:self._dim] * fv.magnitude
+            if fv.location_kind == "world":
+                # World-frame force — find the closest tile to apply
+                # the *reaction* on. For v1 we assume world forces aren't
+                # attached to any tile and so contribute nothing. (User
+                # forces tied to tiles is the common case; pure world
+                # forces are uncommon and would require a contact-style
+                # treatment to bring them into the tile dynamics.)
+                continue
+            ti = fv.tile_index
+            if ti < 0 or ti >= self.n_tiles or ti in self.fixed_tiles:
+                continue
+            base = ti * self._dofs
+            F_q[base:base + self._dim] += F
+            # Torque from the offset of application from tile origin.
+            t_i, R_i = self._sim._decompose_pose(pose, ti)
+            if fv.location_kind == "tile_vertex":
+                if not (0 <= fv.vert_index < self.tile_system.tiles[ti].shape[0]):
+                    continue
+                v_body = self.tile_system.tiles[ti][fv.vert_index]
+                r_world = R_i @ v_body  # offset from tile origin
+            else:  # tile_centroid → no torque
+                continue
+            if self._dim == 2:
+                # 2D cross product yields a scalar torque about z.
+                tau = float(r_world[0] * F[1] - r_world[1] * F[0])
+                F_q[base + 2] += tau
+            else:
+                tau = np.cross(r_world, F)
+                F_q[base + 3:base + 6] += tau
+        return F_q
+
+    def _contact_force(self, pose: np.ndarray,
+                        vel:  np.ndarray) -> np.ndarray:
+        """Penalty + damping + Coulomb-friction contact at the ground
+        plane. Applied per tile vertex that has penetrated."""
+        F_q = np.zeros(self.n_dofs, dtype=float)
+        gc = self.ground
+        if gc is None:
+            return F_q
+        n = gc.plane_normal[:self._dim]
+        plane_pt = gc.plane_point[:self._dim]
+        for ti in range(self.n_tiles):
+            if ti in self.fixed_tiles:
+                continue
+            verts_world = self._sim._tile_world_vertices(pose, ti)
+            t_i, R_i = self._sim._decompose_pose(pose, ti)
+            base = ti * self._dofs
+            v_lin = vel[base:base + self._dim]
+            if self._dim == 2:
+                v_ang = float(vel[base + 2])
+            else:
+                v_ang = vel[base + 3:base + 6]
+            for vert_i, p_world in enumerate(verts_world):
+                d = float((p_world - plane_pt) @ n)
+                if d >= 0.0:
+                    continue   # outside / on the surface
+                # Vertex world velocity.
+                r = p_world - t_i
+                if self._dim == 2:
+                    # ω is scalar; v_vert = v_lin + ω × r
+                    v_vert = v_lin + v_ang * np.array([-r[1], r[0]])
+                else:
+                    v_vert = v_lin + np.cross(v_ang, r)
+                vn = float(v_vert @ n)
+                # Normal: penalty spring + damping along approach.
+                F_normal = (-gc.stiffness * d - gc.damping * vn) * n
+                # Friction: tangential, clamped Coulomb.
+                v_t = v_vert - vn * n
+                speed_t = float(np.linalg.norm(v_t))
+                if speed_t > 1.0e-9:
+                    f_friction_mag = min(
+                        gc.friction_mu * float(np.linalg.norm(F_normal)),
+                        speed_t * 1.0,  # avoid amplifying past static velocity
+                    )
+                    F_friction = -f_friction_mag * (v_t / speed_t)
+                else:
+                    F_friction = np.zeros(self._dim)
+                F_total = F_normal + F_friction
+                # Translational + torque about tile origin.
+                F_q[base:base + self._dim] += F_total
+                if self._dim == 2:
+                    tau = float(r[0] * F_total[1] - r[1] * F_total[0])
+                    F_q[base + 2] += tau
+                else:
+                    tau = np.cross(r, F_total)
+                    F_q[base + 3:base + 6] += tau
+        return F_q
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _retract(self, pose: np.ndarray, dq: np.ndarray) -> np.ndarray:
+        """Apply a pose-space delta. Translation: vector add. Rotation:
+        compose with the rotation parameterised by ``dq[rot]`` (treated
+        as a world-frame angular-velocity step) using SO(3) / SO(2)
+        composition."""
+        out = pose.copy()
+        for i in range(self.n_tiles):
+            base = i * self._dofs
+            # Translation.
+            out[base:base + self._dim] += dq[base:base + self._dim]
+            # Rotation.
+            if self._dim == 2:
+                out[base + 2] += dq[base + 2]
+            else:
+                # Compose: R_new = R(dq[rot]) @ R(pose[rot]).
+                rot_old = Rotation.from_rotvec(pose[base + 3:base + 6])
+                d_omega = dq[base + 3:base + 6]
+                if np.linalg.norm(d_omega) > 0.0:
+                    rot_d = Rotation.from_rotvec(d_omega)
+                    rot_new = rot_d * rot_old
+                else:
+                    rot_new = rot_old
+                out[base + 3:base + 6] = rot_new.as_rotvec()
+        return out
+
+    def _bbox_extents(self, pose: np.ndarray) -> np.ndarray:
+        """Bounding-box ``(max - min)`` per spatial dimension over all
+        tile vertices in the projected configuration."""
+        all_verts = []
+        for ti in range(self.n_tiles):
+            all_verts.append(self._sim._tile_world_vertices(pose, ti))
+        verts = np.vstack(all_verts) if all_verts else np.zeros((1, self._dim))
+        return verts.max(axis=0) - verts.min(axis=0)
+
+    def _kinetic_energy(self, vel: np.ndarray) -> float:
+        """``½ vᵀ M v`` — fixed-tile inf masses contribute 0 (they have
+        zero velocity by construction)."""
+        ke = 0.0
+        for i in range(self.n_tiles):
+            if i in self.fixed_tiles:
+                continue
+            base = i * self._dofs
+            for k in range(self._dofs):
+                m = self._Mdiag[base + k]
+                if not np.isfinite(m):
+                    continue
+                ke += 0.5 * m * vel[base + k] ** 2
+        return float(ke)
+
+
+# ---------------------------------------------------------------------------
+# Convenience: derive default tile masses from geometry
+# ---------------------------------------------------------------------------
+
+def _ground_face_plane(face: str, all_vertices: np.ndarray, dim: int
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """Convert a face label like ``"+y"`` / ``"-y"`` into a
+    ``(plane_point, plane_normal)`` pair anchored at the lattice's
+    bounding box.
+
+    The label names which face of the bbox is the *contact face*. The
+    plane normal points **into free space** (away from the lattice
+    interior), so a tile vertex sitting on the contact plane has
+    signed distance 0; penetration is negative; above the plane is
+    positive.
+
+    Example: ``face="-y"`` says the lattice rests on a floor at
+    ``y = min(y)``. Free space is above (``+y``), so ``plane_normal
+    = (0, +1, ...)``.
+    """
+    axis = {"x": 0, "y": 1, "z": 2}.get(face[-1].lower())
+    if axis is None or face[0] not in "+-" or axis >= dim:
+        raise ValueError(f"invalid ground_face: {face!r}")
+    bbox_min = all_vertices.min(axis=0)
+    bbox_max = all_vertices.max(axis=0)
+    if face[0] == "-":
+        # Lattice's MIN-axis face is the contact face. Floor at min,
+        # free space above (positive axis direction).
+        plane_point = bbox_min.copy()
+        plane_normal = np.zeros(dim)
+        plane_normal[axis] = +1.0
+    else:
+        # MAX-axis face is the contact face. Ceiling at max, free
+        # space below (negative axis direction).
+        plane_point = bbox_max.copy()
+        plane_normal = np.zeros(dim)
+        plane_normal[axis] = -1.0
+    return plane_point, plane_normal
+
+
+def _tiles_touching_face(tile_system: TileSystem,
+                          plane_point: np.ndarray,
+                          plane_normal: np.ndarray,
+                          tol: float = 1e-6) -> List[int]:
+    """Return tile indices that have at least one vertex within ``tol``
+    of the given plane (signed distance ≤ tol). Used to auto-pin the
+    "ground face" tiles when running the dynamic simulator."""
+    out: List[int] = []
+    n = plane_normal[: plane_point.size]
+    for ti, tile in enumerate(tile_system.tiles):
+        d = (tile - plane_point) @ n
+        if float(np.min(d)) <= tol:
+            out.append(ti)
+    return out
+
+
+def build_dynamics_simulator_from_lattice(
+        lattice,
+        *,
+        tile_system: Optional[TileSystem] = None,
+        ) -> "DynamicsSimulator":
+    """Construct a :class:`DynamicsSimulator` from a live :class:`Lattice`.
+
+    Reads ``lattice.dynamics_state`` (the v4-preset dict) for forces,
+    ground face, fixed tiles, and integrator config. Per-tile masses
+    come from :func:`default_masses_from_tile_system`.
+
+    Pass an existing ``tile_system`` to reuse one already built (e.g.
+    by the kinematic panel); otherwise one is constructed lazily here.
+    """
+    if tile_system is None:
+        tile_system = TileSystem.from_lattice(lattice)
+    masses  = default_masses_from_tile_system(tile_system)
+    state   = dict(getattr(lattice, "dynamics_state", None) or {})
+    cfg_in  = dict(state.get("config") or {})
+    gravity_in = np.asarray(
+        cfg_in.get("gravity_cm_per_s2", [0.0, -981.0, 0.0]),
+        dtype=float,
+    )
+    cfg = DynamicsConfig(
+        dt              = float(cfg_in.get("dt", 1.0e-3)),
+        duration        = float(cfg_in.get("duration", 2.0)),
+        joint_stiffness = float(cfg_in.get("joint_stiffness", 1.0e3)),
+        joint_damping   = float(cfg_in.get("joint_damping",   5.0)),
+        gravity         = gravity_in,
+        convergence_kinetic_thresh = float(
+            cfg_in.get("convergence_kinetic_thresh", 1.0e-5)),
+    )
+
+    dim = tile_system.dimension
+    forces: List[ForceVector] = []
+    for f in state.get("forces", []) or []:
+        try:
+            d = np.asarray(f["direction"], dtype=float).flatten()[:dim]
+            forces.append(ForceVector(
+                location_kind = str(f["location_kind"]),
+                direction     = d,
+                magnitude     = float(f.get("magnitude", 0.0)),
+                tile_index    = int(f.get("tile_index", -1)),
+                vert_index    = int(f.get("vert_index", -1)),
+                location_world = (
+                    np.asarray(f["location_world"], dtype=float).flatten()[:dim]
+                    if f.get("location_world") is not None else None
+                ),
+            ))
+        except (KeyError, ValueError):
+            continue   # malformed force record — skip gracefully
+
+    ground: Optional[GroundContact] = None
+    fixed_tiles = [int(i) for i in (state.get("fixed_tiles") or [])]
+    gf = state.get("ground_face")
+    if gf is not None:
+        all_verts = np.vstack(tile_system.tiles)
+        plane_point, plane_normal = _ground_face_plane(str(gf), all_verts, dim)
+        ground = GroundContact(
+            plane_point  = plane_point,
+            plane_normal = plane_normal,
+        )
+        for ti in _tiles_touching_face(tile_system, plane_point, plane_normal):
+            if ti not in fixed_tiles:
+                fixed_tiles.append(ti)
+
+    return DynamicsSimulator(
+        tile_system, masses, cfg,
+        forces=forces, ground=ground, fixed_tiles=fixed_tiles,
+    )
+
+
+def default_masses_from_tile_system(
+        tile_system: TileSystem,
+        density: float = 1.0,
+        thickness: float = 0.01,
+        ) -> List[TileMass]:
+    """Compute a reasonable per-tile :class:`TileMass` from the tile
+    geometry alone.
+
+    For 2D tiles, mass = ``area * thickness * density`` (treating the
+    tile as a thin plate of given thickness). For 3D tiles, mass is the
+    convex-hull volume × density. ``inertia_iso`` is approximated as
+    ``(m / 12) * sum(extent²)`` over the tile's bounding box — exact for
+    a uniform rectangular plate, a useful first approximation otherwise.
+    """
+    masses: List[TileMass] = []
+    for tile in tile_system.tiles:
+        verts = np.asarray(tile, dtype=float)
+        if verts.shape[1] == 2:
+            # 2D polygon area via the shoelace formula.
+            x = verts[:, 0]; y = verts[:, 1]
+            area = 0.5 * abs(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+            m = max(1.0e-9, float(area * thickness * density))
+        else:
+            try:
+                from scipy.spatial import ConvexHull
+                hull = ConvexHull(verts)
+                vol = float(hull.volume)
+            except Exception:
+                vol = 0.0
+            m = max(1.0e-9, float(vol * density))
+        ext = verts.max(axis=0) - verts.min(axis=0)
+        I = (m / 12.0) * float(np.sum(ext * ext))
+        masses.append(TileMass(mass=m, inertia_iso=max(I, 1.0e-12)))
+    return masses
