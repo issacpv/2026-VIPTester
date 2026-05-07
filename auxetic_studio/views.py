@@ -587,6 +587,20 @@ class View3D(QWidget):
             widget = self.interactor.add_camera_orientation_widget()
             self._view_cube_widget = widget
             self.has_view_cube = True
+            # Disable the default animated transition. With it on,
+            # clicking the Top / Bottom faces produces a visible swing
+            # because the "up vector" is degenerate at the poles —
+            # the camera path goes through an unintended intermediate
+            # orientation. Most CAD apps snap instantly and that's
+            # the closer match to user expectation here.
+            try:
+                widget.SetAnimate(False)
+            except Exception:
+                # Older VTK uses AnimateOff(); newer uses SetAnimate.
+                try:
+                    widget.AnimateOff()
+                except Exception:
+                    pass
         except Exception:
             self._view_cube_widget = None
             self.has_view_cube = False

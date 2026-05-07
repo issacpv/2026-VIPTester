@@ -113,3 +113,18 @@ def test_headless_view3d_reports_no_navigation_widgets(main_window):
 # QtInteractor path runs ``_install_3d_navigation_aids`` cleanly on
 # a normal Windows + VTK setup.
 # ---------------------------------------------------------------------------
+
+
+def test_view_cube_widget_supports_animation_disable_api():
+    """The fix for the "weird animation" report relies on the VTK
+    widget exposing ``SetAnimate(False)`` (or the older ``AnimateOff``
+    fallback). Pin that the API exists in the installed VTK so we
+    notice if a future VTK rev removes it."""
+    pytest.importorskip("vtkmodules.vtkInteractionWidgets")
+    from vtkmodules.vtkInteractionWidgets import vtkCameraOrientationWidget
+    w = vtkCameraOrientationWidget()
+    assert hasattr(w, "SetAnimate") or hasattr(w, "AnimateOff"), (
+        "VTK's vtkCameraOrientationWidget no longer exposes the "
+        "animation toggle our fix relies on. Update _install_3d_"
+        "navigation_aids in auxetic_studio/views.py."
+    )
