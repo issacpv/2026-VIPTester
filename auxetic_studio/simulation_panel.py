@@ -59,19 +59,25 @@ from auxetic.dynamics import build_dynamics_simulator_from_lattice
 # ---------------------------------------------------------------------------
 
 def slider_to_simulator_theta(slider_deg: float) -> float:
-    """Slider [0, 180] degrees -> simulator [-pi/2, +pi/2] radians.
+    """Slider ``[0, 180]`` physical degrees -> simulator ``[-π, +π]``
+    radians. M2.8 doubled the math range so the slider can scrub a
+    full 180° rotation from rest in either direction (the kirigami
+    can keep rotating until tile-tile collisions stop it).
 
-    See SPEC §6.2 for the two-parameterization convention.
+    Original SPEC §6.2 convention was slider 0-180 → math -π/2 to
+    +π/2 (the bistable cycle). With collision detection now bounding
+    the reachable range, we cover the full ±π and let collisions —
+    shaded on the plot — show what's physically achievable.
+
+    Rest is at slider=90° (math 0) for both conventions.
     """
-    return float(np.radians(slider_deg - 90.0))
+    return float(np.radians((slider_deg - 90.0) * 2.0))
 
 
 def simulator_theta_to_slider(theta_rad: float) -> float:
-    """Simulator [-pi/2, +pi/2] radians -> slider [0, 180] degrees.
-
-    See SPEC §6.2 for the two-parameterization convention.
-    """
-    return float(np.degrees(theta_rad) + 90.0)
+    """Inverse of :func:`slider_to_simulator_theta` — simulator radians
+    in ``[-π, +π]`` map back to ``[0, 180]`` physical slider degrees."""
+    return float(np.degrees(theta_rad) / 2.0 + 90.0)
 
 
 # Slider range and resolution (sub-degree granularity via tenths-of-deg
@@ -80,6 +86,10 @@ _SLIDER_MIN_DEG  = 0.0
 _SLIDER_MAX_DEG  = 180.0
 _SLIDER_REST_DEG = 90.0
 _SLIDER_SCALE    = 10  # int slider value = degrees × 10
+# The math-θ extremes the slider corresponds to, used by the collision-
+# shading spans on the kinematic plot.
+_SLIDER_MIN_DEG_THETA_MIN = -np.pi   # slider 0°   → math -π
+_SLIDER_MAX_DEG_THETA_MAX = +np.pi   # slider 180° → math +π
 
 # Animation: 30 fps, full bistable cycle in ~3 s.
 _PLAY_FPS_INTERVAL_MS = 33
@@ -278,6 +288,9 @@ class SimulationPanel(QDockWidget):
         self._plot_marker = self._ax.axvline(
             _SLIDER_REST_DEG, color="red", linestyle="--", linewidth=1, alpha=0.7,
         )
+        # Shaded "unreachable due to collision" spans (M2.8). Replaced
+        # on each plot update.
+        self._collision_spans: list = []
         outer.addWidget(self._canvas)
 
     def _build_readout(self, outer):
@@ -400,7 +413,11 @@ class SimulationPanel(QDockWidget):
             else:
                 load_axis = np.array([0.0, -1.0, 0.0])
             simulator   = Simulator(tile_system, load_axis=load_axis)
-            sim_result  = simulator.sweep_theta()
+            # M2.8: sweep the full ±π range with tile-tile collision
+            # detection so the plot shows what's physically reachable.
+            sim_result  = simulator.sweep_theta(
+                n_steps=181, theta_max=np.pi, collision_stop=True,
+            )
             poissons    = simulator.poissons_ratio()
             locked, info = simulator.is_locked()
         except Exception as exc:
@@ -469,6 +486,14 @@ class SimulationPanel(QDockWidget):
 
     def _update_plot_kinematic(self) -> None:
         self._ax.set_xlabel("Joint angle θ (degrees)")
+        # Drop any prior collision-shading spans before redrawing.
+        for span in self._collision_spans:
+            try:
+                span.remove()
+            except Exception:
+                pass
+        self._collision_spans.clear()
+
         if self._sim_result is None:
             if self._plot_line is not None:
                 self._plot_line.remove()
@@ -486,6 +511,23 @@ class SimulationPanel(QDockWidget):
             (self._plot_line,) = self._ax.plot(x_deg, y, color="steelblue")
         else:
             self._plot_line.set_data(x_deg, y)
+
+        # M2.8 — shade the θ ranges where tile-tile collisions block
+        # further rotation, so the user sees what's reachable.
+        result = self._sim_result
+        if result.collision_theta_min is not None:
+            x_lo = simulator_theta_to_slider(_SLIDER_MIN_DEG_THETA_MIN)
+            x_hi = simulator_theta_to_slider(result.collision_theta_min)
+            self._collision_spans.append(
+                self._ax.axvspan(x_lo, x_hi, color="#dd5050", alpha=0.15)
+            )
+        if result.collision_theta_max is not None:
+            x_lo = simulator_theta_to_slider(result.collision_theta_max)
+            x_hi = simulator_theta_to_slider(_SLIDER_MAX_DEG_THETA_MAX)
+            self._collision_spans.append(
+                self._ax.axvspan(x_lo, x_hi, color="#dd5050", alpha=0.15)
+            )
+
         self._ax.relim(); self._ax.autoscale_view(scalex=False, scaley=True)
         self._ax.set_xlim(_SLIDER_MIN_DEG, _SLIDER_MAX_DEG)
         self._canvas.draw_idle()

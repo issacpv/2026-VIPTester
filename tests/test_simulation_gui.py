@@ -114,18 +114,61 @@ def test_joint_slider_drives_pose_when_result_present(main_window):
 # 3. Convention helpers (the boundary)
 # ---------------------------------------------------------------------------
 
-def test_slider_at_zero_degrees_corresponds_to_minus_pi_over_2_radians():
+def test_run_simulation_uses_extended_range_with_collision_check(main_window):
+    """``run_simulation`` should request the M2.8 extended sweep
+    (theta_max=π, collision_stop=True) so the plot can shade
+    physically-unreachable θ regions."""
+    win = main_window
+    panel = win.simulation_panel
+    panel.run_simulation()
+    res = panel._sim_result
+    assert res is not None
+    # theta_samples should now span (-π, +π) rather than (-π/2, +π/2).
+    assert res.theta_samples[0]  == pytest.approx(-math.pi,  abs=1e-9)
+    assert res.theta_samples[-1] == pytest.approx(+math.pi, abs=1e-9)
+    # collision_at_theta is allocated even if no collisions hit (M2.8).
+    assert res.collision_at_theta.shape == (len(res.theta_samples),)
+
+
+def test_collision_shading_added_to_plot_when_collisions_exist(main_window):
+    """If the sweep result records collision bounds, the panel's
+    kinematic plot should add ``axvspan`` shading for those regions."""
+    win = main_window
+    panel = win.simulation_panel
+    panel.run_simulation()
+    # We can't reliably force a collision on the default lattice — but
+    # we can simulate the result having bounds and verify the shading
+    # path runs without error.
+    panel._sim_result.collision_theta_min = -math.pi * 0.9
+    panel._sim_result.collision_theta_max = +math.pi * 0.9
+    panel._update_plot()
+    # Two spans should be drawn (one per side).
+    assert len(panel._collision_spans) == 2
+
+
+def test_slider_convention_extended_to_full_pi_range():
     """The two convention helpers — the only place slider↔simulator
-    mapping is allowed to live — must implement the SPEC §6.2
-    mapping: slider 0° ↔ simulator -π/2; 90° ↔ 0; 180° ↔ +π/2."""
-    assert slider_to_simulator_theta(0.0)   == pytest.approx(-math.pi / 2.0)
-    assert slider_to_simulator_theta(90.0)  == pytest.approx(0.0,        abs=1e-12)
-    assert slider_to_simulator_theta(180.0) == pytest.approx(+math.pi / 2.0)
+    mapping is allowed to live — implement the M2.8 extended mapping:
+    the slider widget keeps its 0–180° physical range but each
+    physical degree corresponds to 2 mathematical degrees, so the
+    full slider range maps to ``[-π, +π]`` math radians.
+
+    Pre-M2.8 the mapping was slider ``[0, 180]`` ↔ math
+    ``[-π/2, +π/2]`` (SPEC §6.2 bistable cycle). Doubling the math
+    range lets the kinematic sweep explore the full ±180° rotation
+    until collisions intervene; the GUI plot shades the unreachable
+    spans so the user still sees the bistable region clearly.
+
+    Rest is at slider 90° ↔ math 0 in BOTH conventions.
+    """
+    assert slider_to_simulator_theta(0.0)   == pytest.approx(-math.pi)
+    assert slider_to_simulator_theta(90.0)  == pytest.approx(0.0,    abs=1e-12)
+    assert slider_to_simulator_theta(180.0) == pytest.approx(+math.pi)
 
     # Inverse round-trip
-    assert simulator_theta_to_slider(-math.pi / 2.0) == pytest.approx(0.0,   abs=1e-9)
-    assert simulator_theta_to_slider(0.0)            == pytest.approx(90.0,  abs=1e-9)
-    assert simulator_theta_to_slider(+math.pi / 2.0) == pytest.approx(180.0, abs=1e-9)
+    assert simulator_theta_to_slider(-math.pi) == pytest.approx(0.0,   abs=1e-9)
+    assert simulator_theta_to_slider(0.0)      == pytest.approx(90.0,  abs=1e-9)
+    assert simulator_theta_to_slider(+math.pi) == pytest.approx(180.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------

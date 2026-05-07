@@ -25,7 +25,7 @@ Pose layout (the contract):
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import scipy.linalg
@@ -56,9 +56,10 @@ class SimResult:
     """Result of ``Simulator.sweep_theta`` (SPEC §7.6).
 
     - ``theta_samples`` (radians, shape ``(n_steps,)``) — the sweep
-      parameter values, ``np.linspace(-π/2, π/2, n_steps)``. Rest at
-      θ=0, compressed states at θ=±π/2 (SPEC §6.2 mathematical
-      parameterization).
+      parameter values. Default range is the canonical bistable
+      ``np.linspace(-π/2, π/2, n_steps)`` (rest at θ=0, compressed
+      states at θ=±π/2 per SPEC §6.2 mathematical parameterization).
+      The M2.8 ``theta_max`` extension allows ranges up to ±π.
     - ``poses`` (shape ``(n_steps, n_tiles * dofs_per_tile)``) — the
       projected pose at each step.
     - ``bbox_extents`` (shape ``(n_steps, dimension)``) — bounding-box
@@ -68,13 +69,26 @@ class SimResult:
       where the axial dimension is the index whose unit vector best
       aligns with ``Simulator.load_axis``.
     - ``locked`` / ``locking_info`` — composite criterion per SPEC §7.5
-      (also exposed by ``Simulator.is_locked``)."""
+      (also exposed by ``Simulator.is_locked``).
+    - ``collision_at_theta`` (M2.8) — bool array of length ``n_steps``,
+      ``True`` for samples where tiles overlap. Set to all-``False``
+      when collision checking is disabled or unsupported (3D modes).
+    - ``collision_theta_min``/``collision_theta_max`` (M2.8) — the
+      θ values at which the lattice first collides on the negative
+      and positive halves of the sweep. ``None`` if no collision was
+      seen on that side. Used by the GUI to render shaded
+      "unreachable" regions on the sweep plot.
+    """
     theta_samples:     np.ndarray
     poses:             np.ndarray
     bbox_extents:      np.ndarray
     compression_ratio: float
     locked:            bool
     locking_info:      dict
+    collision_at_theta:    np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=bool))
+    collision_theta_min:   float | None = None
+    collision_theta_max:   float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -763,16 +777,19 @@ class Simulator:
     # ==================================================================
 
     def sweep_theta(self, n_steps: int = 181, *,
-                     warm_start: bool = True) -> SimResult:
-        """Sweep θ ∈ [-π/2, +π/2] along the kirigami mode and project
-        to the manifold at each step.
+                     warm_start: bool = True,
+                     theta_max: float | None = None,
+                     collision_stop: bool = False,
+                     collision_tol: float = 1.0e-6,
+                     ) -> SimResult:
+        """Sweep θ along the kirigami mode and project to the manifold
+        at each step.
 
         Per SPEC §6.2, the simulator works in the *mathematical*
-        joint-angle parameterization: rest at θ=0, the two compressed
-        states at θ=±π/2. The GUI's physical 0°-180° slider is mapped
-        to this range at the boundary (``θ_physical_deg =
-        degrees(θ_simulator) + 90``); the simulator never sees
-        physical degrees.
+        joint-angle parameterization: rest at θ=0. The default range
+        is the canonical bistable ``[-π/2, +π/2]``; the M2.8
+        ``theta_max`` parameter extends it (set to ``np.pi`` for
+        ``[-π, +π]`` — full 180° rotation in either direction).
 
         SPEC §7.3 step 5–6: at each θ_i, compute ``pose = θ_i * mode``
         (linear extrapolation around the rest pose), project to the
@@ -785,11 +802,33 @@ class Simulator:
 
         ``warm_start=False`` disables warm-starting (every step
         projects from the cold linear extrapolation). Used by the
-        ``test_warm_start_speeds_up_sweep`` test to compare timings."""
+        ``test_warm_start_speeds_up_sweep`` test to compare timings.
+
+        ``collision_stop=True`` (M2.8) runs a 2D tile-tile collision
+        check at every projected pose. The first θ on the negative
+        half of the sweep where a collision appears bounds
+        ``collision_theta_min``; the first on the positive half bounds
+        ``collision_theta_max``. Samples beyond those bounds still get
+        recorded (the array shape stays predictable) but their
+        ``collision_at_theta`` flag is True. Always False for 3D
+        tile systems (collision detection is 2D-only in M2).
+        """
+        if theta_max is None:
+            theta_max = float(np.pi / 2.0)
         n_pose = self.n_tiles * self.dofs
-        theta_samples = np.linspace(-np.pi / 2.0, np.pi / 2.0, n_steps, dtype=float)
+        theta_samples = np.linspace(-theta_max, theta_max, n_steps, dtype=float)
         poses        = np.zeros((n_steps, n_pose), dtype=float)
         bbox_extents = np.zeros((n_steps, self.dimension), dtype=float)
+        collision_flags = np.zeros(n_steps, dtype=bool)
+        collision_theta_min: float | None = None
+        collision_theta_max: float | None = None
+
+        # Lazy collision checker — only constructed when requested AND
+        # supported (2D dimension; the helper module also no-ops 3D).
+        collider = None
+        if collision_stop and self.dimension == 2:
+            from .collision import CollisionChecker
+            collider = CollisionChecker(self.tile_system, tol=collision_tol)
 
         mode = self.identify_kirigami_mode()
         if mode is None:
@@ -806,29 +845,56 @@ class Simulator:
                 bbox_extents=bbox_extents,
                 compression_ratio=comp_ratio,
                 locked=locked, locking_info=locking_info,
+                collision_at_theta=collision_flags,
             )
 
         prev_pose = None
         prev_theta = 0.0
         for i, theta in enumerate(theta_samples):
             if not warm_start or prev_pose is None:
-                # Cold: linear extrapolation from rest.
                 initial = float(theta) * mode
             else:
-                # Warm: previous projected pose, advanced by Δθ along mode.
                 initial = prev_pose + float(theta - prev_theta) * mode
             projected = self.project_to_manifold(initial)
             poses[i] = projected
             bbox_extents[i] = self._bbox_extents(projected)
+            if collider is not None and collider.has_collision(projected):
+                collision_flags[i] = True
+                if theta < 0.0 and collision_theta_min is None:
+                    # First collision on the negative half (sweeping toward
+                    # rest the linspace passes here first, but the FIRST
+                    # collision on this half going outward from rest is the
+                    # one closest to 0, which is the LAST one we'll see in
+                    # the linspace order before crossing rest. Track all
+                    # negative-half collisions and pick the maximum θ later.
+                    pass
+                elif theta > 0.0 and collision_theta_max is None:
+                    collision_theta_max = float(theta)
             prev_pose = projected
             prev_theta = theta
 
-        # SPEC §7.4 Option A compression ratio.
+        # Resolve collision_theta_min: for the negative half, the
+        # *innermost* (closest to 0) collision is the bound — anything
+        # farther out has already collided. Pick the LARGEST negative θ
+        # that has a collision (i.e., the smallest |θ|).
+        neg_collisions = theta_samples[(theta_samples < 0.0) & collision_flags]
+        if neg_collisions.size > 0:
+            collision_theta_min = float(neg_collisions.max())  # closest to 0
+        # collision_theta_max already set on first hit going forward.
+
+        # SPEC §7.4 Option A compression ratio. Only consider non-collided
+        # samples — values past the collision boundary are physically
+        # unreachable and would distort the metric.
+        valid_mask = ~collision_flags
         axial = self._axial_index()
         axial_extent = bbox_extents[:, axial]
-        max_axial = float(axial_extent.max())
-        if max_axial > 0:
-            comp_ratio = (max_axial - float(axial_extent.min())) / max_axial
+        if valid_mask.any():
+            valid_axial = axial_extent[valid_mask]
+            max_axial = float(valid_axial.max())
+            if max_axial > 0:
+                comp_ratio = (max_axial - float(valid_axial.min())) / max_axial
+            else:
+                comp_ratio = 0.0
         else:
             comp_ratio = 0.0
 
@@ -838,6 +904,9 @@ class Simulator:
             bbox_extents=bbox_extents,
             compression_ratio=comp_ratio,
             locked=locked, locking_info=locking_info,
+            collision_at_theta=collision_flags,
+            collision_theta_min=collision_theta_min,
+            collision_theta_max=collision_theta_max,
         )
 
     # ==================================================================
