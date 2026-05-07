@@ -114,6 +114,43 @@ def test_joint_slider_drives_pose_when_result_present(main_window):
 # 3. Convention helpers (the boundary)
 # ---------------------------------------------------------------------------
 
+def test_joint_angle_release_leaves_view_in_posed_state(main_window):
+    """After committing a joint-angle change (e.g. slider release ->
+    JointAngleChangeCommand), the View3D should remain in the POSED
+    configuration rather than snapping back to the canonical lattice.
+
+    Regression: ``_refresh_state`` used to call ``_refresh_views``
+    AFTER ``simulation_panel.refresh_from_lattice``. The panel's
+    ``show_pose`` call ran first and then was immediately overwritten
+    by the canonical ``View3D.update_lattice`` render, so users saw
+    the figure snap back to rest after letting go of the slider.
+    Reordered so the panel's pose-driving is the last step.
+    """
+    win = main_window
+    panel = win.simulation_panel
+
+    # Run a kinematic sim so the panel has a sim_result that
+    # ``_drive_pose_from_slider`` can index into.
+    panel.run_simulation()
+    assert panel._sim_result is not None
+
+    # Commit a non-zero joint angle (simulating slider release).
+    target_rad = 0.5
+    win._on_joint_angle_change_requested(0.0, target_rad)
+
+    # Lattice's joint_angle is the new value.
+    assert win.lattice.joint_angle == pytest.approx(target_rad)
+
+    # View3D's last show_pose call should reflect a non-zero theta —
+    # i.e., the pose at the slider's current θ is what's displayed,
+    # not the rest pose. ``last_show_pose_args`` is set by
+    # ``View3D.show_pose`` (used by tests as an injection point).
+    assert panel._view_3d.last_show_pose_args is not None, (
+        "View3D should be displaying a posed mesh, not the canonical "
+        "mesh — _refresh_state's call order regressed."
+    )
+
+
 def test_run_simulation_uses_extended_range_with_collision_check(main_window):
     """``run_simulation`` should request the M2.8 extended sweep
     (theta_max=π, collision_stop=True) so the plot can shade

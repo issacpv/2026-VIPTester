@@ -342,12 +342,24 @@ class MainWindow(QMainWindow):
     def _refresh_state(self):
         """Refresh inspector + simulation panel + views + mode-gated
         edit action. Called after every command (redo/undo) and from
-        any other path that mutates the lattice."""
+        any other path that mutates the lattice.
+
+        Order matters: the canonical 3D render via ``_refresh_views``
+        runs FIRST, then ``simulation_panel.refresh_from_lattice``
+        drives the posed mesh on top of it. Reversing this order
+        means the panel's ``show_pose`` call gets immediately
+        overwritten by the canonical render, and the user-released
+        joint-angle slider snaps the visualisation back to rest
+        (regression reported as "the figure returns to original
+        structure after letting go of the slider").
+        """
         self.inspector.refresh_from_lattice()
-        self.simulation_panel.refresh_from_lattice()
         self._update_edit_action_enabled()
         self._update_edge_action_enabled()
         self._refresh_views()
+        # Must be last — drives the posed mesh on top of the canonical
+        # render that ``_refresh_views`` just installed.
+        self.simulation_panel.refresh_from_lattice()
 
     def _on_lattice_structurally_changed(self):
         """Like ``_refresh_state``, but also invalidates the simulation
