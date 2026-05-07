@@ -40,19 +40,25 @@ def main_window():
 # Toolbar actions
 # ---------------------------------------------------------------------------
 
+_CAM_ACTION_NAMES = (
+    "cam_top_act",  "cam_bottom_act",
+    "cam_front_act","cam_back_act",
+    "cam_side_act",
+    "cam_iso_act",
+    "cam_fit_act",
+)
+
+
 def test_toolbar_has_all_camera_preset_actions(main_window):
     win = main_window
-    for attr in ("cam_top_act", "cam_front_act", "cam_side_act",
-                 "cam_iso_act", "cam_fit_act"):
+    for attr in _CAM_ACTION_NAMES:
         assert hasattr(win, attr), f"missing toolbar action: {attr}"
 
 
 def test_camera_preset_toolbar_buttons_have_distinct_labels(main_window):
     win = main_window
-    labels = {win.cam_top_act.text(), win.cam_front_act.text(),
-              win.cam_side_act.text(), win.cam_iso_act.text(),
-              win.cam_fit_act.text()}
-    assert len(labels) == 5    # all distinct
+    labels = {getattr(win, attr).text() for attr in _CAM_ACTION_NAMES}
+    assert len(labels) == len(_CAM_ACTION_NAMES)   # all distinct
 
 
 def test_camera_preset_clicks_call_view3d_methods(main_window, monkeypatch):
@@ -63,8 +69,12 @@ def test_camera_preset_clicks_call_view3d_methods(main_window, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(win.view_3d, "camera_top",
                          lambda: calls.append("top"))
+    monkeypatch.setattr(win.view_3d, "camera_bottom",
+                         lambda: calls.append("bottom"))
     monkeypatch.setattr(win.view_3d, "camera_front",
                          lambda: calls.append("front"))
+    monkeypatch.setattr(win.view_3d, "camera_back",
+                         lambda: calls.append("back"))
     monkeypatch.setattr(win.view_3d, "camera_side",
                          lambda: calls.append("side"))
     monkeypatch.setattr(win.view_3d, "camera_isometric",
@@ -72,11 +82,13 @@ def test_camera_preset_clicks_call_view3d_methods(main_window, monkeypatch):
     monkeypatch.setattr(win.view_3d, "camera_fit",
                          lambda: calls.append("fit"))
     win.cam_top_act.trigger()
+    win.cam_bottom_act.trigger()
     win.cam_front_act.trigger()
+    win.cam_back_act.trigger()
     win.cam_side_act.trigger()
     win.cam_iso_act.trigger()
     win.cam_fit_act.trigger()
-    assert calls == ["top", "front", "side", "iso", "fit"]
+    assert calls == ["top", "bottom", "front", "back", "side", "iso", "fit"]
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +101,9 @@ def test_camera_methods_no_op_on_headless_view3d(main_window):
     v = main_window.view_3d
     assert v.interactor is None
     v.camera_top()
+    v.camera_bottom()
     v.camera_front()
+    v.camera_back()
     v.camera_side()
     v.camera_isometric()
     v.camera_fit()

@@ -625,12 +625,30 @@ class View3D(QWidget):
         except Exception:
             pass
 
+    def camera_bottom(self) -> None:
+        """Look straight up the -Z axis (bottom-up)."""
+        if self.interactor is None:
+            return
+        try:
+            self.interactor.view_xy(negative=True)
+        except Exception:
+            pass
+
     def camera_front(self) -> None:
         """Look along the +Y axis (front view)."""
         if self.interactor is None:
             return
         try:
             self.interactor.view_xz()
+        except Exception:
+            pass
+
+    def camera_back(self) -> None:
+        """Look along the -Y axis (back view)."""
+        if self.interactor is None:
+            return
+        try:
+            self.interactor.view_xz(negative=True)
         except Exception:
             pass
 
