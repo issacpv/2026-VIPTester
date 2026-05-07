@@ -219,6 +219,44 @@ class MainWindow(QMainWindow):
         regen_act.triggered.connect(self._regenerate)
         tb.addAction(regen_act)
 
+        tb.addSeparator()
+
+        # ---- Camera-preset buttons (3D viewport orientation) ------------
+        # Distinct from the Inspector's Top/Front/Side/Reset preset
+        # buttons: those rotate the LATTICE; these rotate the CAMERA.
+        # The clickable view cube in the View3D corner does the same
+        # job — these buttons are a redundant-but-handy shortcut and
+        # also work when the cube widget is unavailable (older PyVista).
+        self.cam_top_act = QAction("Top", self)
+        self.cam_top_act.setToolTip(
+            "Camera: top-down (XY view). Doesn't change the lattice.")
+        self.cam_top_act.triggered.connect(lambda: self.view_3d.camera_top())
+        tb.addAction(self.cam_top_act)
+
+        self.cam_front_act = QAction("Front", self)
+        self.cam_front_act.setToolTip(
+            "Camera: front (XZ view). Doesn't change the lattice.")
+        self.cam_front_act.triggered.connect(lambda: self.view_3d.camera_front())
+        tb.addAction(self.cam_front_act)
+
+        self.cam_side_act = QAction("Side", self)
+        self.cam_side_act.setToolTip(
+            "Camera: right side (YZ view). Doesn't change the lattice.")
+        self.cam_side_act.triggered.connect(lambda: self.view_3d.camera_side())
+        tb.addAction(self.cam_side_act)
+
+        self.cam_iso_act = QAction("Iso", self)
+        self.cam_iso_act.setToolTip(
+            "Camera: isometric 3/4 view. Doesn't change the lattice.")
+        self.cam_iso_act.triggered.connect(lambda: self.view_3d.camera_isometric())
+        tb.addAction(self.cam_iso_act)
+
+        self.cam_fit_act = QAction("Fit", self)
+        self.cam_fit_act.setToolTip(
+            "Reframe the camera so the whole lattice is visible.")
+        self.cam_fit_act.triggered.connect(lambda: self.view_3d.camera_fit())
+        tb.addAction(self.cam_fit_act)
+
         self._toolbar = tb
 
     def _build_menus(self):

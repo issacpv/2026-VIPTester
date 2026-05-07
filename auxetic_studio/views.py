@@ -527,6 +527,13 @@ class View3D(QWidget):
         # Test-friendly tap mirroring last_show_pose_args.
         self.last_force_glyphs: list | None = None
 
+        # Track whether the orientation/widget extras are active so
+        # tests / external callers can introspect.
+        self.has_grid           = False
+        self.has_axes           = False
+        self.has_view_cube      = False
+        self._view_cube_widget  = None
+
         if force_placeholder or not _PYVISTAQT_AVAILABLE:
             return
 
@@ -536,6 +543,112 @@ class View3D(QWidget):
         except Exception:
             # VTK / Qt platform mismatch — leave the widget empty.
             self.interactor = None
+
+        if self.interactor is not None:
+            self._install_3d_navigation_aids()
+
+    # ------------------------------------------------------------------
+    # 3D navigation aids (Fusion-360-style grid + axes triad + view cube)
+    # ------------------------------------------------------------------
+
+    def _install_3d_navigation_aids(self) -> None:
+        """Add the standard 3D-app navigation widgets to the interactor:
+
+        - **Floor grid + bbox** (PyVista's ``show_grid``) — gives the
+          user a frame of reference instead of a black void.
+        - **XYZ axes triad** in the lower-left (``add_axes``) — small
+          coloured triad showing world orientation. Always visible.
+        - **Clickable view cube** in the upper-right
+          (``add_camera_orientation_widget``) — clickable cube faces
+          snap the camera to top / front / side / etc., the same UX as
+          Fusion 360 / SolidWorks / OnShape.
+
+        Each call is wrapped in try/except because the underlying VTK
+        widget classes vary by version and we don't want a missing
+        widget to take down the rest of the viewer.
+        """
+        try:
+            self.interactor.show_grid(color="grey", show_zaxis=True)
+            self.has_grid = True
+        except Exception:
+            self.has_grid = False
+        try:
+            self.interactor.add_axes(
+                interactive=False,
+                line_width=2,
+            )
+            self.has_axes = True
+        except Exception:
+            self.has_axes = False
+        # PyVista exposes the VTK camera-orientation widget via
+        # ``add_camera_orientation_widget``. Some older PyVista builds
+        # don't have this method — fall back gracefully.
+        try:
+            widget = self.interactor.add_camera_orientation_widget()
+            self._view_cube_widget = widget
+            self.has_view_cube = True
+        except Exception:
+            self._view_cube_widget = None
+            self.has_view_cube = False
+
+    # ------------------------------------------------------------------
+    # Camera presets (Top / Front / Side / Iso / Fit)
+    # ------------------------------------------------------------------
+    #
+    # These drive the CAMERA only — they don't touch the lattice's
+    # rigid_rotation field. Conceptually distinct from the
+    # InspectorPanel's "Top/Front/Side/Reset" buttons, which orient the
+    # LATTICE in world space (and go through the undo stack). The
+    # InspectorPanel buttons rotate the auxetic; these buttons rotate
+    # the user's viewpoint.
+
+    def camera_top(self) -> None:
+        """Look straight down the +Z axis (top-down)."""
+        if self.interactor is None:
+            return
+        try:
+            self.interactor.view_xy()
+        except Exception:
+            pass
+
+    def camera_front(self) -> None:
+        """Look along the +Y axis (front view)."""
+        if self.interactor is None:
+            return
+        try:
+            self.interactor.view_xz()
+        except Exception:
+            pass
+
+    def camera_side(self) -> None:
+        """Look along the +X axis (right side)."""
+        if self.interactor is None:
+            return
+        try:
+            self.interactor.view_yz()
+        except Exception:
+            pass
+
+    def camera_isometric(self) -> None:
+        """Standard ISO 3/4 view."""
+        if self.interactor is None:
+            return
+        try:
+            self.interactor.view_isometric()
+        except Exception:
+            pass
+
+    def camera_fit(self) -> None:
+        """Re-frame the camera so the current scene fills the
+        viewport. Useful after a big lattice change."""
+        if self.interactor is None:
+            return
+        try:
+            self.interactor.reset_camera()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
 
     def update_lattice(self, lattice):
         # Cache for ``clear_pose`` fall-back, regardless of whether
