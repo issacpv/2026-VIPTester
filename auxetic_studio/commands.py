@@ -280,6 +280,55 @@ class ForceListChangeCommand(QUndoCommand):
     def undo(self) -> None: self._apply(self.old_forces)
 
 
+class RecommendationApplyCommand(QUndoCommand):
+    """Atomically install a (ground_face, edge_flips, joint_angle)
+    triple — typically the output of :func:`auxetic_ml.model.predict_best_action`.
+
+    Three lattice fields move together so the user sees ONE undo
+    entry per "Apply Recommendation" click rather than three. Stores
+    the prior values for undo so reverting restores the exact
+    pre-apply configuration.
+    """
+
+    def __init__(self,
+                 lattice: Lattice,
+                 new_ground_face,
+                 new_edge_flips,
+                 new_joint_angle: float,
+                 on_change: Callback = None):
+        super().__init__("Apply prediction")
+        import copy
+        self.lattice            = lattice
+        self.old_ground_face    = lattice.dynamics_state.get("ground_face")
+        self.old_edge_flips     = set(lattice.edge_flips)
+        self.old_joint_angle    = float(lattice.joint_angle)
+        self.new_ground_face    = (None if new_ground_face is None
+                                   else str(new_ground_face))
+        self.new_edge_flips     = set(
+            tuple(sorted((int(a), int(b)))) for a, b in (new_edge_flips or ())
+        )
+        self.new_joint_angle    = float(new_joint_angle)
+        self.on_change          = on_change
+
+    def _apply(self, ground_face, edge_flips, joint_angle: float) -> None:
+        self.lattice.dynamics_state["ground_face"] = ground_face
+        self.lattice.edge_flips                    = set(edge_flips)
+        self.lattice.joint_angle                   = float(joint_angle)
+        # Re-triangulate so the new edge_flips set takes effect.
+        if self.lattice.points is not None:
+            self.lattice.regenerate_from_points(self.lattice.points)
+        if self.on_change is not None:
+            self.on_change()
+
+    def redo(self) -> None:
+        self._apply(self.new_ground_face, self.new_edge_flips,
+                    self.new_joint_angle)
+
+    def undo(self) -> None:
+        self._apply(self.old_ground_face, self.old_edge_flips,
+                    self.old_joint_angle)
+
+
 class JointAngleChangeCommand(QUndoCommand):
     """Set ``lattice.joint_angle`` (radians). Pushed on slider release,
     not on every tick — the SimulationPanel debounces."""

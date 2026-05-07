@@ -22,6 +22,7 @@ from .views import View2D, View3D
 from .inspector import InspectorPanel
 from .preset import save_preset, load_preset
 from .simulation_panel import SimulationPanel
+from .predictor_panel import PredictorPanel
 from .commands import (
     MovePointCommand,
     ParameterChangeCommand,
@@ -32,6 +33,7 @@ from .commands import (
     FlipEdgeCommand,
     ForceListChangeCommand,
     JointAngleChangeCommand,
+    RecommendationApplyCommand,
 )
 
 
@@ -125,6 +127,22 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.RightDockWidgetArea, self.simulation_panel
         )
         self._simulation_dock = self.simulation_panel
+
+        # ---- predictor panel dock (M3) ----------------------------------
+        # Tabified with the simulation dock so the right column doesn't
+        # get crowded; users switch between Simulation and Predictor
+        # via the dock-tab strip.
+        self.predictor_panel = PredictorPanel(self.lattice, parent=self)
+        self.predictor_panel.applyRecommendationRequested.connect(
+            self._on_apply_recommendation_requested
+        )
+        self.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, self.predictor_panel
+        )
+        self.tabifyDockWidget(self.simulation_panel, self.predictor_panel)
+        # Keep Simulation as the visible tab on first launch.
+        self.simulation_panel.raise_()
+        self._predictor_dock = self.predictor_panel
 
         # ---- left toolbar ------------------------------------------------
         self._build_toolbar()
@@ -552,6 +570,21 @@ class MainWindow(QMainWindow):
         )
         self.undo_stack.push(cmd)
 
+    def _on_apply_recommendation_requested(self,
+                                            ground_face,
+                                            edge_flips,
+                                            joint_angle_rad: float):
+        """Predictor panel emits this when the user clicks Apply on a
+        recommendation. Wrap as a single ``RecommendationApplyCommand``
+        so the three lattice fields move atomically and undo restores
+        the prior config in one click."""
+        cmd = RecommendationApplyCommand(
+            self.lattice,
+            ground_face, edge_flips, joint_angle_rad,
+            on_change=self._on_dynamics_state_changed,
+        )
+        self.undo_stack.push(cmd)
+
     def _on_dynamics_state_changed(self):
         """Invalidate the simulation panel's stale dynamics result and
         repaint everything that depends on the lattice. Used as the
@@ -569,6 +602,7 @@ class MainWindow(QMainWindow):
         self.lattice = Lattice(mode=1, n_points=5, ratio=0.35, nz_layers=2, seed=42)
         self.inspector.set_lattice(self.lattice)
         self.simulation_panel.set_lattice(self.lattice)
+        self.predictor_panel.set_lattice(self.lattice)
         self.undo_stack.clear()
         self._current_path = None
         self.setWindowTitle("Auxetic Studio")
@@ -588,6 +622,7 @@ class MainWindow(QMainWindow):
             return
         self.inspector.set_lattice(self.lattice)
         self.simulation_panel.set_lattice(self.lattice)
+        self.predictor_panel.set_lattice(self.lattice)
         self.undo_stack.clear()
         self._current_path = path
         self.setWindowTitle(f"Auxetic Studio — {os.path.basename(path)}")
@@ -614,6 +649,7 @@ class MainWindow(QMainWindow):
         self.lattice = new_lattice
         self.inspector.set_lattice(self.lattice)
         self.simulation_panel.set_lattice(self.lattice)
+        self.predictor_panel.set_lattice(self.lattice)
         self.undo_stack.clear()
         self._current_path = None
         self.setWindowTitle(
@@ -724,6 +760,10 @@ class MainWindow(QMainWindow):
         # MainWindow lifecycles in the same process.
         try:
             self.simulation_panel.shutdown()
+        except Exception:
+            pass
+        try:
+            self.predictor_panel.shutdown()
         except Exception:
             pass
         super().closeEvent(event)
