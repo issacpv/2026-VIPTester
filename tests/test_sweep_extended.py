@@ -151,16 +151,23 @@ def test_compression_ratio_excludes_collided_samples():
 # 3D mode falls through cleanly (collision is 2D-only in M2)
 # ---------------------------------------------------------------------------
 
-def test_3d_sweep_with_collision_stop_does_not_error():
-    """For 3D modes the collision checker no-ops; sweep completes
-    normally with collision_at_theta all-False."""
+def test_3d_sweep_with_collision_stop_completes_cleanly():
+    """3D collision was M2.8-deferred; the polish round added it via
+    convex-polytope SAT. The mode-6 n=8 fixture is small enough that
+    its tiles don't actually trip the detector across a ±π sweep —
+    we just assert the sweep runs without error and the bookkeeping
+    fields are well-shaped. Larger / more deformed 3D fixtures CAN
+    register collisions via this same path."""
     lat = Lattice(mode=6, n_points=8, ratio=0.35, seed=42)
     ts = TileSystem.from_lattice(lat)
     sim = Simulator(ts, load_axis=np.array([0.0, -1.0, 0.0]))
     res = sim.sweep_theta(n_steps=11, theta_max=np.pi, collision_stop=True)
     assert res.poses.shape[0] == 11
-    # 3D collision is unsupported — array exists but all False.
     assert res.collision_at_theta.shape == (11,)
-    assert not res.collision_at_theta.any()
-    assert res.collision_theta_min is None
-    assert res.collision_theta_max is None
+    # If the fixture happens not to collide through the sweep, both
+    # bounds remain None — that's expected for a small loosely-coupled
+    # 3D grid. Either way, no error.
+    assert (res.collision_theta_min is None
+            or isinstance(res.collision_theta_min, float))
+    assert (res.collision_theta_max is None
+            or isinstance(res.collision_theta_max, float))

@@ -1,13 +1,8 @@
-"""Tests for ``auxetic.collision`` — 2D SAT polygon overlap and the
-``CollisionChecker`` that wraps it for kirigami pose evaluation.
-
-The detector is 2D-only in M2; 3D tile systems return no collisions
-with a one-time warning.
-"""
+"""Tests for ``auxetic.collision`` — SAT polygon overlap (2D, M2.8)
+and convex-polytope SAT (3D, M3 polish), plus the
+``CollisionChecker`` that wraps them for kirigami pose evaluation."""
 
 from __future__ import annotations
-
-import warnings
 
 import numpy as np
 import pytest
@@ -161,25 +156,78 @@ def test_pose_rotation_brings_tiles_together():
 
 
 # ---------------------------------------------------------------------------
-# 3D smoke
+# 3D SAT primitive
 # ---------------------------------------------------------------------------
 
-def test_3d_collision_returns_false_with_warning():
-    ts = TileSystem(
-        3,
-        tiles=[
-            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
-                      [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
-            np.array([[0.5, 0.5, 0.5], [1.5, 0.5, 0.5],
-                      [0.5, 1.5, 0.5], [0.5, 0.5, 1.5]]),
-        ],
-        constraints=[],
-    )
-    # Reset the once-warned flag so this test can independently see it.
-    CollisionChecker._warned_3d = False
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        cc = CollisionChecker(ts)
-        result = cc.has_collision(cc._sim.rest_pose())
-    assert result is False
-    assert any("2D-only" in str(w.message) for w in caught)
+UNIT_TET = np.array([
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+])
+
+
+def test_polytopes_overlap_3d_separated_returns_false():
+    from auxetic.collision import polytopes_overlap_3d
+    a = UNIT_TET.copy()
+    b = UNIT_TET.copy() + np.array([3.0, 0.0, 0.0])
+    assert polytopes_overlap_3d(a, b) is False
+
+
+def test_polytopes_overlap_3d_overlapping_returns_true():
+    from auxetic.collision import polytopes_overlap_3d
+    a = UNIT_TET.copy()
+    b = UNIT_TET.copy() + np.array([0.2, 0.2, 0.2])
+    assert polytopes_overlap_3d(a, b) is True
+
+
+def test_polytopes_overlap_3d_face_touching_with_positive_tol():
+    from auxetic.collision import polytopes_overlap_3d
+    a = UNIT_TET.copy()
+    b = UNIT_TET.copy() + np.array([1.0, 0.0, 0.0])  # share a vertex on the +x face
+    assert polytopes_overlap_3d(a, b, tol=1e-6) is False
+
+
+def test_polytopes_overlap_3d_invalid_dim_raises():
+    from auxetic.collision import polytopes_overlap_3d
+    with pytest.raises(ValueError, match="expects \\(N, 3\\)"):
+        polytopes_overlap_3d(np.zeros((4, 2)), UNIT_TET)
+
+
+# ---------------------------------------------------------------------------
+# CollisionChecker — 3D path
+# ---------------------------------------------------------------------------
+
+def _two_far_tets() -> TileSystem:
+    t0 = UNIT_TET.copy()
+    t1 = UNIT_TET.copy() + np.array([4.0, 0.0, 0.0])
+    return TileSystem(3, [t0, t1], constraints=[])
+
+
+def _two_overlapping_tets() -> TileSystem:
+    t0 = UNIT_TET.copy()
+    t1 = UNIT_TET.copy() + np.array([0.3, 0.3, 0.3])
+    return TileSystem(3, [t0, t1], constraints=[])
+
+
+def test_3d_no_collision_at_rest_when_separated():
+    cc = CollisionChecker(_two_far_tets())
+    assert cc.has_collision(cc._sim.rest_pose()) is False
+    assert cc.colliding_pairs(cc._sim.rest_pose()) == []
+
+
+def test_3d_collision_detected_when_overlapping():
+    cc = CollisionChecker(_two_overlapping_tets())
+    assert cc.has_collision(cc._sim.rest_pose()) is True
+    assert cc.colliding_pairs(cc._sim.rest_pose()) == [(0, 1)]
+
+
+def test_3d_constraint_pair_not_flagged():
+    """Two tetrahedra sharing a vertex via an explicit Constraint
+    should be exempted from the collision check."""
+    t0 = UNIT_TET.copy()
+    t1 = UNIT_TET.copy() + np.array([1.0, 0.0, 0.0])  # share (1,0,0)
+    constraints = [Constraint(0, 1, 1, 0, 1)]
+    ts = TileSystem(3, [t0, t1], constraints=constraints)
+    cc = CollisionChecker(ts)
+    assert cc.has_collision(cc._sim.rest_pose()) is False

@@ -521,6 +521,11 @@ class View3D(QWidget):
         self.last_show_pose_args: tuple | None = None
         # State flag — True between show_pose and clear_pose.
         self._pose_view_active = False
+        # M3-polish: list of VTK actors holding force-arrow glyphs.
+        # Replaced wholesale on each ``set_force_glyphs`` call.
+        self._force_actors: list = []
+        # Test-friendly tap mirroring last_show_pose_args.
+        self.last_force_glyphs: list | None = None
 
         if force_placeholder or not _PYVISTAQT_AVAILABLE:
             return
@@ -654,6 +659,142 @@ class View3D(QWidget):
         self.last_show_pose_args = None
         if self._cached_lattice is not None:
             self.update_lattice(self._cached_lattice)
+
+    # ------------------------------------------------------------------
+    # Force-arrow glyphs (M2 polish — visual feedback for ForceVectors)
+    # ------------------------------------------------------------------
+
+    def set_force_glyphs(self, tile_system, forces) -> None:
+        """Render one arrow per :class:`ForceVector` at its world
+        application point. Called by the simulation panel whenever
+        the force list, the lattice, or the cached tile system
+        changes.
+
+        ``forces`` is the raw list of force dicts as stored in
+        ``lattice.dynamics_state['forces']``. ``tile_system`` is the
+        same TileSystem used by the kinematic / dynamic solvers — its
+        tile vertices are already in world frame.
+
+        Arrow length is normalised across the active force list so
+        the largest force renders at a fixed visual size and smaller
+        forces are proportionally shorter; this avoids tiny invisible
+        arrows when one big force dominates the dynamics.
+        """
+        # Always update the test-friendly tap, even when headless.
+        self.last_force_glyphs = self._compute_glyph_data(tile_system, forces)
+        self._clear_force_actors()
+        if self.interactor is None:
+            return
+        if not self.last_force_glyphs:
+            try:
+                self.interactor.render()
+            except Exception:
+                pass
+            return
+        # Pick a render scale so the largest force is ~10% of the
+        # bbox diagonal — visible but not dominating.
+        scale = self._glyph_render_scale(tile_system, self.last_force_glyphs)
+        try:
+            for origin, direction, mag_norm in self.last_force_glyphs:
+                arrow = pv.Arrow(
+                    start=tuple(origin),
+                    direction=tuple(direction),
+                    scale=float(scale * max(0.1, mag_norm)),
+                )
+                actor = self.interactor.add_mesh(
+                    arrow, color="crimson", show_edges=False,
+                )
+                self._force_actors.append(actor)
+            self.interactor.render()
+        except Exception:
+            # If glyph rendering fails (e.g. VTK quirks), drop the
+            # actors and continue without crashing the panel.
+            self._clear_force_actors()
+
+    def clear_force_glyphs(self) -> None:
+        """Remove all force arrows. Used when forces are emptied or
+        the panel is rebound to a lattice without forces."""
+        self.last_force_glyphs = []
+        self._clear_force_actors()
+        if self.interactor is not None:
+            try:
+                self.interactor.render()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _compute_glyph_data(tile_system, forces) -> list:
+        """Pure helper, no Qt / VTK touching — returns
+        ``[(origin_xyz, dir_xyz, mag_normalised), ...]``. Used as the
+        test-friendly tap and consumed by the actor-creation path."""
+        import numpy as _np
+        if not forces or tile_system is None:
+            return []
+        # Extract magnitudes for normalisation (keep raw too for the
+        # "no scaling" branch when only one non-zero force exists).
+        raw_mags = [
+            float(f.get("magnitude", 0.0)) for f in forces
+        ]
+        max_mag = max((abs(m) for m in raw_mags), default=1.0)
+        if max_mag < 1e-12:
+            max_mag = 1.0
+        out = []
+        n_tiles = tile_system.n_tiles
+        dim = tile_system.dimension
+        for f, mag in zip(forces, raw_mags):
+            tile_idx = int(f.get("tile_index", -1))
+            if not (0 <= tile_idx < n_tiles):
+                continue
+            tile_verts = _np.asarray(tile_system.tiles[tile_idx], dtype=float)
+            kind = str(f.get("location_kind", "tile_centroid"))
+            if kind == "tile_vertex":
+                v_idx = int(f.get("vert_index", -1))
+                if not (0 <= v_idx < tile_verts.shape[0]):
+                    continue
+                origin = tile_verts[v_idx]
+            else:   # tile_centroid (default) or anything else falls back
+                origin = tile_verts.mean(axis=0)
+            # Direction (3D padded for 2D tiles)
+            d = list(f.get("direction") or [1.0, 0.0, 0.0])
+            while len(d) < 3:
+                d.append(0.0)
+            origin3 = _np.zeros(3, dtype=float)
+            origin3[: min(3, dim)] = origin[: min(3, dim)]
+            direction3 = _np.asarray(d[:3], dtype=float)
+            n = float(_np.linalg.norm(direction3))
+            if n < 1e-12:
+                continue
+            direction3 = direction3 / n
+            mag_norm = float(abs(mag) / max_mag)
+            out.append((origin3, direction3, mag_norm))
+        return out
+
+    @staticmethod
+    def _glyph_render_scale(tile_system, glyph_data) -> float:
+        """Pick a per-arrow length scale (for ``pv.Arrow(scale=...)``)
+        that renders the largest force at ~10% of the lattice's bbox
+        diagonal."""
+        import numpy as _np
+        try:
+            all_v = _np.vstack(tile_system.tiles)
+            if all_v.shape[1] == 2:
+                all_v = _np.hstack([all_v, _np.zeros((all_v.shape[0], 1))])
+            bbox = all_v.max(axis=0) - all_v.min(axis=0)
+            diag = float(_np.linalg.norm(bbox))
+            return max(diag * 0.10, 0.05)
+        except Exception:
+            return 0.1
+
+    def _clear_force_actors(self) -> None:
+        if self.interactor is None:
+            self._force_actors.clear()
+            return
+        for actor in self._force_actors:
+            try:
+                self.interactor.remove_actor(actor)
+            except Exception:
+                pass
+        self._force_actors.clear()
 
     @staticmethod
     def _build_pose_mesh_triangles(tile_system, pose, *, lattice=None):

@@ -412,7 +412,36 @@ class SimulationPanel(QDockWidget):
         # also goes through ``_suspend`` to avoid emitting cellChanged
         # for every populated cell.
         self._populate_forces_table_from_lattice()
+        self._refresh_force_glyphs()
         self._drive_pose_from_slider(slider_deg)
+
+    def _refresh_force_glyphs(self) -> None:
+        """Render (or clear) the View3D force-arrow glyphs to match
+        ``lattice.dynamics_state['forces']``. Requires a cached
+        TileSystem to know where each tile sits in world space — we
+        keep that cached after Run Simulation / Run Dynamic, so
+        glyphs only appear once a sim has been run.
+
+        UX justification: arrow placement requires tile centroids
+        which are NOT lattice point coords (each tile is a small
+        triangle inside a Delaunay simplex). Building the TileSystem
+        ad-hoc on every refresh is expensive; reusing the cached one
+        is free and costs only a "run sim once first" requirement
+        before glyphs appear.
+        """
+        if self._view_3d is None:
+            return
+        forces = self._lattice.dynamics_state.get("forces") or []
+        if self._tile_system is None or not forces:
+            try:
+                self._view_3d.clear_force_glyphs()
+            except Exception:
+                pass
+            return
+        try:
+            self._view_3d.set_force_glyphs(self._tile_system, forces)
+        except Exception:
+            pass
 
     def mark_outdated(self) -> None:
         """Called by MainWindow whenever the lattice changes (regenerate,

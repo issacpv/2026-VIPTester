@@ -300,6 +300,129 @@ def test_force_changes_invalidate_dynamics_result(main_window):
     assert panel._dynamics_result is None
 
 
+# ---------------------------------------------------------------------------
+# Force-arrow glyphs in View3D (M3 polish)
+# ---------------------------------------------------------------------------
+
+def test_force_glyphs_empty_when_no_forces(main_window):
+    """No forces, no arrows — even after a sim run."""
+    panel = main_window.simulation_panel
+    panel.run_simulation()
+    panel._refresh_force_glyphs()
+    glyphs = main_window.view_3d.last_force_glyphs
+    assert glyphs == [] or glyphs is None
+
+
+def test_force_glyphs_populate_after_run_sim_with_forces(main_window):
+    """One force, one arrow. The glyph data is recorded in
+    ``View3D.last_force_glyphs`` regardless of whether the underlying
+    VTK interactor renders (works headless too)."""
+    panel = main_window.simulation_panel
+    # Add a force first so it's present when run_simulation caches the
+    # tile system.
+    panel._on_add_force()
+    panel.run_simulation()
+    panel._refresh_force_glyphs()
+    glyphs = main_window.view_3d.last_force_glyphs
+    assert glyphs is not None
+    assert len(glyphs) == 1
+    origin, direction, mag_norm = glyphs[0]
+    assert origin.shape == (3,)
+    assert direction.shape == (3,)
+    # Largest magnitude in the list normalises to 1.0.
+    assert mag_norm == pytest.approx(1.0)
+
+
+def test_force_glyph_normalisation_picks_largest():
+    """Two forces with magnitudes 1 and 5 → mag_norms 0.2 and 1.0."""
+    import numpy as np
+    from auxetic_studio.views import View3D
+    from auxetic.simulation import TileSystem
+
+    tiles = [np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]])]
+    ts = TileSystem(2, tiles, constraints=[])
+    forces = [
+        {"location_kind": "tile_centroid", "tile_index": 0,
+         "vert_index": -1, "direction": [1.0, 0.0, 0.0], "magnitude": 1.0},
+        {"location_kind": "tile_centroid", "tile_index": 0,
+         "vert_index": -1, "direction": [0.0, 1.0, 0.0], "magnitude": 5.0},
+    ]
+    glyphs = View3D._compute_glyph_data(ts, forces)
+    assert len(glyphs) == 2
+    mags = sorted(g[2] for g in glyphs)
+    assert mags[0] == pytest.approx(0.2)
+    assert mags[1] == pytest.approx(1.0)
+
+
+def test_force_glyph_uses_tile_centroid_when_vert_index_negative():
+    import numpy as np
+    from auxetic_studio.views import View3D
+    from auxetic.simulation import TileSystem
+
+    # Triangle centroid at (0.5, 0.333…)
+    tiles = [np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]])]
+    ts = TileSystem(2, tiles, constraints=[])
+    forces = [{
+        "location_kind": "tile_centroid", "tile_index": 0,
+        "vert_index": -1, "direction": [1.0, 0.0, 0.0], "magnitude": 1.0,
+    }]
+    glyphs = View3D._compute_glyph_data(ts, forces)
+    assert len(glyphs) == 1
+    origin = glyphs[0][0]
+    np.testing.assert_allclose(origin[:2], [0.5, 1.0 / 3.0], atol=1e-6)
+
+
+def test_force_glyph_uses_specific_vertex_when_kind_is_tile_vertex():
+    import numpy as np
+    from auxetic_studio.views import View3D
+    from auxetic.simulation import TileSystem
+
+    tiles = [np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]])]
+    ts = TileSystem(2, tiles, constraints=[])
+    forces = [{
+        "location_kind": "tile_vertex", "tile_index": 0,
+        "vert_index": 1, "direction": [0.0, 1.0, 0.0], "magnitude": 2.0,
+    }]
+    glyphs = View3D._compute_glyph_data(ts, forces)
+    origin = glyphs[0][0]
+    np.testing.assert_allclose(origin[:2], [1.0, 0.0], atol=1e-12)
+
+
+def test_force_glyph_skips_invalid_tile_or_vertex_indices():
+    """Out-of-range tile_index or vert_index → silently skip the
+    record so the panel doesn't crash on partially-edited tables."""
+    import numpy as np
+    from auxetic_studio.views import View3D
+    from auxetic.simulation import TileSystem
+
+    tiles = [np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]])]
+    ts = TileSystem(2, tiles, constraints=[])
+    forces = [
+        {"location_kind": "tile_centroid", "tile_index": 99,
+         "vert_index": -1, "direction": [1.0, 0.0, 0.0], "magnitude": 1.0},
+        {"location_kind": "tile_vertex", "tile_index": 0,
+         "vert_index": 7, "direction": [1.0, 0.0, 0.0], "magnitude": 1.0},
+    ]
+    assert View3D._compute_glyph_data(ts, forces) == []
+
+
+def test_force_glyph_skips_zero_direction():
+    """A zero-direction force can't be normalised → drop it from the
+    glyph list (the dataset / table editor would never produce one in
+    practice but the helper guards against it)."""
+    import numpy as np
+    from auxetic_studio.views import View3D
+    from auxetic.simulation import TileSystem
+
+    tiles = [np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]])]
+    ts = TileSystem(2, tiles, constraints=[])
+    forces = [{
+        "location_kind": "tile_centroid", "tile_index": 0,
+        "vert_index": -1, "direction": [0.0, 0.0, 0.0], "magnitude": 1.0,
+    }]
+    assert View3D._compute_glyph_data(ts, forces) == []
+
+
 def test_force_table_populates_from_lattice_on_set_lattice(main_window):
     """When the panel is rebound to a lattice that already has forces
     (e.g. after File → Open of a v4 preset), the table should reflect

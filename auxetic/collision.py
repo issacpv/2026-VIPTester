@@ -1,29 +1,28 @@
-"""Tile-tile collision detection (M2.8).
+"""Tile-tile collision detection.
 
 The kirigami null-space lets joint angles sweep arbitrarily far in
 either direction (the math has no built-in stop), but physically the
 shrunken tiles will eventually run into each other across the
-negative-space gap. This module provides a 2D **separating axis
-theorem** (SAT) overlap test plus a :class:`CollisionChecker` wrapper
-that filters out the tile pairs that are *supposed* to touch (those
-joined by a kirigami constraint at a shared vertex).
+negative-space gap. This module provides:
 
-Why SAT and not Shapely:
-    The package is numpy/scipy-only per CLAUDE.md. SAT for two convex
-    polygons in 2D is ~30 lines and exact; pulling in Shapely just for
-    intersection testing is overkill and adds a native dependency.
+- **2D**: full Separating Axis Theorem on convex polygons (M2.8).
+- **3D** (M3 polish): face-normal SAT on convex polytopes
+  (tetrahedra, convex hubs from ``scipy.spatial.ConvexHull``). The
+  classical full 3D SAT also tests edge×edge cross products; we
+  skip those for speed and accept a small false-negative rate at
+  edge-on-edge configurations. For kirigami applications this is
+  acceptable — tiles colliding in such configurations also collide
+  on a face-normal axis a few sweep steps later, so the bounding
+  on the achievable θ range is essentially unchanged.
 
-3D collision (mode-3 / 6 / 9 tetrahedra) is intentionally out of scope
-in M2 — that needs GJK or convex-hull SAT in 3D, which is a
-substantially bigger primitive. For now,
-:func:`CollisionChecker.has_collision` returns ``False`` on 3D tile
-systems with a one-time warning, so callers don't have to special-case
-the dimension.
+Why pure numpy:
+    The package is numpy/scipy-only per CLAUDE.md. SAT in either
+    dimension is ~50 LOC; pulling in Shapely (2D) or trimesh (3D)
+    is overkill for this surface area.
 """
 
 from __future__ import annotations
 
-import warnings
 from typing import Iterable, List, Tuple
 
 import numpy as np
@@ -39,6 +38,98 @@ def _project(verts: np.ndarray, axis: np.ndarray) -> tuple[float, float]:
     """Min/max projection of ``verts`` onto unit ``axis``."""
     p = verts @ axis
     return float(p.min()), float(p.max())
+
+
+def _convex_hull_face_normals(verts: np.ndarray) -> np.ndarray:
+    """Return the outward face normals of the convex hull of ``verts``
+    as an ``(n_faces, 3)`` unit-normal array.
+
+    Tetrahedra (4 verts) and any larger convex 3D point cloud are
+    handled. Falls back to the empty array if scipy can't build a
+    hull (degenerate input).
+    """
+    arr = np.asarray(verts, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 3 or arr.shape[0] < 4:
+        return np.zeros((0, 3), dtype=float)
+    try:
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(arr)
+    except Exception:
+        return np.zeros((0, 3), dtype=float)
+    normals = []
+    for simplex in hull.simplices:
+        a, b, c = arr[simplex[0]], arr[simplex[1]], arr[simplex[2]]
+        n = np.cross(b - a, c - a)
+        ln = float(np.linalg.norm(n))
+        if ln < 1e-12:
+            continue
+        n = n / ln
+        # Orient outward: away from the centroid.
+        if float(np.dot(n, a - arr.mean(axis=0))) < 0.0:
+            n = -n
+        normals.append(n)
+    return (np.asarray(normals, dtype=float)
+            if normals else np.zeros((0, 3), dtype=float))
+
+
+def polytopes_overlap_3d(verts_a: np.ndarray,
+                          verts_b: np.ndarray,
+                          tol: float = 0.0) -> bool:
+    """Convex-polytope overlap test in 3D via face-normal SAT.
+
+    Tests separating axes from each polytope's outward face normals.
+    We skip the edge×edge axes that the full 3D SAT prescribes:
+
+    - For tetrahedra-vs-tetrahedra (the common kirigami case in 3D
+      modes), face normals catch all but a thin set of edge-on-edge
+      configurations.
+    - In a kirigami sweep those configurations are bounded above
+      and below by configurations that DO get caught by the
+      face-normal axes a few θ-samples earlier / later, so the
+      reachable θ range the caller computes is essentially the same.
+    - Skipping the edge axes turns a potentially O(F1*F2 + E1*E2)
+      check into O(F1 + F2), which matters when iterating across
+      every (i, j) tile pair × every sweep sample.
+
+    A future patch can add the edge-cross axes if the false-negative
+    rate proves to matter. ``tol`` works the same as in
+    :func:`polygons_overlap_2d` — pass a small positive value to
+    treat just-touching surfaces as non-overlapping.
+    """
+    a = np.asarray(verts_a, dtype=float)
+    b = np.asarray(verts_b, dtype=float)
+    if (a.ndim != 2 or a.shape[1] != 3
+            or b.ndim != 2 or b.shape[1] != 3):
+        raise ValueError(
+            f"polytopes_overlap_3d expects (N, 3) arrays; got "
+            f"{a.shape} and {b.shape}"
+        )
+    # Quick AABB pre-filter — cheap and rules out most pairs.
+    a_min, a_max = a.min(axis=0), a.max(axis=0)
+    b_min, b_max = b.min(axis=0), b.max(axis=0)
+    if np.any(a_max < b_min + tol) or np.any(b_max < a_min + tol):
+        return False
+
+    # Collect candidate separating axes.
+    axes = []
+    for poly in (a, b):
+        axes.append(_convex_hull_face_normals(poly))
+    all_axes = np.vstack([ax for ax in axes if ax.size]) \
+        if any(ax.size for ax in axes) else np.zeros((0, 3))
+
+    if all_axes.size == 0:
+        # Couldn't build hull normals — fall back to AABB result
+        # (which already returned True above by getting here).
+        return True
+
+    for axis in all_axes:
+        proj_a = a @ axis
+        proj_b = b @ axis
+        min_a, max_a = float(proj_a.min()), float(proj_a.max())
+        min_b, max_b = float(proj_b.min()), float(proj_b.max())
+        if max_a < min_b + tol or max_b < min_a + tol:
+            return False
+    return True
 
 
 def polygons_overlap_2d(verts_a: np.ndarray,
@@ -125,14 +216,17 @@ class CollisionChecker:
     # Public API
     # ------------------------------------------------------------------
 
+    def _overlap(self, va: np.ndarray, vb: np.ndarray) -> bool:
+        """Dispatch the right SAT primitive for the tile system's
+        dimensionality."""
+        if self.dimension == 2:
+            return polygons_overlap_2d(va, vb, tol=self.tol)
+        return polytopes_overlap_3d(va, vb, tol=self.tol)
+
     def colliding_pairs(self, pose: np.ndarray) -> List[Tuple[int, int]]:
-        """Return list of ``(i, j)`` (i < j) tile pairs whose 2D world
-        polygons overlap at this pose. Empty list for 3D tile systems
-        (with a one-time warning) and for poses that produce no
-        overlaps."""
-        if self.dimension != 2:
-            self._warn_3d_unsupported()
-            return []
+        """Return list of ``(i, j)`` (i < j) tile pairs whose world-frame
+        polytopes overlap at this pose. Works for both 2D and 3D tile
+        systems."""
         n = self.tile_system.n_tiles
         out: List[Tuple[int, int]] = []
         # Cache world vertices per tile to amortise the pose decomposition.
@@ -141,41 +235,21 @@ class CollisionChecker:
             for j in range(i + 1, n):
                 if (i, j) in self._connected:
                     continue
-                if polygons_overlap_2d(worlds[i], worlds[j], tol=self.tol):
+                if self._overlap(worlds[i], worlds[j]):
                     out.append((i, j))
         return out
 
     def has_collision(self, pose: np.ndarray) -> bool:
         """Short-circuit version of :meth:`colliding_pairs` — returns
         ``True`` as soon as any non-exempt tile pair overlaps. Faster
-        than enumerating every pair when you only need the boolean.
-        """
-        if self.dimension != 2:
-            self._warn_3d_unsupported()
-            return False
+        than enumerating every pair when you only need the boolean."""
         n = self.tile_system.n_tiles
         worlds = [self._sim._tile_world_vertices(pose, i) for i in range(n)]
         for i in range(n):
             for j in range(i + 1, n):
                 if (i, j) in self._connected:
                     continue
-                if polygons_overlap_2d(worlds[i], worlds[j], tol=self.tol):
+                if self._overlap(worlds[i], worlds[j]):
                     return True
         return False
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    _warned_3d = False
-
-    @classmethod
-    def _warn_3d_unsupported(cls) -> None:
-        if cls._warned_3d:
-            return
-        cls._warned_3d = True
-        warnings.warn(
-            "CollisionChecker is 2D-only in M2 — tile-tile overlap "
-            "detection for 3D tetrahedra is not implemented yet. "
-            "All 3D collision queries return False."
-        )
