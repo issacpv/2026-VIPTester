@@ -36,10 +36,15 @@ from PyQt6.QtWidgets import (
     QLabel,
     QSlider,
     QDoubleSpinBox,
+    QSpinBox,
     QPushButton,
     QRadioButton,
     QButtonGroup,
     QComboBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvas
@@ -112,6 +117,11 @@ class SimulationPanel(QDockWidget):
 
     # Stage 5-era hook (unused here — Play is wired internally now).
     playRequested = pyqtSignal()
+
+    # M2.9 — emitted when the user adds / removes / edits a force in
+    # the dynamics force table. Carries (old_forces, new_forces) so
+    # the MainWindow can wrap the change in a ForceListChangeCommand.
+    forcesChangeRequested = pyqtSignal(object, object)
 
     # ------------------------------------------------------------------
 
@@ -197,16 +207,21 @@ class SimulationPanel(QDockWidget):
         outer.addWidget(row)
 
     def _build_dynamics_config_box(self, outer):
-        """Compact dynamics config: ground-face dropdown.
+        """Dynamics config: ground-face dropdown + force-table editor.
 
-        Force-vector editing is intentionally not in v1 — users edit
-        ``lattice.dynamics_state['forces']`` via Python or preset JSON.
-        Adding a force-table widget is a separate patch (deferred from
-        the original M2 plan).
+        The table edits ``lattice.dynamics_state['forces']`` directly.
+        Each row is one force vector with columns Tile / Vertex / dx /
+        dy / dz / Magnitude. Vertex = -1 means "applied at tile
+        centroid" (no torque); Vertex >= 0 means "applied at that body-
+        frame vertex" (induces torque).
         """
         self._dynamics_config_box = QGroupBox("Dynamics setup", self)
-        form = QFormLayout(self._dynamics_config_box)
+        v = QVBoxLayout(self._dynamics_config_box)
 
+        # ---- Ground face row -------------------------------------------
+        gf_row = QWidget(self._dynamics_config_box)
+        gf_layout = QHBoxLayout(gf_row); gf_layout.setContentsMargins(0, 0, 0, 0)
+        gf_layout.addWidget(QLabel("Ground face:"))
         self.ground_face_combo = QComboBox(self._dynamics_config_box)
         for label in ("none", "+x", "-x", "+y", "-y", "+z", "-z"):
             self.ground_face_combo.addItem(label, label)
@@ -215,7 +230,40 @@ class SimulationPanel(QDockWidget):
             "Tiles touching that face are auto-pinned during the sim.")
         self.ground_face_combo.currentIndexChanged.connect(
             self._on_ground_face_changed)
-        form.addRow(QLabel("Ground face"), self.ground_face_combo)
+        gf_layout.addWidget(self.ground_face_combo, 1)
+        v.addWidget(gf_row)
+
+        # ---- Force table -----------------------------------------------
+        v.addWidget(QLabel("External forces:"))
+        self.forces_table = QTableWidget(0, 6, self._dynamics_config_box)
+        self.forces_table.setHorizontalHeaderLabels(
+            ["Tile", "Vertex", "dx", "dy", "dz", "Magnitude (N)"])
+        self.forces_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.forces_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.forces_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.AllEditTriggers)
+        # Cell-changed: a single edit pushed via the
+        # ``forcesChangeRequested`` signal — one undo entry per commit.
+        self.forces_table.cellChanged.connect(self._on_force_cell_changed)
+        v.addWidget(self.forces_table)
+
+        # ---- Add / Remove buttons --------------------------------------
+        btn_row = QWidget(self._dynamics_config_box)
+        btn_layout = QHBoxLayout(btn_row); btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.add_force_button = QPushButton("+ Add force", btn_row)
+        self.add_force_button.setToolTip(
+            "Append a default force (centroid of tile 0, +x direction, 1 N)")
+        self.add_force_button.clicked.connect(self._on_add_force)
+        self.remove_force_button = QPushButton("− Remove selected", btn_row)
+        self.remove_force_button.setToolTip(
+            "Remove the highlighted row from the force list")
+        self.remove_force_button.clicked.connect(self._on_remove_force)
+        btn_layout.addWidget(self.add_force_button)
+        btn_layout.addWidget(self.remove_force_button)
+        btn_layout.addStretch(1)
+        v.addWidget(btn_row)
 
         outer.addWidget(self._dynamics_config_box)
         # Hidden by default; only visible in Dynamic mode.
@@ -360,6 +408,10 @@ class SimulationPanel(QDockWidget):
                 self.ground_face_combo.setCurrentIndex(gi)
         finally:
             self._suspend = False
+        # Populate the force table from the current lattice. This call
+        # also goes through ``_suspend`` to avoid emitting cellChanged
+        # for every populated cell.
+        self._populate_forces_table_from_lattice()
         self._drive_pose_from_slider(slider_deg)
 
     def mark_outdated(self) -> None:
@@ -812,13 +864,133 @@ class SimulationPanel(QDockWidget):
         new_value = None if label == "none" else label
         # Direct mutation of dynamics_state — this isn't a
         # geometry-changing edit so it doesn't go through the undo
-        # stack. (Force-list edits will, when that UI lands.)
+        # stack.
         if self._lattice.dynamics_state.get("ground_face") != new_value:
             self._lattice.dynamics_state["ground_face"] = new_value
             # Clear stale dynamic result; user must rerun.
             self._dynamics_result = None
             self._dynamics_error  = None
             self._update_state_dependent_ui()
+
+    # ==================================================================
+    # Force-table handlers (M2.9)
+    # ==================================================================
+
+    def _populate_forces_table_from_lattice(self) -> None:
+        """Sync the table widget from ``lattice.dynamics_state['forces']``.
+        Called by ``refresh_from_lattice`` and after every force-list
+        commit so undo/redo reflects in the table."""
+        forces = list(self._lattice.dynamics_state.get("forces") or [])
+        # ``cellChanged`` fires for every setItem call; suspend during
+        # the populate so we don't ping-pong commits.
+        self._suspend = True
+        try:
+            self.forces_table.setRowCount(len(forces))
+            for row, f in enumerate(forces):
+                self._populate_forces_row(row, f)
+        finally:
+            self._suspend = False
+
+    def _populate_forces_row(self, row: int, f: dict) -> None:
+        """Populate one row of the table from a force dict."""
+        # tile_index → "Tile" cell
+        self.forces_table.setItem(
+            row, 0, QTableWidgetItem(str(int(f.get("tile_index", 0)))))
+        # vert_index → "Vertex" cell (-1 means centroid)
+        v_idx = int(f.get("vert_index", -1))
+        # If the dict's location_kind says centroid, force vert to -1.
+        if str(f.get("location_kind", "tile_centroid")) == "tile_centroid":
+            v_idx = -1
+        self.forces_table.setItem(
+            row, 1, QTableWidgetItem(str(v_idx)))
+        # direction (3 components)
+        d = list(f.get("direction") or [1.0, 0.0, 0.0])
+        while len(d) < 3:
+            d.append(0.0)
+        for k in range(3):
+            self.forces_table.setItem(
+                row, 2 + k, QTableWidgetItem(f"{float(d[k]):.4f}"))
+        # magnitude
+        self.forces_table.setItem(
+            row, 5, QTableWidgetItem(f"{float(f.get('magnitude', 1.0)):.4f}"))
+
+    def _build_forces_from_table(self) -> list:
+        """Read the table widget back into a list of force dicts.
+        Invalid cells fall back to sensible defaults so users can edit
+        partial rows without crashing."""
+        out = []
+        n_rows = self.forces_table.rowCount()
+        for row in range(n_rows):
+            try:
+                tile_idx = int(self.forces_table.item(row, 0).text())
+            except (AttributeError, ValueError):
+                tile_idx = 0
+            try:
+                vert_idx = int(self.forces_table.item(row, 1).text())
+            except (AttributeError, ValueError):
+                vert_idx = -1
+            d = []
+            for k in range(3):
+                try:
+                    d.append(float(self.forces_table.item(row, 2 + k).text()))
+                except (AttributeError, ValueError):
+                    d.append(0.0)
+            try:
+                mag = float(self.forces_table.item(row, 5).text())
+            except (AttributeError, ValueError):
+                mag = 1.0
+            # Auto-classify location_kind based on vert_idx.
+            kind = "tile_vertex" if vert_idx >= 0 else "tile_centroid"
+            # ForceVector requires non-zero direction — default to +x
+            # if the user's edit zeroed everything out.
+            if all(abs(v) < 1e-12 for v in d):
+                d = [1.0, 0.0, 0.0]
+            out.append({
+                "location_kind": kind,
+                "tile_index":    tile_idx,
+                "vert_index":    vert_idx,
+                "direction":     d,
+                "magnitude":     mag,
+            })
+        return out
+
+    def _emit_forces_change_if_modified(self) -> None:
+        """Compare the table's reconstructed force list against what's
+        currently on the lattice. If they differ, emit
+        ``forcesChangeRequested`` so the MainWindow can wrap the diff
+        in an undoable command."""
+        if self._suspend:
+            return
+        old = list(self._lattice.dynamics_state.get("forces") or [])
+        new = self._build_forces_from_table()
+        if old != new:
+            self.forcesChangeRequested.emit(old, new)
+
+    def _on_force_cell_changed(self, _row: int, _col: int) -> None:
+        self._emit_forces_change_if_modified()
+
+    def _on_add_force(self) -> None:
+        """Append a sensible default force (tile 0 centroid, +x, 1 N)."""
+        old = list(self._lattice.dynamics_state.get("forces") or [])
+        new = old + [{
+            "location_kind": "tile_centroid",
+            "tile_index":    0,
+            "vert_index":    -1,
+            "direction":     [1.0, 0.0, 0.0],
+            "magnitude":     1.0,
+        }]
+        self.forcesChangeRequested.emit(old, new)
+
+    def _on_remove_force(self) -> None:
+        """Remove the currently selected row from the force list."""
+        row = self.forces_table.currentRow()
+        if row < 0:
+            return
+        old = list(self._lattice.dynamics_state.get("forces") or [])
+        if not (0 <= row < len(old)):
+            return
+        new = list(old[:row]) + list(old[row + 1:])
+        self.forcesChangeRequested.emit(old, new)
 
     # ==================================================================
     # Play / animate

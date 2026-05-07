@@ -30,6 +30,7 @@ from .commands import (
     RotationChangeCommand,
     FlipCommand,
     FlipEdgeCommand,
+    ForceListChangeCommand,
     JointAngleChangeCommand,
 )
 
@@ -116,6 +117,9 @@ class MainWindow(QMainWindow):
         )
         self.simulation_panel.jointAngleChangeRequested.connect(
             self._on_joint_angle_change_requested
+        )
+        self.simulation_panel.forcesChangeRequested.connect(
+            self._on_forces_change_requested
         )
         self.addDockWidget(
             Qt.DockWidgetArea.RightDockWidgetArea, self.simulation_panel
@@ -533,6 +537,29 @@ class MainWindow(QMainWindow):
             on_change=self._refresh_state,
         )
         self.undo_stack.push(cmd)
+
+    def _on_forces_change_requested(self, old_forces, new_forces):
+        """SimulationPanel emits one (old, new) pair per add / remove /
+        edit on the dynamics force table. Wrap as an undoable command
+        so the user can revert experimental load cases.
+
+        Force-list edits invalidate the most-recent dynamics result,
+        so the on_change callback also drops it (handled by
+        ``_on_dynamics_state_changed``)."""
+        cmd = ForceListChangeCommand(
+            self.lattice, old_forces, new_forces,
+            on_change=self._on_dynamics_state_changed,
+        )
+        self.undo_stack.push(cmd)
+
+    def _on_dynamics_state_changed(self):
+        """Invalidate the simulation panel's stale dynamics result and
+        repaint everything that depends on the lattice. Used as the
+        ``on_change`` callback for force-edit commands."""
+        # Drop the dynamics result; user must rerun.
+        self.simulation_panel._dynamics_result = None
+        self.simulation_panel._dynamics_error  = None
+        self._refresh_state()
 
     # =====================================================================
     # File menu handlers

@@ -246,6 +246,40 @@ class FlipEdgeCommand(QUndoCommand):
         self._set_membership(self.already_flipped)
 
 
+class ForceListChangeCommand(QUndoCommand):
+    """Replace ``lattice.dynamics_state['forces']`` with a new list.
+
+    Single command type covers add / remove / edit — each user
+    interaction snapshots the full force list before and after, so
+    undo/redo restores the exact prior state regardless of which
+    operation triggered the change. Force lists are tiny (typically
+    < 10 entries), so deep-copying them per command is negligible.
+
+    Auto-invalidates the dynamics result via the ``on_change``
+    callback so a stale trajectory doesn't survive past a force
+    edit.
+    """
+
+    def __init__(self, lattice: Lattice,
+                 old_forces: list, new_forces: list,
+                 on_change: Callback = None):
+        super().__init__("Edit forces")
+        import copy
+        self.lattice    = lattice
+        self.old_forces = copy.deepcopy(list(old_forces))
+        self.new_forces = copy.deepcopy(list(new_forces))
+        self.on_change  = on_change
+
+    def _apply(self, forces: list) -> None:
+        import copy
+        self.lattice.dynamics_state["forces"] = copy.deepcopy(forces)
+        if self.on_change is not None:
+            self.on_change()
+
+    def redo(self) -> None: self._apply(self.new_forces)
+    def undo(self) -> None: self._apply(self.old_forces)
+
+
 class JointAngleChangeCommand(QUndoCommand):
     """Set ``lattice.joint_angle`` (radians). Pushed on slider release,
     not on every tick — the SimulationPanel debounces."""

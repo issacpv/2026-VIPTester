@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 4,
   "mode": 1,
   "n_points": 5,
   "ratio": 0.35,
@@ -22,8 +22,8 @@
       0.8661761457749352
     ],
     [
-      0.6011150117432088,
-      0.7080725777960455
+      0.44897708172963285,
+      0.6407376543346248
     ]
   ],
   "shape_params": {
@@ -32,20 +32,48 @@
     "joint_sphere_radius": 0.015,
     "strut_radius": 0.02
   },
+  "generation": {
+    "density_axis": "none",
+    "density_law": "uniform",
+    "density_strength": 1.0,
+    "edge_flips": [],
+    "mesh_path": null,
+    "mesh_vertices": null,
+    "unit_scale_cm": 1.0
+  },
+  "dynamics": {
+    "forces": [],
+    "ground_face": null,
+    "pre_rotation_quat": null,
+    "pre_joint_angle_deg": null,
+    "fixed_tiles": [],
+    "config": {
+      "dt": 0.001,
+      "duration": 1.0,
+      "joint_stiffness": 100.0,
+      "joint_damping": 2.0,
+      "gravity_cm_per_s2": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "convergence_kinetic_thresh": 1e-05
+    }
+  },
   "view_state": {
     "rigid_rotation_quat": [
-      0.7071067811865476,
+      1.0,
       0.0,
       0.0,
-      0.7071067811865475
+      0.0
     ],
     "flipped": false,
     "joint_angle_deg": 0.0
   },
   "metadata": {
     "name": "",
-    "created": "2026-04-30T04:12:45.345344+00:00",
-    "modified": "2026-04-30T04:12:45.345376+00:00",
+    "created": "2026-05-07T04:12:36.858582+00:00",
+    "modified": "2026-05-07T04:12:36.858934+00:00",
     "notes": ""
   }
 }

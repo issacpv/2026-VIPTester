@@ -211,3 +211,105 @@ def test_ground_face_change_invalidates_dynamic_result(main_window):
     idx = panel.ground_face_combo.findData("-y")
     panel.ground_face_combo.setCurrentIndex(idx)
     assert panel._dynamics_result is None
+
+
+# ---------------------------------------------------------------------------
+# Force-table editor (M2.9)
+# ---------------------------------------------------------------------------
+
+def test_force_table_starts_empty(main_window):
+    panel = main_window.simulation_panel
+    assert panel.forces_table.rowCount() == 0
+
+
+def test_add_force_appends_default_row(main_window):
+    panel = main_window.simulation_panel
+    panel._on_add_force()
+    forces = main_window.lattice.dynamics_state["forces"]
+    assert len(forces) == 1
+    f = forces[0]
+    assert f["tile_index"]    == 0
+    assert f["vert_index"]    == -1
+    assert f["location_kind"] == "tile_centroid"
+    assert f["direction"]     == [1.0, 0.0, 0.0]
+    assert f["magnitude"]     == 1.0
+    # Table should now have one row populated.
+    assert panel.forces_table.rowCount() == 1
+
+
+def test_add_force_pushes_undoable_command(main_window):
+    panel = main_window.simulation_panel
+    initial_count = main_window.undo_stack.count()
+    panel._on_add_force()
+    assert main_window.undo_stack.count() == initial_count + 1
+    # Undo restores the empty force list.
+    main_window.undo_stack.undo()
+    assert main_window.lattice.dynamics_state["forces"] == []
+    # Redo brings the force back.
+    main_window.undo_stack.redo()
+    assert len(main_window.lattice.dynamics_state["forces"]) == 1
+
+
+def test_remove_force_drops_selected_row(main_window):
+    panel = main_window.simulation_panel
+    # Add two forces so we have a non-trivial selection.
+    panel._on_add_force()
+    panel._on_add_force()
+    # Select the first row and remove.
+    panel.forces_table.selectRow(0)
+    panel._on_remove_force()
+    assert len(main_window.lattice.dynamics_state["forces"]) == 1
+
+
+def test_remove_force_with_no_selection_is_noop(main_window):
+    panel = main_window.simulation_panel
+    panel._on_add_force()
+    panel.forces_table.clearSelection()
+    panel.forces_table.setCurrentCell(-1, -1)
+    panel._on_remove_force()
+    # No removal happened.
+    assert len(main_window.lattice.dynamics_state["forces"]) == 1
+
+
+def test_editing_magnitude_cell_propagates_to_lattice(main_window):
+    panel = main_window.simulation_panel
+    panel._on_add_force()
+    # Programmatically edit the magnitude cell (column 5).
+    panel.forces_table.item(0, 5).setText("4.5")
+    assert main_window.lattice.dynamics_state["forces"][0]["magnitude"] == 4.5
+
+
+def test_editing_vertex_to_positive_value_switches_to_tile_vertex_kind(main_window):
+    panel = main_window.simulation_panel
+    panel._on_add_force()
+    # Default is centroid (vert_index = -1). Set vertex to 2.
+    panel.forces_table.item(0, 1).setText("2")
+    f = main_window.lattice.dynamics_state["forces"][0]
+    assert f["vert_index"]    == 2
+    assert f["location_kind"] == "tile_vertex"
+
+
+def test_force_changes_invalidate_dynamics_result(main_window):
+    """Like the ground-face change, editing forces should drop a
+    stale dynamics result so the readout doesn't lie."""
+    panel = main_window.simulation_panel
+    panel._lattice.dynamics_state["config"]["duration"] = 0.05
+    panel.run_dynamic_button.click()
+    assert panel._dynamics_result is not None
+    panel._on_add_force()
+    assert panel._dynamics_result is None
+
+
+def test_force_table_populates_from_lattice_on_set_lattice(main_window):
+    """When the panel is rebound to a lattice that already has forces
+    (e.g. after File → Open of a v4 preset), the table should reflect
+    the loaded forces immediately."""
+    panel = main_window.simulation_panel
+    main_window.lattice.dynamics_state["forces"] = [
+        {"location_kind": "tile_centroid", "tile_index": 1,
+         "vert_index": -1, "direction": [0.0, -1.0, 0.0], "magnitude": 7.5},
+    ]
+    panel.set_lattice(main_window.lattice)
+    assert panel.forces_table.rowCount() == 1
+    assert panel.forces_table.item(0, 0).text() == "1"
+    assert panel.forces_table.item(0, 5).text() == "7.5000"
