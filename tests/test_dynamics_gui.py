@@ -301,6 +301,111 @@ def test_force_changes_invalidate_dynamics_result(main_window):
 
 
 # ---------------------------------------------------------------------------
+# Piston compression mode (M3 polish — primary "Run Dynamic" workflow)
+# ---------------------------------------------------------------------------
+
+def test_piston_default_in_dynamics_state(main_window):
+    """Fresh lattices have piston_force_n > 0 by default so a brand-
+    new "Run Dynamic" click produces visible compression instead of
+    sitting motionless."""
+    val = main_window.lattice.dynamics_state.get("piston_force_n", 0.0)
+    assert val > 0.0
+
+
+def test_piston_force_spinbox_visible_in_dynamic_mode(main_window):
+    panel = main_window.simulation_panel
+    panel.mode_dynamic_radio.setChecked(True)
+    assert hasattr(panel, "piston_force_spin")
+    assert not panel.piston_force_spin.isHidden()
+
+
+def test_piston_force_spinbox_writes_through_to_lattice(main_window):
+    panel = main_window.simulation_panel
+    panel.mode_dynamic_radio.setChecked(True)
+    panel.piston_force_spin.setValue(12.5)
+    assert main_window.lattice.dynamics_state["piston_force_n"] == 12.5
+
+
+def test_piston_setup_pins_bottom_and_pushes_top():
+    """Smoke: with piston_force_n > 0, the dynamics build helper
+    auto-pins the bottom slab and adds downward forces on the top
+    slab. Piston mode bypasses the manual ground_face / forces."""
+    from auxetic import Lattice
+    from auxetic.dynamics import build_dynamics_simulator_from_lattice
+
+    lat = Lattice(mode=4, n_points=9, ratio=0.35, seed=42)
+    lat.dynamics_state["piston_force_n"] = 5.0
+    # Manual fields should be IGNORED by piston mode.
+    lat.dynamics_state["ground_face"] = "+x"
+    lat.dynamics_state["forces"] = [{
+        "location_kind": "tile_centroid", "tile_index": 0,
+        "vert_index": -1, "direction": [1.0, 0.0, 0.0], "magnitude": 99.0,
+    }]
+    ds = build_dynamics_simulator_from_lattice(lat)
+    assert len(ds.fixed_tiles) > 0, "piston mode should auto-pin bottom"
+    assert len(ds.forces) > 0,      "piston mode should auto-push top"
+    # Manual force was overridden.
+    for f in ds.forces:
+        assert f.magnitude != pytest.approx(99.0)
+        # All forces point downward (negative on the vertical axis).
+        assert f.direction[1] < 0.0
+    # Manual ground_face was ignored.
+    assert ds.ground is None
+
+
+def test_piston_force_zero_falls_back_to_manual_mode():
+    """``piston_force_n = 0`` returns the original M2.6 behaviour:
+    forces / ground_face / fixed_tiles read directly from
+    dynamics_state."""
+    from auxetic import Lattice
+    from auxetic.dynamics import build_dynamics_simulator_from_lattice
+
+    lat = Lattice(mode=4, n_points=9, ratio=0.35, seed=42)
+    lat.dynamics_state["piston_force_n"] = 0.0
+    lat.dynamics_state["forces"] = [{
+        "location_kind": "tile_centroid", "tile_index": 0,
+        "vert_index": -1, "direction": [1.0, 0.0, 0.0], "magnitude": 3.0,
+    }]
+    ds = build_dynamics_simulator_from_lattice(lat)
+    assert len(ds.forces) == 1
+    assert ds.forces[0].magnitude == pytest.approx(3.0)
+
+
+def test_piston_actually_compresses_the_lattice():
+    """End-to-end: piston mode → the bbox actually shrinks along the
+    axial direction. This is the core "the dynamic sim shows
+    something" guarantee the user asked for."""
+    import numpy as np
+    from auxetic import Lattice
+    from auxetic.dynamics import build_dynamics_simulator_from_lattice
+
+    lat = Lattice(mode=4, n_points=9, ratio=0.35, seed=42)
+    lat.dynamics_state["piston_force_n"] = 5.0
+    lat.dynamics_state["config"]["duration"] = 0.3
+    ds = build_dynamics_simulator_from_lattice(lat)
+    res = ds.simulate()
+    # bbox along world-y should shrink: final < initial.
+    initial_y = float(res.bbox_extents[0, 1])
+    final_y   = float(res.bbox_extents[-1, 1])
+    assert final_y < initial_y, (
+        f"piston should compress along y; got initial={initial_y:.4f}, "
+        f"final={final_y:.4f}"
+    )
+    # final_compression is positive when compression happened.
+    assert res.final_compression > 0.0
+
+
+def test_piston_changing_force_invalidates_dynamics_result(main_window):
+    panel = main_window.simulation_panel
+    panel._lattice.dynamics_state["config"]["duration"] = 0.05
+    panel.run_dynamic_button.click()
+    assert panel._dynamics_result is not None
+    panel.mode_dynamic_radio.setChecked(True)
+    panel.piston_force_spin.setValue(10.0)
+    assert panel._dynamics_result is None
+
+
+# ---------------------------------------------------------------------------
 # Force-arrow glyphs in View3D (M3 polish)
 # ---------------------------------------------------------------------------
 

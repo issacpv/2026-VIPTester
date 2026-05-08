@@ -114,13 +114,13 @@ def _stub_generation() -> Dict[str, Any]:
 
 
 def _stub_dynamics() -> Dict[str, Any]:
-    """v4 ``dynamics`` block defaults — empty force list, no ground
-    face, no overrides on view_state, default integrator config. v3
-    files migrate to this stub. Defaults match
-    ``Lattice.dynamics_state``'s in-memory defaults: zero gravity and
-    modest constraint stiffness so a default ``Run Dynamic`` doesn't
-    immediately blow up under explicit Euler."""
+    """v4 ``dynamics`` block defaults. Mirrors
+    ``Lattice.dynamics_state`` in-memory defaults: a 5 N piston
+    compression load case as the ready-to-go workflow. Set
+    ``piston_force_n`` to 0 to fall back to the manual ground-face
+    + force-table path."""
     return {
+        "piston_force_n":      5.0,
         "forces":              [],
         "ground_face":         None,
         "pre_rotation_quat":   None,
@@ -129,8 +129,8 @@ def _stub_dynamics() -> Dict[str, Any]:
         "config": {
             "dt":                         1.0e-3,
             "duration":                   1.0,
-            "joint_stiffness":            1.0e2,
-            "joint_damping":              2.0e0,
+            "joint_stiffness":            5.0e2,
+            "joint_damping":              5.0e0,
             "gravity_cm_per_s2":          [0.0, 0.0, 0.0],
             "convergence_kinetic_thresh": 1.0e-5,
         },

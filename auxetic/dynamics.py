@@ -585,6 +585,87 @@ def _tiles_touching_face(tile_system: TileSystem,
     return out
 
 
+def _piston_setup(tile_system: TileSystem,
+                   piston_force_n: float,
+                   *,
+                   top_fraction: float    = 0.15,
+                   bottom_fraction: float = 0.15,
+                   axis_idx: int          = 1,    # world-y is "vertical"
+                   ) -> tuple[List["ForceVector"], List[int]]:
+    """Auto-configure a piston compression load case.
+
+    Returns ``(forces, fixed_tiles)``:
+
+    - ``forces``       : per-vertex downward forces on the top
+      ``top_fraction`` slab of tile vertices. Total downward force
+      across the slab equals ``piston_force_n``; per-vertex magnitude
+      is therefore ``piston_force_n / N_top``.
+    - ``fixed_tiles``  : tile indices with at least one vertex in the
+      bottom ``bottom_fraction`` slab. These get pinned in place to
+      simulate the lattice resting on a base plate.
+
+    Top / bottom are determined in ``tile_system``'s world frame,
+    which already incorporates the lattice's rigid_rotation (the
+    pre-rotation the user set via the Inspector). So if the user
+    rotated the lattice 45° about Z, the piston pushes from the
+    correct "top" of the rotated lattice.
+    """
+    if piston_force_n <= 0.0 or tile_system.n_tiles == 0:
+        return [], []
+
+    dim = tile_system.dimension
+    if axis_idx >= dim:
+        # 2D lattices live in XY; treat Y as vertical.
+        axis_idx = 1
+
+    # Find global axial extent across every tile vertex.
+    all_v = np.vstack(tile_system.tiles)
+    axial = all_v[:, axis_idx]
+    lo = float(axial.min())
+    hi = float(axial.max())
+    span = hi - lo
+    if span < 1e-12:
+        return [], []
+    bottom_threshold = lo + bottom_fraction * span
+    top_threshold    = hi - top_fraction    * span
+
+    # Identify top vertices (per tile, per vertex) and bottom tiles.
+    top_targets: list[tuple[int, int]] = []
+    bottom_tiles: list[int] = []
+    for ti, tile in enumerate(tile_system.tiles):
+        verts = np.asarray(tile, dtype=float)
+        col = verts[:, axis_idx]
+        # Bottom: any vertex sitting on the base plate → pin the tile.
+        if float(col.min()) <= bottom_threshold:
+            bottom_tiles.append(ti)
+        # Top: every vertex in the top slab is a force-application point.
+        for vi in range(verts.shape[0]):
+            if float(col[vi]) >= top_threshold:
+                top_targets.append((ti, vi))
+
+    if not top_targets:
+        return [], bottom_tiles
+
+    per_vertex_mag = float(piston_force_n) / float(len(top_targets))
+    direction = np.zeros(dim, dtype=float)
+    direction[axis_idx] = -1.0   # downward along world +axis
+
+    forces: List[ForceVector] = []
+    for ti, vi in top_targets:
+        # Skip the tile if it's also pinned at the bottom — pushing a
+        # fixed tile is wasted force.
+        if ti in bottom_tiles:
+            continue
+        forces.append(ForceVector(
+            location_kind="tile_vertex",
+            direction=direction.copy(),
+            magnitude=per_vertex_mag,
+            tile_index=int(ti),
+            vert_index=int(vi),
+        ))
+    return forces, bottom_tiles
+
+
 def build_dynamics_simulator_from_lattice(
         lattice,
         *,
@@ -595,6 +676,18 @@ def build_dynamics_simulator_from_lattice(
     Reads ``lattice.dynamics_state`` (the v4-preset dict) for forces,
     ground face, fixed tiles, and integrator config. Per-tile masses
     come from :func:`default_masses_from_tile_system`.
+
+    Two operating modes — selected by ``dynamics_state['piston_force_n']``:
+
+    - ``> 0``: **piston compression** mode. Auto-pins the bottom of
+      the lattice (in world frame, after the user's rigid_rotation)
+      and applies a downward force totalling that magnitude on the
+      top vertices. The user's manual ``ground_face`` and ``forces``
+      list are ignored in this mode — the auto-config replaces them.
+    - ``== 0``: **manual** mode. Reads ``ground_face``, ``forces``,
+      ``fixed_tiles`` directly from ``dynamics_state`` (the original
+      M2.6 behavior). Use this when you need a custom load case the
+      piston abstraction can't express.
 
     Pass an existing ``tile_system`` to reuse one already built (e.g.
     by the kinematic panel); otherwise one is constructed lazily here.
@@ -619,6 +712,18 @@ def build_dynamics_simulator_from_lattice(
     )
 
     dim = tile_system.dimension
+
+    # ---- Piston mode (the primary "Run Dynamic" workflow) ----------
+    piston_force = float(state.get("piston_force_n", 0.0) or 0.0)
+    if piston_force > 0.0:
+        forces, fixed_tiles = _piston_setup(tile_system, piston_force)
+        ground = None    # piston mode pins via fixed_tiles, no ground plane
+        return DynamicsSimulator(
+            tile_system, masses, cfg,
+            forces=forces, ground=ground, fixed_tiles=fixed_tiles,
+        )
+
+    # ---- Manual mode: read forces / ground / fixed_tiles directly --
     forces: List[ForceVector] = []
     for f in state.get("forces", []) or []:
         try:
@@ -659,8 +764,8 @@ def build_dynamics_simulator_from_lattice(
 
 def default_masses_from_tile_system(
         tile_system: TileSystem,
-        density: float = 1.0,
-        thickness: float = 0.01,
+        density: float   = 1000.0,   # bumped from 1.0 for integrator stability
+        thickness: float = 0.10,     # bumped from 0.01
         ) -> List[TileMass]:
     """Compute a reasonable per-tile :class:`TileMass` from the tile
     geometry alone.
@@ -670,6 +775,16 @@ def default_masses_from_tile_system(
     convex-hull volume × density. ``inertia_iso`` is approximated as
     ``(m / 12) * sum(extent²)`` over the tile's bounding box — exact for
     a uniform rectangular plate, a useful first approximation otherwise.
+
+    The defaults were re-tuned in the M3-polish piston pass: with the
+    earlier ``density=1.0, thickness=0.01`` defaults a small kirigami
+    tile (area ~0.05 in unit-cube space) gets a mass of ~5e-4. A 5 N
+    piston force per vertex → acceleration of ~10⁴ m/s², which blows
+    up explicit Euler at the 1 ms timestep we use. Bumping mass by 10⁴
+    keeps accelerations under control without changing the integrator.
+    The user can override either knob to model a specific physical
+    scenario; the defaults are picked for "Run Dynamic just works on a
+    fresh lattice".
     """
     masses: List[TileMass] = []
     for tile in tile_system.tiles:
@@ -678,7 +793,7 @@ def default_masses_from_tile_system(
             # 2D polygon area via the shoelace formula.
             x = verts[:, 0]; y = verts[:, 1]
             area = 0.5 * abs(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
-            m = max(1.0e-9, float(area * thickness * density))
+            m = max(1.0e-3, float(area * thickness * density))
         else:
             try:
                 from scipy.spatial import ConvexHull
@@ -686,8 +801,8 @@ def default_masses_from_tile_system(
                 vol = float(hull.volume)
             except Exception:
                 vol = 0.0
-            m = max(1.0e-9, float(vol * density))
+            m = max(1.0e-3, float(vol * density))
         ext = verts.max(axis=0) - verts.min(axis=0)
         I = (m / 12.0) * float(np.sum(ext * ext))
-        masses.append(TileMass(mass=m, inertia_iso=max(I, 1.0e-12)))
+        masses.append(TileMass(mass=m, inertia_iso=max(I, 1.0e-9)))
     return masses

@@ -218,6 +218,42 @@ class SimulationPanel(QDockWidget):
         self._dynamics_config_box = QGroupBox("Dynamics setup", self)
         v = QVBoxLayout(self._dynamics_config_box)
 
+        # ---- Piston compression row (primary workflow) ----------------
+        # Auto-pins the bottom of the lattice (in world frame, after
+        # the rigid rotation set via the Inspector) and pushes a
+        # downward force totalling N Newtons on the top vertices.
+        # Sets all the manual dynamics knobs below to "ignored" while
+        # piston_force_n > 0.
+        piston_row = QWidget(self._dynamics_config_box)
+        pi_layout = QHBoxLayout(piston_row)
+        pi_layout.setContentsMargins(0, 0, 0, 0)
+        pi_layout.addWidget(QLabel("<b>Piston force (N):</b>"))
+        self.piston_force_spin = QDoubleSpinBox(self._dynamics_config_box)
+        self.piston_force_spin.setRange(0.0, 1.0e4)
+        self.piston_force_spin.setDecimals(2)
+        self.piston_force_spin.setSingleStep(0.5)
+        self.piston_force_spin.setValue(5.0)
+        self.piston_force_spin.setToolTip(
+            "Total downward force a virtual piston applies to the top of "
+            "the lattice (after pre-rotation via the Inspector's "
+            "Orientation controls). Set to 0 to use the manual "
+            "Ground face + Forces below."
+        )
+        self.piston_force_spin.valueChanged.connect(
+            self._on_piston_force_changed)
+        pi_layout.addWidget(self.piston_force_spin, 1)
+        v.addWidget(piston_row)
+
+        piston_help = QLabel(
+            "<i>Pre-rotate the lattice via Inspector → Orientation, "
+            "then click <b>Run Dynamic</b>. The piston pushes from the "
+            "top of the lattice in its current world orientation.</i>",
+            self._dynamics_config_box,
+        )
+        piston_help.setTextFormat(Qt.TextFormat.RichText)
+        piston_help.setWordWrap(True)
+        v.addWidget(piston_help)
+
         # ---- Ground face row -------------------------------------------
         gf_row = QWidget(self._dynamics_config_box)
         gf_layout = QHBoxLayout(gf_row); gf_layout.setContentsMargins(0, 0, 0, 0)
@@ -400,6 +436,10 @@ class SimulationPanel(QDockWidget):
         try:
             self.slider.setValue(int(round(slider_deg * _SLIDER_SCALE)))
             self.spin.setValue(slider_deg)
+            # Sync the piston-force spinbox from the lattice.
+            self.piston_force_spin.setValue(
+                float(self._lattice.dynamics_state.get("piston_force_n", 0.0))
+            )
             # Sync the ground-face combo from the lattice's dynamics_state.
             gf = self._lattice.dynamics_state.get("ground_face")
             target = "none" if gf is None else str(gf)
@@ -885,6 +925,22 @@ class SimulationPanel(QDockWidget):
     # ==================================================================
     # Ground-face handler
     # ==================================================================
+
+    def _on_piston_force_changed(self, new_value: float) -> None:
+        """Write through to ``lattice.dynamics_state['piston_force_n']``
+        and invalidate any stale dynamics result so the readout
+        doesn't lie about the new load case. Mirrors the ground-face
+        handler — direct mutation, not undo-stack-tracked (the spinbox
+        is a config knob, not a geometry edit)."""
+        if self._suspend:
+            return
+        new_value = float(new_value)
+        if self._lattice.dynamics_state.get("piston_force_n", 0.0) == new_value:
+            return
+        self._lattice.dynamics_state["piston_force_n"] = new_value
+        self._dynamics_result = None
+        self._dynamics_error  = None
+        self._update_state_dependent_ui()
 
     def _on_ground_face_changed(self, _idx: int) -> None:
         if self._suspend:

@@ -245,7 +245,10 @@ def test_save_writes_v1_schema(tmp_path):
         "edge_flips", "mesh_path", "mesh_vertices", "unit_scale_cm",
     }
     # dynamics block (v4, M2) — Newtonian sim parameters.
+    # M3-polish added ``piston_force_n`` for the piston compression
+    # workflow.
     assert set(data["dynamics"].keys()) == {
+        "piston_force_n",
         "forces", "ground_face", "pre_rotation_quat",
         "pre_joint_angle_deg", "fixed_tiles", "config",
     }

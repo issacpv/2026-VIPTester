@@ -114,12 +114,16 @@ class Lattice:
 
         # ---- M2 dynamic-simulator state ---------------------------------
         # Stored as a plain dict so save/load pickup is straightforward.
-        # Defaults are tuned for STABILITY rather than realism: zero
-        # gravity and modest constraint stiffness so a "Run Dynamic"
-        # click on a fresh lattice doesn't immediately blow up under
-        # explicit Euler. Users opt in to gravity / stiffer constraints
-        # after they've added forces and a ground face.
+        # Defaults configure a "piston compression" load case so a
+        # fresh "Run Dynamic" click produces visible motion: the
+        # bottom of the lattice (in world frame, after rigid_rotation)
+        # is auto-pinned, the top gets a downward force totalling
+        # ``piston_force_n``. Users who want manual control can set
+        # ``piston_force_n = 0`` and configure ``ground_face`` +
+        # ``forces`` directly.
         self.dynamics_state: dict = {
+            "piston_force_n":      5.0,    # total compressive force (N).
+                                            # 0 = disable piston mode.
             "forces":              [],     # list of dicts (see preset v4)
             "ground_face":         None,   # "+x"/"-x"/"+y"/"-y"/"+z"/"-z"
             "pre_rotation_quat":   None,   # override view_state.rigid_rotation_quat
@@ -128,8 +132,11 @@ class Lattice:
             "config": {
                 "dt":                       1.0e-3,
                 "duration":                 1.0,
-                "joint_stiffness":          1.0e2,
-                "joint_damping":            2.0e0,
+                # Stiffness picked so a 5 N piston force on a unit-cell
+                # kirigami produces visible compression without blowing
+                # up under explicit Euler. Users tune for their geometry.
+                "joint_stiffness":          5.0e2,
+                "joint_damping":            5.0e0,
                 "gravity_cm_per_s2":        [0.0, 0.0, 0.0],
                 "convergence_kinetic_thresh": 1.0e-5,
             },
