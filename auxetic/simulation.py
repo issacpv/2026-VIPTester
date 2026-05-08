@@ -140,13 +140,24 @@ class TileSystem:
         differently against the load axis (SPEC §6.3 / §8)."""
         from . import tiles as _tiles  # local import: avoid circular at module load
 
-        tile_arrays_3d, source = _tiles.collect_kirigami_tiles(
-            lattice.points, lattice.tri, lattice.ratio,
-            lattice.mode, lattice.nz_layers,
-        )
-        constraint_tuples = _tiles.build_kirigami_constraints(
-            tile_arrays_3d, source,
-        )
+        # Mode-10 cuboid kirigami stores its tiles + constraints
+        # directly on the lattice (no Delaunay simplices), so we skip
+        # the simplex-based collector and use the precomputed data.
+        if (int(lattice.mode) == 10
+                and getattr(lattice, "cuboid_tiles", None) is not None):
+            tile_arrays_3d = [np.asarray(t, dtype=float).copy()
+                               for t in lattice.cuboid_tiles]
+            constraint_tuples = list(lattice.cuboid_constraints or [])
+            source = [{"type": "cuboid", "cube_idx": i}
+                      for i in range(len(tile_arrays_3d))]
+        else:
+            tile_arrays_3d, source = _tiles.collect_kirigami_tiles(
+                lattice.points, lattice.tri, lattice.ratio,
+                lattice.mode, lattice.nz_layers,
+            )
+            constraint_tuples = _tiles.build_kirigami_constraints(
+                tile_arrays_3d, source,
+            )
 
         # Apply the lattice's world transform (rigid rotation + flip,
         # around centroid). collect_kirigami_tiles always returns 3D

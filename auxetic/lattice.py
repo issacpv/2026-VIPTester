@@ -49,8 +49,11 @@ from . import export as _export
 
 # Modes whose points live in 3D (n×3); everything else is 2D (n×2).
 # Modes 7, 8, 9 are mesh-import variants of 1, 2, 3 respectively.
-_3D_MODES = (3, 6, 9)
+# Mode 10 is the rotating-cuboids 3D kirigami (sibling of mode 6 but
+# with cube tiles instead of tetrahedra).
+_3D_MODES = (3, 6, 9, 10)
 _DELAUNAY_MODES = (1, 2, 3, 7, 8, 9)  # modes that re-Delaunay on each retriangulation
+_CUBOID_MODES = (10,)                  # modes that bypass Delaunay entirely
 
 # Lattice-space centroid that all rigid rotations / flips pivot around.
 _CENTROID = np.array([0.5, 0.5, 0.5])
@@ -106,6 +109,13 @@ class Lattice:
         self.mesh_path = mesh_path
         self.mesh_vertices = (np.asarray(mesh_vertices, dtype=float)
                               if mesh_vertices is not None else None)
+
+        # Mode-10 cuboid-kirigami state: list of (8, 3) tile arrays plus
+        # the explicit (tile_a, vert_a, tile_b, vert_b, ctype) constraint
+        # tuples. None for non-cuboid modes. Set during ``regenerate``
+        # via :func:`auxetic.cuboid_kirigami.generate_cuboids`.
+        self.cuboid_tiles: list | None = None
+        self.cuboid_constraints: list | None = None
 
         # Lattice unit -> physical scale. Used by the M2 dynamic
         # simulator to convert default forces/masses into SI; the
@@ -294,6 +304,24 @@ class Lattice:
     def regenerate(self):
         if self.seed is not None:
             np.random.seed(self.seed)
+        if self.mode in _CUBOID_MODES:
+            from . import cuboid_kirigami as _cuboid
+            n = max(2, int(round(self.n_points ** (1.0 / 3.0))))
+            points, tiles, constraint_records = _cuboid.generate_cuboids(
+                n=n, ratio=self.ratio,
+            )
+            # Mode-10 has no Delaunay simplices — store None for `tri`
+            # and populate the cuboid-specific fields. Downstream code
+            # gates on ``self.mode in _CUBOID_MODES`` rather than
+            # ``self.tri is None``.
+            self.cuboid_tiles = tiles
+            self.cuboid_constraints = constraint_records
+            self._set_points_and_tri(points, None)
+            self.points_original = points.copy()
+            return self
+        # Non-cuboid modes use the usual generate-points + Delaunay path.
+        self.cuboid_tiles = None
+        self.cuboid_constraints = None
         if self.mode in (7, 8, 9):
             if self.mesh_vertices is None:
                 raise RuntimeError(
@@ -440,7 +468,9 @@ class Lattice:
             (self._strut_curves,
              self._solid_triangles,
              self._joint_positions) = _geom.collect_export_geometry(
-                self.points, self.tri, self.ratio, self.mode, self.nz_layers)
+                self.points, self.tri, self.ratio, self.mode, self.nz_layers,
+                cuboid_tiles=self.cuboid_tiles,
+                cuboid_constraints=self.cuboid_constraints)
 
     def build_export_triangles(self, **kwargs):
         """Final triangle list including strut tubes + joint spheres."""

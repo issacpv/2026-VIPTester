@@ -48,9 +48,11 @@ from scipy.spatial.transform import Rotation
 # pre-existing random/grid combinations; modes 7/8/9 are the M1
 # mesh-import variants (dim 2D / 2.5D / 3D respectively).
 DIM_LABELS      = ["2D", "2.5D", "3D"]
-STRATEGY_LABELS = ["Random", "Grid", "Mesh import"]
+STRATEGY_LABELS = ["Random", "Grid", "Mesh import", "Cuboid grid"]
 
 # (dim, strategy) tuple → mode integer.
+# "Cuboid grid" is 3D-only — picking it from 2D / 2.5D auto-switches
+# the dim combo to 3D in ``_on_strategy_changed``.
 _DIM_STRAT_TO_MODE: dict[tuple[str, str], int] = {
     ("2D",   "Random"):       1,
     ("2.5D", "Random"):       2,
@@ -61,8 +63,10 @@ _DIM_STRAT_TO_MODE: dict[tuple[str, str], int] = {
     ("2D",   "Mesh import"):  7,
     ("2.5D", "Mesh import"):  8,
     ("3D",   "Mesh import"):  9,
+    ("3D",   "Cuboid grid"):  10,
 }
-# Inverse for refresh_from_lattice.
+# Inverse for refresh_from_lattice — only canonical (dim, strategy)
+# pairs map back. Mode 10 → ("3D", "Cuboid grid").
 _MODE_TO_DIM_STRAT: dict[int, tuple[str, str]] = {
     v: k for k, v in _DIM_STRAT_TO_MODE.items()
 }
@@ -70,8 +74,9 @@ _MODE_TO_DIM_STRAT: dict[int, tuple[str, str]] = {
 _RANDOM_MODES = (1, 2, 3)
 _GRID_MODES   = (4, 5, 6)
 _MESH_MODES   = (7, 8, 9)
+_CUBOID_MODES = (10,)
 _2D_MODES     = (1, 2, 4, 5, 7, 8)   # 2D and 2.5D
-_3D_MODES     = (3, 6, 9)
+_3D_MODES     = (3, 6, 9, 10)
 
 # Vertex-count threshold above which mesh import prompts for decimation.
 _MESH_DECIMATE_PROMPT_THRESHOLD = 500
@@ -352,6 +357,21 @@ class InspectorPanel(QWidget):
     def _on_dim_changed(self, _idx):
         if self._suspend:
             return
+        # Cuboid grid is 3D-only — if the user switches dim away from
+        # 3D while strategy is Cuboid, auto-flip strategy back to Grid
+        # (the closest equivalent). Mirrors the auto-flip-to-3D when
+        # the user picks Cuboid from a non-3D dim.
+        new_dim   = str(self.dim_combo.currentData())
+        cur_strat = str(self.strategy_combo.currentData())
+        if new_dim != "3D" and cur_strat == "Cuboid grid":
+            si_grid = self.strategy_combo.findData("Grid")
+            if si_grid >= 0:
+                self._suspend = True
+                try:
+                    self.strategy_combo.setCurrentIndex(si_grid)
+                    self._last_valid_strategy_idx = si_grid
+                finally:
+                    self._suspend = False
         # Mesh-strategy + new dim with no mesh loaded → can't change yet.
         # Fall through and emit anyway; if the lattice has mesh_vertices
         # the new mode (7/8/9) will work, otherwise regenerate raises and
@@ -364,6 +384,19 @@ class InspectorPanel(QWidget):
         if self._suspend:
             return
         new_strat = str(self.strategy_combo.currentData())
+        # Cuboid grid is 3D-only — auto-flip the dim combo to 3D so
+        # ``_DIM_STRAT_TO_MODE`` resolves to mode 10. We do this in
+        # ``_suspend`` so the dim change doesn't fire its own
+        # parameterChanged emission; we'll emit one mode change below.
+        if new_strat == "Cuboid grid":
+            di_3d = self.dim_combo.findData("3D")
+            if di_3d >= 0 and self.dim_combo.currentIndex() != di_3d:
+                self._suspend = True
+                try:
+                    self.dim_combo.setCurrentIndex(di_3d)
+                    self._last_valid_dim_idx = di_3d
+                finally:
+                    self._suspend = False
         if new_strat == "Mesh import":
             # Mesh strategy needs a file. Open the chooser; revert combo
             # if the user cancels.

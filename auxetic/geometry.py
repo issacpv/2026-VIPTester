@@ -659,7 +659,9 @@ def build_3d_groups(pts_norm, tri, ratio):
     return groups
 
 
-def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers):
+def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
+                              cuboid_tiles=None,
+                              cuboid_constraints=None):
     """Build the strut curves, solid triangles, and joint positions for STL/OBJ/SCAD output."""
     strut_curves  = []
     all_triangles = []
@@ -674,6 +676,32 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers):
     def register_joint(pt):
         key = tuple(np.round(pt, 8))
         joint_positions.add(key)
+
+    # Mode-10 cuboid kirigami: render each cube as 12 triangles + struts
+    # connecting constraint-pinned vertex pairs. Geometry independent of
+    # ``points_nd`` / ``tri`` (which mode-10 leaves as None).
+    if mode == 10:
+        from . import cuboid_kirigami as _cuboid
+        if cuboid_tiles is None:
+            return strut_curves, all_triangles, joint_positions
+        for tile in cuboid_tiles:
+            tile_arr = np.asarray(tile, dtype=float)
+            for tri_arr in _cuboid.triangles_for_cube(tile_arr):
+                all_triangles.append([tri_arr[0], tri_arr[1], tri_arr[2]])
+            for vert in tile_arr:
+                register_joint(vert)
+        # Strut tubes for each constraint pair so the rotating-cubes
+        # mechanism is visually obvious — short tubes between each
+        # pinned vertex pair.
+        for ct in (cuboid_constraints or []):
+            ti_a, vi_a, ti_b, vi_b, _ctype = ct
+            try:
+                p_a = cuboid_tiles[ti_a][vi_a]
+                p_b = cuboid_tiles[ti_b][vi_b]
+            except (IndexError, TypeError):
+                continue
+            add_strut(p_a, p_b)
+        return strut_curves, all_triangles, joint_positions
 
     if mode in [3, 6, 9]:
         pts_norm = points_nd
