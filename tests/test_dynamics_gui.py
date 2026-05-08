@@ -395,6 +395,76 @@ def test_piston_actually_compresses_the_lattice():
     assert res.final_compression > 0.0
 
 
+def test_piston_visualization_data_static_ground_moving_piston():
+    """The visualisation helper should report a STATIC ground (the
+    initial-pose bottom y) and a MOVING piston (the current-pose top
+    y). When the lattice is the same in both poses, ground and piston
+    flank it on each side."""
+    import numpy as np
+    from auxetic.simulation import TileSystem
+    from auxetic_studio.views import View3D
+
+    # Two unit triangles stacked vertically along Y.
+    tiles = [
+        np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]]),
+        np.array([[0.0, 1.0], [1.0, 1.0], [0.5, 2.0]]),
+    ]
+    ts = TileSystem(2, tiles, constraints=[])
+    rest = np.zeros(2 * 3)   # 2 tiles × 3 dofs
+    info = View3D._compute_piston_data(ts, rest, initial_pose=rest)
+    assert info is not None
+    # Ground y at rest = bbox min y = 0.0
+    assert info["ground_axis_y"] == pytest.approx(0.0, abs=1e-9)
+    # Piston y at rest = bbox max y = 2.0
+    assert info["piston_axis_y"] == pytest.approx(2.0, abs=1e-9)
+    # Plate size: lateral 1.2× × bbox extent (x=1, z=0 → padded to thickness)
+    assert info["plate_size"][0] > 1.0   # padded x extent
+    assert info["plate_size"][1] > 0.0   # thickness
+
+
+def test_piston_visualization_piston_follows_compression():
+    """When the current pose has a SMALLER top y than the initial
+    pose, the piston center should sit lower than it would at rest —
+    visualising the compression."""
+    import numpy as np
+    from auxetic.simulation import TileSystem
+    from auxetic_studio.views import View3D
+
+    tiles = [np.array([[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]])]
+    ts = TileSystem(2, tiles, constraints=[])
+    rest_pose       = np.zeros(3)     # tile at origin
+    compressed_pose = np.array([0.0, -0.2, 0.0])  # tile pulled down 0.2 units
+
+    info_rest = View3D._compute_piston_data(ts, rest_pose,        initial_pose=rest_pose)
+    info_comp = View3D._compute_piston_data(ts, compressed_pose,  initial_pose=rest_pose)
+
+    # Ground stays at rest's bottom (y=0) in both cases.
+    assert info_rest["ground_axis_y"] == pytest.approx(0.0, abs=1e-9)
+    assert info_comp["ground_axis_y"] == pytest.approx(0.0, abs=1e-9)
+    # Piston tracks the CURRENT top: rest top=1.0, compressed top=0.8.
+    assert info_rest["piston_axis_y"] == pytest.approx(1.0, abs=1e-9)
+    assert info_comp["piston_axis_y"] == pytest.approx(0.8, abs=1e-9)
+
+
+def test_piston_visualization_returns_none_for_empty_tile_system():
+    from auxetic_studio.views import View3D
+    info = View3D._compute_piston_data(None, None)
+    assert info is None
+
+
+def test_piston_visualization_clears_when_leaving_dynamic_mode(main_window):
+    """Switching from Dynamic to Kinematic mode should clear any
+    rendered piston plates so they don't linger over the kinematic
+    sweep visualisation."""
+    panel = main_window.simulation_panel
+    panel._lattice.dynamics_state["config"]["duration"] = 0.05
+    panel.run_dynamic_button.click()    # auto-switches to dynamic mode
+    panel.mode_kinematic_radio.setChecked(True)
+    # The drive_pose call inside _on_mode_toggled should clear the
+    # piston actors.
+    assert panel._view_3d.last_piston_visualization is None
+
+
 def test_piston_changing_force_invalidates_dynamics_result(main_window):
     panel = main_window.simulation_panel
     panel._lattice.dynamics_state["config"]["duration"] = 0.05

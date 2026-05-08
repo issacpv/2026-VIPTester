@@ -510,6 +510,10 @@ class SimulationPanel(QDockWidget):
                 self._view_3d.clear_pose()
             except Exception:
                 pass
+            try:
+                self._view_3d.clear_piston_visualization()
+            except Exception:
+                pass
         self._update_state_dependent_ui()
 
     # ==================================================================
@@ -893,10 +897,29 @@ class SimulationPanel(QDockWidget):
                     from auxetic import TileSystem
                     ts = TileSystem.from_lattice(self._lattice)
                 self._view_3d.show_pose(ts, poses[idx])
+                # M3-polish: ground + piston plate visualisation.
+                # Static ground at the initial-pose bottom; piston at
+                # the current pose's top so it tracks the compression.
+                # Only meaningful when piston mode is active (the
+                # default workflow); skip for manual mode.
+                if float(
+                    self._lattice.dynamics_state.get("piston_force_n", 0.0)
+                ) > 0.0:
+                    self._view_3d.set_piston_visualization(
+                        ts, poses[idx], initial_pose=poses[0],
+                    )
+                else:
+                    self._view_3d.clear_piston_visualization()
             except Exception:
                 pass
             return
-        # Kinematic (default).
+        # Kinematic (default) — clear any leftover piston plates from
+        # a previous dynamic-mode scrub.
+        if self._view_3d is not None:
+            try:
+                self._view_3d.clear_piston_visualization()
+            except Exception:
+                pass
         if self._sim_result is None or self._is_outdated:
             return
         theta_rad = slider_to_simulator_theta(slider_deg)

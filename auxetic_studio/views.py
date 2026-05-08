@@ -526,6 +526,10 @@ class View3D(QWidget):
         self._force_actors: list = []
         # Test-friendly tap mirroring last_show_pose_args.
         self.last_force_glyphs: list | None = None
+        # Piston-mode visualisation: ground + piston plate actors.
+        self._piston_actors: list = []
+        # Test-friendly tap — records the most recent piston-viz call.
+        self.last_piston_visualization: dict | None = None
 
         # Track whether the orientation/widget extras are active so
         # tests / external callers can introspect.
@@ -941,6 +945,153 @@ class View3D(QWidget):
                 pass
         self._force_actors.clear()
 
+    # ------------------------------------------------------------------
+    # Piston-mode visualisation (ground plate + moving piston plate)
+    # ------------------------------------------------------------------
+
+    def set_piston_visualization(self,
+                                  tile_system,
+                                  current_pose,
+                                  *,
+                                  initial_pose=None,
+                                  axis_idx: int = 1) -> None:
+        """Render two thin slabs flanking the lattice along the piston
+        axis:
+
+        - **Ground plate** at the *initial-pose* lattice bottom — a
+          fixed reference for the user's eye showing where the bottom
+          slab is anchored.
+        - **Piston plate** at the *current-pose* lattice top — moves
+          downward as the user scrubs through the dynamic trajectory,
+          visualising how far the piston has pressed in.
+
+        Both plates align with the **world axes** (so a pre-rotated
+        lattice doesn't tilt them), extend 1.2× the lattice's lateral
+        extent so they fully cover the deforming structure, and are
+        thin in the piston axis (5% of the bbox diagonal).
+
+        ``initial_pose=None`` falls back to ``current_pose`` (no
+        compression depicted — both plates touch the lattice).
+        ``axis_idx`` matches the piston axis the dynamics builder used
+        (default 1 = world-Y, matching ``_piston_setup``).
+        """
+        info = self._compute_piston_data(
+            tile_system, current_pose,
+            initial_pose=initial_pose, axis_idx=axis_idx,
+        )
+        self.last_piston_visualization = info
+        self._clear_piston_actors()
+        if self.interactor is None or info is None:
+            return
+        try:
+            ground_mesh = pv.Cube(
+                center=tuple(info["ground_center"]),
+                x_length=float(info["plate_size"][0]),
+                y_length=float(info["plate_size"][1]),
+                z_length=float(info["plate_size"][2]),
+            )
+            piston_mesh = pv.Cube(
+                center=tuple(info["piston_center"]),
+                x_length=float(info["plate_size"][0]),
+                y_length=float(info["plate_size"][1]),
+                z_length=float(info["plate_size"][2]),
+            )
+            ground_actor = self.interactor.add_mesh(
+                ground_mesh, color="#5a5a5a", opacity=0.6,
+                show_edges=True, edge_color="#1a1a1a",
+            )
+            piston_actor = self.interactor.add_mesh(
+                piston_mesh, color="#a0a0a8", opacity=0.7,
+                show_edges=True, edge_color="#303030",
+                metallic=True, specular=0.7,
+            )
+            self._piston_actors.extend([ground_actor, piston_actor])
+            self.interactor.render()
+        except Exception:
+            self._clear_piston_actors()
+
+    def clear_piston_visualization(self) -> None:
+        """Drop the ground + piston actors."""
+        self.last_piston_visualization = None
+        self._clear_piston_actors()
+        if self.interactor is not None:
+            try:
+                self.interactor.render()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _compute_piston_data(tile_system, current_pose,
+                              *, initial_pose=None, axis_idx: int = 1
+                              ) -> dict | None:
+        """Compute ground and piston plate centres + size from poses.
+        Pure helper so headless tests can verify the geometry without
+        any VTK dependency."""
+        import numpy as _np
+        if tile_system is None or tile_system.n_tiles == 0:
+            return None
+        cur_verts = _world_verts_3d(tile_system, current_pose)
+        if cur_verts.shape[0] == 0:
+            return None
+        ref_verts = (cur_verts if initial_pose is None
+                     else _world_verts_3d(tile_system, initial_pose))
+
+        # Lateral axes are everything except the piston axis. We work
+        # in 3D throughout (2D lattices are padded to z=0 in
+        # ``_world_verts_3d``).
+        ax = int(axis_idx)
+        if ax not in (0, 1, 2):
+            ax = 1
+        lat = [i for i in range(3) if i != ax]
+
+        bbox_min = cur_verts.min(axis=0)
+        bbox_max = cur_verts.max(axis=0)
+        bbox_size = bbox_max - bbox_min
+        diag = float(_np.linalg.norm(bbox_size))
+        thickness = max(diag * 0.05, 0.02)
+
+        # Ground anchored at the INITIAL bottom — doesn't move.
+        ground_axis_y = float(ref_verts[:, ax].min())
+        # Piston tracks the CURRENT top — moves with compression.
+        piston_axis_y = float(cur_verts[:, ax].max())
+
+        center_lat = (bbox_min[lat] + bbox_max[lat]) / 2.0
+        ground_center = _np.zeros(3)
+        ground_center[lat[0]] = center_lat[0]
+        ground_center[lat[1]] = center_lat[1]
+        ground_center[ax]     = ground_axis_y - thickness / 2.0
+        piston_center = _np.zeros(3)
+        piston_center[lat[0]] = center_lat[0]
+        piston_center[lat[1]] = center_lat[1]
+        piston_center[ax]     = piston_axis_y + thickness / 2.0
+
+        # Plate size: 1.2x the lateral extents in the perpendicular
+        # axes; thickness along the piston axis.
+        size = _np.zeros(3)
+        size[lat[0]] = max(float(bbox_size[lat[0]]) * 1.2, thickness)
+        size[lat[1]] = max(float(bbox_size[lat[1]]) * 1.2, thickness)
+        size[ax]     = thickness
+
+        return {
+            "ground_center":  ground_center,
+            "piston_center":  piston_center,
+            "plate_size":     size,
+            "axis_idx":       ax,
+            "ground_axis_y":  ground_axis_y,
+            "piston_axis_y":  piston_axis_y,
+        }
+
+    def _clear_piston_actors(self) -> None:
+        if self.interactor is None:
+            self._piston_actors.clear()
+            return
+        for actor in self._piston_actors:
+            try:
+                self.interactor.remove_actor(actor)
+            except Exception:
+                pass
+        self._piston_actors.clear()
+
     @staticmethod
     def _build_pose_mesh_triangles(tile_system, pose, *, lattice=None):
         """Apply ``pose`` to ``tile_system`` and return the full deformed
@@ -1020,6 +1171,24 @@ def _apply_tile_pose(tile, pose, tile_idx, dimension):
         else:
             R = _R.from_rotvec(omega).as_matrix()
         return np.asarray(tile, dtype=float) @ R.T + t
+
+
+def _world_verts_3d(tile_system, pose) -> np.ndarray:
+    """Stack every tile's world-frame vertices for ``pose`` into a
+    single ``(N, 3)`` array. 2D lattices are padded with z=0 so the
+    piston-visualisation helper can treat both dim cases uniformly."""
+    if tile_system is None or tile_system.n_tiles == 0:
+        return np.zeros((0, 3), dtype=float)
+    dim = tile_system.dimension
+    rows = []
+    for ti in range(tile_system.n_tiles):
+        v = _apply_tile_pose(tile_system.tiles[ti], pose, ti, dim)
+        if dim == 2:
+            v3 = np.hstack([v, np.zeros((v.shape[0], 1))])
+        else:
+            v3 = v
+        rows.append(np.asarray(v3, dtype=float))
+    return np.vstack(rows) if rows else np.zeros((0, 3), dtype=float)
 
 
 def _triangles_to_polydata(triangles):
