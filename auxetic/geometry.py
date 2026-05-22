@@ -769,17 +769,18 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
     quadratic-Bézier polyline (see :func:`bezier_polyline`) instead of a
     straight 2-point segment. With it off — the default — struts are the
     same 2-point arrays as before, so STL/OBJ/SCAD output is unchanged.
-    The arcs bow away from the lattice centroid so neighbouring struts
-    curve coherently rather than each picking an arbitrary normal."""
+    The arcs bow *toward* the lattice centroid, so each strut curves inward
+    (concave / re-entrant — the intended auxetic look) coherently rather
+    than each picking an arbitrary normal."""
     strut_curves  = []
     all_triangles = []
     joint_positions = set()
 
     _bez_on = bool(bezier_enabled) and float(bezier_strength) != 0.0 and int(bezier_segments) > 1
     # Centroid of the export geometry, used as the bow reference so struts
-    # bulge outward coherently. Computed lazily from the point cloud
-    # (lifted to 3D for 2D modes); falls back to None (deterministic
-    # perpendicular) when unavailable.
+    # curve inward (concave / re-entrant) coherently. Computed lazily from
+    # the point cloud (lifted to 3D for 2D modes); falls back to None
+    # (deterministic perpendicular) when unavailable.
     _bow_center = None
     if _bez_on:
         try:
@@ -797,7 +798,9 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
             if _bez_on:
                 bow = None
                 if _bow_center is not None:
-                    bow = 0.5 * (p0 + p1) - _bow_center
+                    # Toward the centroid -> concave / re-entrant arc (inward),
+                    # not away (which bulged the struts outward — the bug).
+                    bow = _bow_center - 0.5 * (p0 + p1)
                 strut_curves.append(bezier_polyline(
                     p0, p1, strength=float(bezier_strength),
                     segments=int(bezier_segments), bow_dir=bow))

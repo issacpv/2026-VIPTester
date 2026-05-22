@@ -233,3 +233,53 @@ def test_zero_strength_with_enabled_is_still_straight(tmp_path):
     b.to_stl(str(b_stl), verbose=False)
 
     assert _read_bytes(a_stl)[80:] == _read_bytes(b_stl)[80:]
+
+
+# ---------------------------------------------------------------------------
+# Bow DIRECTION (task 1, Batch 2): struts must curve inward / re-entrant
+# ---------------------------------------------------------------------------
+
+def _bow_dots_toward_centroid(lat):
+    """For each curved strut on ``lat``, the dot of its apex offset (the
+    perpendicular bow vector) with the chord->centroid vector. Positive =
+    the arc bows inward toward the structure centroid (concave); negative =
+    it bulges outward (the pre-fix bug)."""
+    lat._ensure_export_geometry()
+    curved = [np.asarray(c, float) for c in lat._strut_curves if len(c) > 2]
+    pts = np.asarray(lat.points, float)
+    c = pts.mean(axis=0)
+    centroid = np.array([c[0], c[1], 0.0]) if c.shape[0] == 2 else c
+    dots = []
+    for poly in curved:
+        chord_mid = 0.5 * (poly[0] + poly[-1])
+        apex = poly[len(poly) // 2]
+        dots.append(float(np.dot(apex - chord_mid, centroid - chord_mid)))
+    return dots
+
+
+def test_curved_struts_bow_inward_on_eqtri():
+    """The EqTri repro: with curves ON, every bond curves toward the
+    triangle centroid (concave / re-entrant — the intended auxetic look),
+    and none bulge outward. Before the fix the arcs bowed away from the
+    centroid, so these dots were negative."""
+    eqtri = np.array([[0.0, 0.0], [1.0, np.sqrt(3.0)], [2.0, 0.0]])
+    lat = Lattice(mode=11, n_points=3, ratio=0.35)
+    lat.regenerate_from_points(eqtri)
+    lat.set_bezier(enabled=True, strength=0.3, segments=8)
+
+    dots = _bow_dots_toward_centroid(lat)
+    assert dots, "expected curved bond struts for EqTri with bezier on"
+    assert all(d >= -1e-9 for d in dots)   # none bulge outward
+    assert any(d > 1e-9 for d in dots)     # at least one genuinely inward
+
+
+def test_curved_struts_bow_inward_on_grid_mode():
+    """Same inward-bow invariant on a mode-6 3D grid (reliable boundary
+    struts) — confirms the direction fix is mode-agnostic, not EqTri-only."""
+    lat = Lattice(mode=6, n_points=8, ratio=0.35)
+    lat.set_bezier(enabled=True, strength=0.3, segments=6)
+
+    dots = _bow_dots_toward_centroid(lat)
+    assert dots, "expected curved struts for mode-6 grid with bezier on"
+    assert all(d >= -1e-9 for d in dots)
+    assert any(d > 1e-9 for d in dots)
