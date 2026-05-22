@@ -12,9 +12,9 @@ This file is the cross-iteration state. Read it FIRST every iteration.
 
 | # | Task | Status |
 |---|------|--------|
-| 3 | Zoom-to-cursor in the 3D view | DONE (commit) |
-| 2 | SCAD intact — integration test guarding to_scad | IN PROGRESS |
-| 1 | Bezier-curve edges before export | PENDING |
+| 3 | Zoom-to-cursor in the 3D view | DONE (13fd991) |
+| 2 | SCAD intact — integration test guarding to_scad | DONE (commit) |
+| 1 | Bezier-curve edges before export | IN PROGRESS (next) |
 | 5 | Tessellation generator | PENDING |
 | 4 | Generalized Poisson's ratio on triangle edge vectors | PENDING |
 
@@ -80,10 +80,45 @@ Working order: 3 → 2 → 1 → 5 → 4 (risk-managed, per prompt).
   than risk suite flakiness; the guards are trivial early-returns.
 - Verified: zoom file 18/18 (solo x3 + in company), regression 5/5, load-bearing
   `test_app` GUI STL-diff + nav 9/9 — all EXIT 0.
-- **Next step:** Task 2 — add `tests/test_scad_export.py` integration test that
-  `to_scad` emits valid OpenSCAD for a representative mode (assert structure:
-  `union(){`, `cylinder(`, `polyhedron(points=[...],faces=[...]`, balanced
-  braces, nonzero strut+triangle counts). Must guard the bezier work in task 1.
+### Iteration 3 (2026-05-22) — Task 2 SCAD guard
+- Added `tests/test_scad_export.py` (pure, no GUI). Validates `to_scad` for
+  modes 1/4/2/6: header params, `$fn`, `union(){`, ≥1 strut `cylinder(`, exactly
+  one `polyhedron(points=[...],faces=[...]`, balanced `{}`/`[]`/`()` (and never
+  closing-before-opening), ends with `}`, no nan/inf, and **face indices in
+  range of the points array**. Plus a positive-radius/length strut check, and an
+  `openscad`-CLI parse test that auto-skips when the binary is absent.
+- 5 passed, 1 skipped (no openscad CLI here). This is the guard for tasks 1 & 5.
+
+### Iteration 4 (2026-05-22) — Task 1 bezier edges (STARTING)
+- **Design (decided):** Add a `bezier` config to `Lattice`, default **off** so
+  modes 1–9 stay byte-for-byte identical.
+  - `Lattice.bezier_enabled: bool = False`, `Lattice.bezier_strength: float`
+    (0 = straight; curvature magnitude as a fraction of edge length), and
+    `bezier_segments: int` (polyline tessellation density; 1 == straight).
+  - Geometry: a new pure helper in `auxetic/geometry.py`,
+    `bezier_polyline(p0, p1, *, strength, segments, ...)`, returns a dense
+    polyline. Zero strength OR segments<=1 returns exactly `[p0, p1]` (so OFF is
+    byte-identical). Nonzero => smooth denser polyline (quadratic/cubic Bézier).
+  - The struts are the natural curve target: `collect_export_geometry`'s
+    `add_strut` currently appends a 2-point `np.array([p0,p1])`. When bezier is
+    on, replace with the tessellated polyline. `build_export_triangles.tube_mesh`
+    ALREADY handles multi-point paths, and SCAD already iterates strut segments —
+    but check: SCAD's `scad_cylinder` only uses `pts[0]`/`pts[1]`! Must update
+    `export_to_scad` to emit a cylinder per polyline segment when len>2. Verify.
+  - Round-trip through preset: bump preset to **v6**, add migration v5->v6 that
+    injects bezier defaults (off). Never break old presets.
+  - GUI: a control (checkbox + strength/segments spin) in the inspector or a
+    relevant panel, wired through a Lattice setter (no geometry in GUI).
+  - Tests: curve math (zero curvature == original 2 pts; nonzero == denser smooth
+    polyline, endpoints preserved, midpoint offset along normal); all three
+    exporters with curves ON produce valid output; with OFF byte-identical
+    (regression already covers OFF for modes 1-9). Reuse test_scad_export guard.
+- **Next step:** read `auxetic_studio/preset.py` (current version + migration
+  pattern) and the inspector panel to find where to add the GUI control; confirm
+  whether tile/strut EDGES vs strut CURVES is the right curve target (struts are
+  the clean target; "tile edges" => curve the polygon outline before extrude —
+  decide scope). Then implement `bezier_polyline` + wire `add_strut`, update SCAD
+  per-segment cylinders, preset v6 + migration, GUI control, tests.
 
 ---
 
