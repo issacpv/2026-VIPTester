@@ -315,7 +315,7 @@ not commit them unless a task needs one as a test fixture.
 | 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
 | 4 | Desktop-shortcut launch is slow — speed up cold start | DONE (investigation; no safe code win — see notes) |
 | 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | DONE (34250a5) |
-| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e (583231d), 6a (762bd45) DONE; 6b–6d TODO |
+| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e (583231d), 6a (762bd45), 6b (3ef75b5) DONE; 6c–6d TODO |
 
 **Working order (risk-managed, isolated/cheap first → big features last):**
 6e (remove buttons — trivial) → 3 (small render fix) → 2 (render fix, same redraw path)
@@ -730,4 +730,37 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
   that works on `presetEqHex.json`. Likely in the Predictor "Geometry metrics" box
   (where `edge_vector_poisson_ratio` already shows) and/or the sim readout. Working
   order: … 6a → **6b** → 6c → 6d.
+
+### Iteration 8 (2026-05-22) — Task 6b full-structure ν readout (COMPLETE, 3ef75b5)
+- **Key finding (drove the design).** On EqHex (mode 11), the two whole-structure
+  ν measures DISAGREE: `edge_vector_poisson_ratio` = **-1.000** (the true auxetic
+  value for equilateral tiles) but the bbox `Simulator.poissons_ratio` ≈ **0** (the
+  symmetric rotating-units mode barely changes the AABB at the tiny SPEC §7.4
+  probe). So the meaningful full-structure value is the edge-vector one — and it
+  was only shown in the ML/Predictor panel, easy to miss.
+- **Shipped.** Added the full-structure edge-vector ν to the **simulation readout**
+  (row "Full-structure ν (edge-vector)") and relabelled the bbox value
+  "Poisson's ratio (bbox)" so both whole-structure measures are distinct and clear.
+  Value computed once per solve (`_apply_sim_result`, geometry-only & cheap) and
+  stored as `self._edge_poisson_ratio` (mirrors `_poissons_ratio`; no per-readout
+  recompute). Relabelled the Predictor "Geometry metrics" row "Edge-vector ν:" →
+  "Full-structure ν:" with a tooltip noting it's the whole-lattice mean and that
+  per-triangle ν comes via Ctrl-click (forward-ref 6c). All display goes through
+  `Lattice.edge_vector_poisson_ratio` — no geometry in the GUI.
+- **Compatibility.** Kept `edge_poisson_label` (+ its `+.3f` value format) so
+  `test_predictor_panel` still passes; kept "Poisson's ratio" substring so
+  `test_simulation_gui` still passes.
+- **Tests.** `test_edge_poisson.py`: EqHex full-structure ν ≈ -1 (pure). 
+  `test_simulation_gui.py`: the sim readout contains "Full-structure" after a run.
+- Full suite **549 passed, 1 skipped** (+1), 0 failures, EXIT 0 (5m25s). `auxetic/`
+  untouched this iteration.
+- **Env note.** The two stray `_token_*.py` token-tally scripts seen in iter-7's
+  tree were transient (gone by this iteration) — not project files, never committed.
+- **Next step:** Task 6c — Ctrl-click a triangle in the 3D view → show THAT
+  triangle's ν. Add VTK cell picking in `views.py` (a `vtkCellPicker`), detect the
+  Ctrl modifier on left-click in 3D, map the picked cell → the lattice triangle →
+  `auxetic/edge_poisson.py::generalized_poisson_ratio` (wrap as a `Lattice` method
+  that takes a triangle index). 2D picking already exists; 3D is new. Selection /
+  ν computation in `auxetic/`; the GUI only displays. Working order: … 6b → **6c**
+  → 6d.
 
