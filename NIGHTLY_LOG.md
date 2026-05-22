@@ -16,7 +16,9 @@ This file is the cross-iteration state. Read it FIRST every iteration.
 | 2 | SCAD intact — integration test guarding to_scad | DONE (7b00de6) |
 | 1 | Bezier-curve edges before export | DONE (8a8c282, aedd64a, ccd873c) |
 | 5 | Tessellation generator | DONE (876d5e8) |
-| 4 | Generalized Poisson's ratio on triangle edge vectors | IN PROGRESS (next) |
+| 4 | Generalized Poisson's ratio on triangle edge vectors | DONE (265050d) |
+
+**All 5 tasks complete.** Full-suite verification running (background id brdhfxqi0).
 
 Working order: 3 → 2 → 1 → 5 → 4 (risk-managed, per prompt).
 
@@ -216,9 +218,29 @@ Working order: 3 → 2 → 1 → 5 → 4 (risk-managed, per prompt).
     metric method on Lattice/sim that the panel can call, tested without GUI,
     and only a tiny display hook). If risky, compute+expose via a Lattice
     method and note panel wiring as optional.
-- **Next step:** read `auxetic_studio/predictor_panel.py`; implement
-  `auxetic/edge_poisson.py` + tests; then a minimal panel surface; full-suite
-  verification pass; write final summary.
+### Iteration 7 (2026-05-22) — Task 4 generalized Poisson (COMPLETE, 265050d)
+- **Key result (documented in the module):** a single triangle's actuated kite
+  *corners* deform by a shape-INDEPENDENT gradient `B = t·R(θ)+(1-t)I`, so their
+  strain `ε = t(cosθ-1)I` is isotropic and a corner-based ν is identically -1 for
+  every shape/C. The shape/C dependence the task asks for therefore had to come
+  from a non-affine edge measure: the per-edge **bond midpoints** (each carried by
+  a kite rotating about a different hinge). The triangle of those midpoints
+  deforms non-affinely → its principal-strain ratio IS shape/C-dependent.
+- `auxetic/edge_poisson.py` (numpy only): `generalized_poisson_ratio(tri, C, theta,
+  axis=None)` (principal or directional), `triangle_strain_tensor`,
+  `edge_midpoint_triangle`, `actuated_corners` (kept to demonstrate the isotropy),
+  `sweep_poisson` / `sweep_shape_and_C` (+ `PoissonSweep`), shape helpers
+  (`equilateral_triangle`, `apex_triangle`, `morph_triangle`). Equilateral → -1
+  across all C/θ; scalene drifts toward 0/positive; θ=0 → nan (guarded).
+- `Lattice.edge_vector_poisson_ratio(theta=0.1)` = mean over the lattice's 2D
+  triangles (nan for 3D). Surfaced read-only in the Predictor panel's new
+  "Geometry metrics" box; refreshed live via `MainWindow._refresh_state ->
+  predictor_panel.refresh_metrics()`.
+- 31 pure tests + 2 GUI tests (panel label ties to the Lattice method). Regression
+  green. Committed task 4 (265050d); also committed the baseline's intended
+  `.gitignore` `.claude/` line that had been left unstaged (a8f0513).
+- **Next:** await full-suite result (background brdhfxqi0); if green, finalize the
+  summary below and STOP. If any failure, fix (my code is wrong) and re-verify.
 
 ---
 
