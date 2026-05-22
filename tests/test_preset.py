@@ -223,7 +223,7 @@ def test_save_writes_v1_schema(tmp_path):
 
     expected_keys = {
         "version", "mode", "n_points", "ratio", "nz_layers",
-        "points", "shape_params", "generation", "dynamics",
+        "points", "shape_params", "generation", "dynamics", "bezier",
         "view_state", "metadata",
     }
     assert set(data.keys()) == expected_keys

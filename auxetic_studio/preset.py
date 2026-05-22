@@ -56,10 +56,11 @@ from auxetic import Lattice
 from auxetic import geometry as _geom
 
 
-PRESET_VERSION = 5  # Mode 11 — adds the bipartite-auxetic constant
-                     # size ratio "C" to the v3 generation block. v4 → v5
-                     # migration fills C = 1.0; geometry payload for every
-                     # other mode is unchanged.
+PRESET_VERSION = 6  # Task 1 — adds the opt-in "bezier" block (curved
+                     # strut edges). v5 → v6 migration fills it with
+                     # curving OFF, so every pre-v6 preset loads with
+                     # byte-for-byte identical export geometry. (v5 added
+                     # the mode-11 constant size ratio "C" to generation.)
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,19 @@ def _stub_dynamics() -> Dict[str, Any]:
             "gravity_cm_per_s2":          [0.0, 0.0, 0.0],
             "convergence_kinetic_thresh": 1.0e-5,
         },
+    }
+
+
+def _stub_bezier() -> Dict[str, Any]:
+    """v6 ``bezier`` block defaults — curving OFF, so a migrated preset
+    exports byte-for-byte identically. ``strength`` (perpendicular
+    control-point offset as a fraction of strut length) and ``segments``
+    (polyline tessellation density) are the values used once the user
+    enables curving."""
+    return {
+        "enabled":  False,
+        "strength": 0.25,
+        "segments": 12,
     }
 
 
@@ -235,6 +249,11 @@ def save_preset(
         },
         "generation": generation,
         "dynamics":   dynamics_dict,
+        "bezier": {
+            "enabled":  bool(getattr(lattice, "bezier_enabled", False)),
+            "strength": float(getattr(lattice, "bezier_strength", 0.25)),
+            "segments": int(getattr(lattice, "bezier_segments", 12)),
+        },
         "view_state": dict(lattice.view_state) if lattice.view_state else _stub_view_state(),
         "metadata":   md,
     }
@@ -295,6 +314,9 @@ def load_preset(path: str) -> Lattice:
     if int(data.get("version", PRESET_VERSION)) == 4:
         data = _migrate_v4_to_v5(data)
 
+    if int(data.get("version", PRESET_VERSION)) == 5:
+        data = _migrate_v5_to_v6(data)
+
     # ---- M1 generation block (v3) ---------------------------------------
     # Pull these out first so they can be passed to the Lattice
     # constructor. Mesh-import modes (7, 8, 9) need ``mesh_vertices``
@@ -305,6 +327,10 @@ def load_preset(path: str) -> Lattice:
                      if mesh_vertices_list else None)
     edge_flips_raw = gen.get("edge_flips") or []
     edge_flips = {tuple(sorted((int(e[0]), int(e[1])))) for e in edge_flips_raw}
+
+    # ---- bezier block (v6) — read before construction so it can be
+    #      passed straight to the Lattice constructor.
+    bez = dict(data.get("bezier") or _stub_bezier())
 
     # ---- construct the Lattice with saved scalars -----------------------
     lattice = Lattice(
@@ -320,6 +346,9 @@ def load_preset(path: str) -> Lattice:
         mesh_vertices    = mesh_vertices,
         unit_scale_cm    = float(gen.get("unit_scale_cm", 1.0)),
         C                = float(gen.get("C", 1.0)),
+        bezier_enabled   = bool(bez.get("enabled", False)),
+        bezier_strength  = float(bez.get("strength", 0.25)),
+        bezier_segments  = int(bez.get("segments", 12)),
     )
 
     # ---- install saved points (and freeze them as the new "original") --
@@ -459,4 +488,17 @@ def _migrate_v4_to_v5(data: Dict[str, Any]) -> Dict[str, Any]:
     gen = dict(out.get("generation") or {})
     gen.setdefault("C", 1.0)
     out["generation"] = gen
+    return out
+
+
+def _migrate_v5_to_v6(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote a v5 preset to v6: adds the ``bezier`` block with curving
+    OFF. v5 files load with byte-for-byte identical export geometry —
+    bezier curving is opt-in and only affects struts when enabled."""
+    out = dict(data)
+    out["version"] = 6
+    bez = dict(out.get("bezier") or {})
+    for key, value in _stub_bezier().items():
+        bez.setdefault(key, value)
+    out["bezier"] = bez
     return out

@@ -60,8 +60,11 @@ def _v4_payload(mode=1, n_points=5):
 # Version + stub
 # ---------------------------------------------------------------------------
 
-def test_preset_version_is_5():
-    assert PRESET_VERSION == 5
+def test_preset_version_at_least_5():
+    # v5 introduced generation.C; the exact current version is pinned in
+    # the newest version's test (test_preset_v6). This only asserts v5's
+    # features have not been rolled back.
+    assert PRESET_VERSION >= 5
 
 
 def test_stub_generation_includes_C():
@@ -105,7 +108,7 @@ def test_mode_11_roundtrip(tmp_path):
     save_preset(str(p), lat)
 
     data = json.loads(p.read_text())
-    assert data["version"] == 5
+    assert data["version"] == PRESET_VERSION
     assert data["generation"]["C"] == 3.5
 
     lat2 = load_preset(str(p))
