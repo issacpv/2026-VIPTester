@@ -312,7 +312,7 @@ not commit them unless a task needs one as a test fixture.
 |---|------|--------|
 | 1 | Bezier strut curving is wrong — fix curve direction/shape to match intent | TODO |
 | 2 | Kinematic sim playback flickers / mesh disappears mid-motion | TODO |
-| 3 | Reference-polygon highlight only visible from top, not bottom | TODO |
+| 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
 | 4 | Desktop-shortcut launch is slow — speed up cold start | TODO |
 | 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | TODO |
 | 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e DONE (583231d); 6a–6d TODO |
@@ -488,4 +488,33 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
 - **Next step:** Task 3 — reference-polygon highlight invisible from bottom
   (`views.py` `self._anchor_actor`, ~L1380-1420). Small render fix; next in the
   risk-managed working order (6e → **3** → 2 → 1 → 4 → 5 → 6a–6d).
+
+### Iteration 2 (2026-05-22) — Task 3 anchor highlight from all sides (COMPLETE, 9e82a3c)
+- **Root cause.** `views.py::_update_anchor_outline` lifts the gold ring to
+  `ztop + 0.05*span` (just ABOVE the mesh, +Z only). From the top the ring sits
+  over the structure (visible); from the bottom the opaque mesh sits between the
+  camera and the ring → genuine occlusion (not z-fighting), so the ring vanishes.
+- **Fix.** New module-level `views.py::_force_actor_on_top(actor)` pushes the
+  actor's rasterized depth toward the near plane via large negative
+  coincident-topology offsets (polygon + line + point variants, units −66000 —
+  the standard VTK always-on-top hack). Wired in right after the anchor
+  `add_mesh`. Ring now wins the depth test against the mesh from ANY angle; the
+  top-down look is unchanged (it already drew over the mesh there). Geometry/verts
+  untouched, so `last_anchor_highlight` and the mode-11 anchor GUI tests are
+  unaffected (they early-return headless anyway).
+- **Tests.** `tests/test_anchor_highlight_on_top.py` — 4 pure tests with a
+  recording fake mapper (GetMapper + `.mapper` fallback, no-mapper safe,
+  swallows mapper API errors). No Qt widget constructed → immune to the teardown
+  race; safe to run alone.
+- **HONEST CAVEAT (visual not headlessly verified).** I locked in the *intent*
+  (the helper issues the right VTK depth calls), but I could NOT assert actual
+  pixel visibility-from-below on `presetEqHex` — that needs a real render window,
+  which crashes headless here. The −66000 always-on-top offset is a well-known
+  VTK recipe; a human should eyeball EqHex from the bottom to confirm.
+- Full suite **533 passed, 1 skipped** (+4 new), 0 failures (6m01s). Didn't touch
+  `auxetic/`; regression green within the suite.
+- **Next step:** Task 2 — kinematic sim playback flicker / mesh disappears
+  mid-motion (`views.py` ~L1230-1350: remove_actor → add_mesh leaves a frame with
+  no mesh actor). Same redraw path family as Task 3. Working order: 6e → 3 →
+  **2** → 1 → 4 → 5 → 6a–6d.
 
