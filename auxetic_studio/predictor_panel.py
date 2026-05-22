@@ -164,20 +164,22 @@ class PredictorPanel(QDockWidget):
         outer.addWidget(self.status_label)
 
     def _build_metrics_box(self, outer):
-        """Read-only geometry metrics for the current lattice. Currently
-        the edge-vector generalized Poisson's ratio (task 4) — a local
-        per-triangle auxetic metric, averaged over the lattice, distinct
-        from the simulator's bounding-box Poisson ratio."""
+        """Read-only geometry metrics for the current lattice. The
+        full-structure edge-vector generalized Poisson's ratio (task 4) —
+        the whole-lattice mean of the per-triangle auxetic metric, distinct
+        from the simulator's bounding-box Poisson ratio. Ctrl-click a
+        triangle in the 3D view for one triangle's ν (task 6c)."""
         box = QGroupBox("Geometry metrics", self)
         form = QFormLayout(box)
         self.edge_poisson_label = QLabel("—", box)
         self.edge_poisson_label.setTextFormat(Qt.TextFormat.RichText)
         self.edge_poisson_label.setToolTip(
-            "Mean generalized Poisson's ratio from how each triangle's "
-            "edge connection points deform under a small actuation of the "
-            "rotating-units mechanism (uses the lattice's C). "
-            "Equilateral tiles give -1 (isotropic auxetic).")
-        form.addRow(QLabel("Edge-vector ν:"), self.edge_poisson_label)
+            "Whole-lattice (full-structure) generalized Poisson's ratio: the "
+            "mean over ALL triangles of how each triangle's edge connection "
+            "points deform under a small actuation of the rotating-units "
+            "mechanism (uses the lattice's C). Equilateral tiles give -1 "
+            "(isotropic auxetic). Ctrl-click a triangle in 3D for its own ν.")
+        form.addRow(QLabel("Full-structure ν:"), self.edge_poisson_label)
         outer.addWidget(box)
 
     def _build_train_box(self, outer):

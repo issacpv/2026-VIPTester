@@ -74,6 +74,8 @@ def test_simulation_panel_run_button_populates_results(main_window):
     assert panel._locking_info is not None
     text = panel.readout.text()
     assert "Poisson's ratio" in text
+    # Task 6b: the whole-structure edge-vector ν is surfaced in the readout.
+    assert "Full-structure" in text
 
 
 # ---------------------------------------------------------------------------

@@ -234,3 +234,18 @@ def test_lattice_equilateral_tessellation_is_auxetic():
     # Clearly auxetic on average (interior equilateral tiles dominate the
     # mean; the scalene boundary closers pull it up from the ideal -1).
     assert nu < -0.2
+
+
+def test_lattice_eqhex_full_structure_is_minus_one():
+    """The EqHex repro (mode-11 hexagon of equilateral tiles): the
+    full-structure edge-vector ν is ~-1, the meaningful auxetic value the
+    task-6b readout surfaces — even though the bbox ν reads ~0 for this
+    symmetric rotating-units mechanism."""
+    eqhex = np.array([
+        [0.0, 1.7320508075688772], [1.0, 0.0], [1.0, 3.4641016151377544],
+        [2.0, 1.7320508075688772], [3.0, 0.0], [3.0, 3.4641016151377544],
+        [4.0, 1.7320508075688772],
+    ])
+    lat = Lattice(mode=11, n_points=7, ratio=0.35)
+    lat.regenerate_from_points(eqhex)
+    assert lat.edge_vector_poisson_ratio() == pytest.approx(-1.0, abs=1e-4)

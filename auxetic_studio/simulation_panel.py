@@ -239,7 +239,8 @@ class SimulationPanel(QDockWidget):
         self._sim_result      = None
         self._tile_system     = None
         self._simulator       = None
-        self._poissons_ratio  = None
+        self._poissons_ratio  = None      # bbox ν (SPEC §7.4), whole structure
+        self._edge_poisson_ratio = None   # full-structure edge-vector ν (mean)
         self._locking_info    = None
         self._is_outdated     = False     # True after lattice change until rerun
         self._last_error      = None      # exception text if last run failed
@@ -799,6 +800,14 @@ class SimulationPanel(QDockWidget):
         self._tile_system     = tile_system
         self._simulator       = simulator
         self._poissons_ratio  = poissons
+        # Whole-lattice edge-vector ν (geometry-only; cheap, computed once
+        # here rather than per readout refresh). Captures the true auxetic
+        # value for symmetric mechanisms where the bbox ν reads ~0.
+        try:
+            self._edge_poisson_ratio = float(
+                self._lattice.edge_vector_poisson_ratio())
+        except Exception:
+            self._edge_poisson_ratio = None
         self._locking_info    = info
         self._is_outdated     = False
         # Drop a stale anchor whose index no longer exists (tile count
@@ -818,6 +827,7 @@ class SimulationPanel(QDockWidget):
         self._tile_system    = None
         self._simulator      = None
         self._poissons_ratio = None
+        self._edge_poisson_ratio = None
         self._locking_info   = None
         self._is_outdated    = False
         self._update_state_dependent_ui()
@@ -1114,12 +1124,15 @@ class SimulationPanel(QDockWidget):
 
         # Success rendering (fresh) or stale (outdated).
         nu_html       = self._format_poissons_ratio_html()
+        edge_nu_html  = self._format_edge_poisson_html()
         lock_html     = self._format_locked_html()
         comp_pct      = (self._locking_info or {}).get("compression_ratio", 0.0) * 100.0
         proj          = (self._locking_info or {}).get("mode_projection",   0.0)
         body = (
             "<table style='border-spacing:0;'>"
-            f"<tr><td><b>Poisson's ratio:</b></td><td>{nu_html}</td></tr>"
+            f"<tr><td><b>Full-structure ν (edge-vector):</b></td>"
+            f"<td>{edge_nu_html}</td></tr>"
+            f"<tr><td><b>Poisson's ratio (bbox):</b></td><td>{nu_html}</td></tr>"
             f"<tr><td><b>Locked status:</b></td><td>{lock_html}</td></tr>"
             f"<tr><td><b>Compression ratio:</b></td><td>{comp_pct:.1f}%</td></tr>"
             f"<tr><td><b>Mode projection:</b></td><td>{proj:.3f}</td></tr>"
@@ -1180,6 +1193,19 @@ class SimulationPanel(QDockWidget):
         if isinstance(nu, float) and math.isnan(nu):
             return "— <i>(no axial extension)</i>"
         return f"{float(nu):.4f}"
+
+    def _format_edge_poisson_html(self) -> str:
+        """Whole-lattice edge-vector generalized Poisson's ratio (mean over
+        all triangles) — geometry-only, distinct from the bbox ν above. For
+        symmetric rotating-units mechanisms (e.g. EqHex) the bbox ν can read
+        ~0 while this captures the true auxetic value (-1 for equilateral
+        tiles). Ctrl-click a triangle in the 3D view for one triangle's ν."""
+        nu = self._edge_poisson_ratio
+        if nu is None:
+            return "—"
+        if isinstance(nu, float) and math.isnan(nu):
+            return "— <i>(3D / no 2D triangles)</i>"
+        return f"{float(nu):+.4f}"
 
     def _format_locked_html(self) -> str:
         info = self._locking_info or {}
