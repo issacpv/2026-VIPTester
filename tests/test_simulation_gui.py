@@ -110,6 +110,49 @@ def test_run_simulation_populates_poisson_tracking(main_window):
     assert win.view_3d.last_poisson_tracking is None
 
 
+def test_anchored_poisson_bounds_use_relativized_poses(main_window):
+    """Batch 3 task 2: with a polygon anchored, the displayed structure is
+    drawn in that polygon's frame (relativize_pose), so the Poisson bounds
+    must be computed from the SAME relativized poses — not the absolute
+    ones — to enclose what's on screen."""
+    win = main_window
+    panel = win.simulation_panel
+    panel.run_simulation()
+    sim = panel._simulator
+    result = panel._sim_result
+    if sim is None or result is None or sim.n_tiles == 0:
+        pytest.skip("no kinematic result with tiles to anchor")
+
+    anchor = 0
+    panel._anchor_tile = anchor
+    panel._update_poisson_tracking()
+    tracking = win.view_3d.last_poisson_tracking
+    assert tracking is not None
+
+    # Rest box: corners match the AABB of the RELATIVIZED rest pose.
+    # (At rest the pose is the zero vector, so relativize is the identity —
+    # this equality also holds for the absolute path; the discriminating
+    # check below uses the compressed pose, which actually moves.)
+    rest = sim.rest_pose()
+    rel_rest = sim.relativize_pose(rest, anchor)
+    np.testing.assert_allclose(
+        tracking["initial_corners"], sim.bbox_corners(rel_rest))
+    # Compressed box (panel selects argmin of the axial bbox extent) — this
+    # is an actuated pose, so relativization genuinely transforms it.
+    extents = np.asarray(result.bbox_extents, dtype=float)
+    axial = sim._axial_index()
+    comp_idx = int(np.argmin(extents[:, axial])) if extents.size else 0
+    abs_comp = sim.bbox_corners(result.poses[comp_idx])
+    rel_comp = sim.bbox_corners(sim.relativize_pose(result.poses[comp_idx], anchor))
+    np.testing.assert_allclose(tracking["final_corners"], rel_comp)
+    # And whenever relativization changes that pose's bbox, the anchored
+    # corners differ from the ABSOLUTE-pose corners — proving the anchor
+    # frame is actually applied (this is what would regress if the
+    # relativize step were dropped).
+    if not np.allclose(rel_comp, abs_comp):
+        assert not np.allclose(tracking["final_corners"], abs_comp)
+
+
 # ---------------------------------------------------------------------------
 # 1c. Ctrl-click a triangle in 3D shows its ν in the status bar (task 6c)
 # ---------------------------------------------------------------------------

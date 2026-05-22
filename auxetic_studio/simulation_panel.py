@@ -837,7 +837,9 @@ class SimulationPanel(QDockWidget):
         """Refresh the 3D Poisson-tracking overlay (task 6a): the rest, the
         most axially-compressed, and the most axially-expanded sweep poses —
         three bounding boxes and the per-axis extreme points the Poisson
-        calc tracks. Clears the overlay when there's no fresh kinematic
+        calc tracks. When a polygon is anchored, the bounds are computed in
+        that polygon's frame so they enclose the on-screen (relativized)
+        structure. Clears the overlay when there's no fresh kinematic
         result. No-op without a 3D view. All geometry comes from the
         Simulator (auxetic/), not here."""
         view = self._view_3d
@@ -859,6 +861,15 @@ class SimulationPanel(QDockWidget):
             exp_idx = int(np.argmax(extents[:, axial])) if extents.size else 0
             final_pose = result.poses[comp_idx]
             expansion_pose = result.poses[exp_idx]
+            # When a polygon is anchored, _drive_pose_from_slider draws every
+            # frame relativized to that polygon (relativize_pose); compute the
+            # bounds from the SAME relativized poses so the boxes enclose
+            # what's actually on screen. No anchor → absolute (unchanged).
+            anchor = self._anchor_tile
+            if anchor is not None:
+                rest = sim.relativize_pose(rest, anchor)
+                final_pose = sim.relativize_pose(final_pose, anchor)
+                expansion_pose = sim.relativize_pose(expansion_pose, anchor)
             view.show_poisson_tracking(
                 sim.bbox_corners(rest),
                 sim.bbox_corners(final_pose),
