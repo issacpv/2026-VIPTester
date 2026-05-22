@@ -877,3 +877,136 @@ STL-diff test stayed green throughout and were never modified.
 
 **STOP.** All Batch-2 tasks DONE, full suite green. No new work invented.
 
+---
+---
+
+# Batch 3 — 2026-05-22 (Poisson-bounds overlay refinements)
+
+**Branch:** `nightly/auto-2026-05-22` (CONTINUE — do not cut a new branch).
+**Run via:** `/loop /nightly`. Read this whole file first every iteration.
+**Context:** user feedback on the running app (presetEqHex.json, 3D kinematic sim,
+view anchored to polygon #6). The Batch-2 Poisson-tracking overlay (6a) + the
+full-structure ν readout (6b) render correctly (confirmed by screenshots:
+edge-vector ν = -1.0000, bbox ν = 0.0000, two bbox wireframes + per-axis extreme
+points). These three tasks refine that overlay.
+
+## Task checklist (Batch 3)
+
+| # | Task | Status |
+|---|------|--------|
+| 1 | Add a full-EXPANSION bounds box (max axial extent), alongside rest + compressed | DONE (a6feada) |
+| 2 | Draw the bounds in the reference-polygon (anchored) frame, not the absolute frame | TODO |
+| 3 | GUI toggles to show/hide each bounds box individually in the kinematic sim | TODO |
+
+**Working order (risk-managed):** 1 (additive box) → 2 (frame correctness for all
+boxes) → 3 (GUI toggles, last). One commit per task.
+
+## Confirm-before-guessing (assumptions made — flag if wrong)
+- **T1 "full expansion".** Interpreted as the most axially-EXPANDED sweep pose
+  (`argmax` of `sim_result.bbox_extents[:, axial]`), the counterpart to the
+  existing most-COMPRESSED box (`argmin`). On EqHex the θ-extent plot peaks near
+  θ≈60°/120° (the expansion extreme) and bottoms at θ=0/180°.
+- **T2 reference frame.** When `SimulationPanel._anchor_tile` is set the displayed
+  structure is relativized via `Simulator.relativize_pose(pose, ref_tile)`; the
+  bounds must be computed from the SAME relativized poses so they align with what's
+  on screen. No anchor → absolute poses (current behavior, unchanged).
+- **T3 toggles.** Three checkboxes in the Simulation panel (default all ON):
+  Initial / Compressed / Expansion. Pure GUI visibility state; geometry unchanged.
+
+## Task specs (Batch 3) — anchors are accurate as of Batch-2 completion
+
+### Task 1 — Full-expansion bounds box
+- **Now:** `SimulationPanel._update_poisson_tracking` shows rest ("initial") vs the
+  most axially-COMPRESSED sweep pose (`idx = argmin(bbox_extents[:, axial])`) via
+  `View3D.show_poisson_tracking(initial_corners, final_corners, initial_extremes,
+  final_extremes)`.
+- **Add:** a THIRD box at the most axially-EXPANDED pose
+  (`argmax(bbox_extents[:, axial])`). Extend `show_poisson_tracking` to take the
+  expansion corners + extreme points (distinct color family, e.g. green/cyan, with
+  a darker shade like the others); compute them in `_update_poisson_tracking` via
+  `Simulator.bbox_corners` / `bbox_extreme_vertices`. Keep geometry in `auxetic/`.
+  Update the `View3D.last_poisson_tracking` tap (new keys) + tests.
+- **Acceptance:** a third box appears at the expanded extreme on presetEqHex; pure
+  test that the expansion pose ≠ compressed pose (and its axial extent is the max);
+  the headless tap carries the expansion geometry; full suite green.
+
+### Task 2 — Bounds in the reference-polygon (anchored) frame
+- **Symptom (the Batch-2 6a caveat, now user-reported):** with the view anchored to
+  polygon #6 the structure is drawn relativized, but `_update_poisson_tracking`
+  builds bbox geometry from ABSOLUTE poses (`rest_pose`, sweep poses) → the boxes
+  don't enclose the on-screen structure.
+- **Fix:** in `_update_poisson_tracking`, when `self._anchor_tile is not None`,
+  relativize each pose with `self._simulator.relativize_pose(pose,
+  self._anchor_tile)` BEFORE `bbox_corners` / `bbox_extreme_vertices`, so the
+  bounds are in the displayed (anchored) frame. No anchor → absolute (unchanged).
+- **Acceptance:** anchored bounds visually enclose the displayed structure (human
+  eyeball — flag honestly); headless test: with an anchor set, the tracking corners
+  equal the AABB of the *relativized* poses, not the absolute ones.
+
+### Task 3 — Per-bound toggles in the kinematic sim
+- **Add** three checkboxes (Initial / Compressed / Expansion, default ON) in the
+  Simulation panel; thread their state through `_update_poisson_tracking` →
+  `View3D.show_poisson_tracking(..., show_initial=, show_compressed=,
+  show_expansion=)` so each box (+ its extreme points) draws only when enabled.
+  Pure GUI visibility; geometry unchanged. Re-call `_update_poisson_tracking` on
+  toggle so it updates live.
+- **Acceptance:** toggling a checkbox shows/hides that box (human eyeball for the
+  live visual); headless test that the visibility flags reach
+  `show_poisson_tracking` (via the tap) and a disabled box is omitted from the
+  drawn/recorded set.
+
+## Decisions & assumptions (Batch 3)
+- **T1 expansion-box color convention (documented; spec said "e.g. green/cyan").**
+  The three boxes are pose-coded by wireframe color: initial = grey `#8a8a8a`,
+  compressed = white `#f0f0f0`, expansion = green `#33dd55`. The per-axis extreme
+  POINTS keep the existing X/Y/Z hue idea but use a distinct family per the spec so
+  the expansion set reads apart from the magenta/yellow/teal (initial) and their
+  darker variants (compressed): expansion points = green `#39ff14` / cyan `#00e5ff`
+  / spring `#1de9b6` (X/Y/Z), size 15 (matching the compressed points). Chose a
+  whole distinct family over a third brightness level of the same hues because
+  three shades of magenta are hard to tell apart; the spec explicitly suggested
+  green/cyan.
+
+## Per-iteration notes (Batch 3)
+
+### Iteration 1 (2026-05-22) — Task 1 full-expansion bounds box (COMPLETE, a6feada)
+- **Shipped.** A third Poisson bounds box at the most axially-EXPANDED sweep pose,
+  the counterpart to the existing most-COMPRESSED box. `auxetic_studio/views.py::
+  show_poisson_tracking` gained optional `expansion_corners` / `expansion_extremes`
+  params — draws a green wireframe + green/cyan per-axis extreme points and records
+  them under new `expansion_corners` / `expansion_extremes` keys in the headless
+  `last_poisson_tracking` tap (None when not supplied, so the signature stays
+  back-compatible). `simulation_panel.py::_update_poisson_tracking` now also
+  computes `exp_idx = argmax(bbox_extents[:, axial])` (vs the existing
+  `comp_idx = argmin`) and passes `Simulator.bbox_corners` / `bbox_extreme_vertices`
+  for that pose. **All geometry stays in the Simulator (`auxetic/`)** — the panel
+  only selects the pose index; the view only renders.
+- **No `auxetic/` change.** The expansion box reuses the Batch-2 6a geometry API
+  (`bbox_corners` / `bbox_extreme_vertices` / `_axial_index`), so `auxetic/` was
+  untouched and the regression goldens are trivially unaffected (still ran the full
+  suite, which includes `test_regression.py`).
+- **Tests.** `tests/test_poisson_bbox.py::test_expansion_pose_is_the_axial_maximum`
+  (pure): the argmax pose differs from the argmin pose and really is the axial-extent
+  maximum, with well-formed corners/extremes (skips if the axial extent is flat —
+  `ptp < 1e-9`). Extended `tests/test_simulation_gui.py`'s tap test to assert the
+  `expansion_corners` (2^dim, dim) + `expansion_extremes` (dim, 2, dim) geometry
+  reaches the view.
+- **HONEST CAVEAT (visual not headlessly verifiable).** The pure test + the headless
+  tap prove the *geometry* of the third box is computed and handed to the view; the
+  actual on-screen green box + points (and that the expanded extreme looks right on
+  presetEqHex) need a real interactor — a human should eyeball it.
+- Full suite **557 passed, 1 skipped** (+1 pure test), 0 failures, EXIT 0 (5m54s).
+  GUI tap test verified in company (the documented Win+PyQt6+pyvistaqt teardown race
+  means GUI tests are only trusted via the full suite). Pre-existing degenerate-mode
+  warning in `test_cuboid_kirigami` is not mine.
+- **Next step:** Task 2 — draw the bounds in the reference-polygon (anchored) frame.
+  When `SimulationPanel._anchor_tile is not None`, the displayed structure is
+  relativized via `Simulator.relativize_pose(pose, ref_tile)`, but
+  `_update_poisson_tracking` currently builds bbox geometry from ABSOLUTE poses
+  (`rest`, `final_pose`, `expansion_pose`) → the boxes don't enclose the on-screen
+  structure. Fix: relativize each of the three poses with `relativize_pose` before
+  `bbox_corners` / `bbox_extreme_vertices` when an anchor is set; no anchor →
+  absolute (unchanged). Headless test: with an anchor set, the tracking corners
+  equal the AABB of the *relativized* poses, not the absolute ones. Working order:
+  1 → **2** → 3.
+
