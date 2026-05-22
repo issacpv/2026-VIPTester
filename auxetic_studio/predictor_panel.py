@@ -146,11 +146,13 @@ class PredictorPanel(QDockWidget):
         outer.setContentsMargins(8, 8, 8, 8)
 
         self._build_status_row(outer)
+        self._build_metrics_box(outer)
         self._build_train_box(outer)
         self._build_predict_box(outer)
         outer.addStretch(1)
         self.setWidget(body)
         self._refresh_state_dependent_ui()
+        self.refresh_metrics()
 
     # ------------------------------------------------------------------
     # Construction
@@ -160,6 +162,23 @@ class PredictorPanel(QDockWidget):
         self.status_label = QLabel("Model: <i>none loaded</i>", self)
         self.status_label.setTextFormat(Qt.TextFormat.RichText)
         outer.addWidget(self.status_label)
+
+    def _build_metrics_box(self, outer):
+        """Read-only geometry metrics for the current lattice. Currently
+        the edge-vector generalized Poisson's ratio (task 4) — a local
+        per-triangle auxetic metric, averaged over the lattice, distinct
+        from the simulator's bounding-box Poisson ratio."""
+        box = QGroupBox("Geometry metrics", self)
+        form = QFormLayout(box)
+        self.edge_poisson_label = QLabel("—", box)
+        self.edge_poisson_label.setTextFormat(Qt.TextFormat.RichText)
+        self.edge_poisson_label.setToolTip(
+            "Mean generalized Poisson's ratio from how each triangle's "
+            "edge connection points deform under a small actuation of the "
+            "rotating-units mechanism (uses the lattice's C). "
+            "Equilateral tiles give -1 (isotropic auxetic).")
+        form.addRow(QLabel("Edge-vector ν:"), self.edge_poisson_label)
+        outer.addWidget(box)
 
     def _build_train_box(self, outer):
         box = QGroupBox("Train / load model", self)
@@ -249,6 +268,21 @@ class PredictorPanel(QDockWidget):
         self._lattice = lattice
         # Don't drop the model on lattice change — predictor is generic.
         self._refresh_state_dependent_ui()
+        self.refresh_metrics()
+
+    def refresh_metrics(self) -> None:
+        """Recompute the read-only geometry metrics for the current
+        lattice and update their labels. Called on construction, on
+        lattice rebind, and from MainWindow after every lattice change."""
+        import math
+        try:
+            nu = float(self._lattice.edge_vector_poisson_ratio())
+        except Exception:
+            nu = float("nan")
+        if math.isnan(nu):
+            self.edge_poisson_label.setText("<i>n/a (3D mode)</i>")
+        else:
+            self.edge_poisson_label.setText(f"<b>{nu:+.3f}</b>")
 
     @property
     def model(self):

@@ -462,6 +462,7 @@ class MainWindow(QMainWindow):
         """
         self.inspector.refresh_from_lattice()
         self.coordinates_panel.refresh_from_lattice()
+        self.predictor_panel.refresh_metrics()
         self._update_edit_action_enabled()
         self._update_edge_action_enabled()
         self._refresh_views()

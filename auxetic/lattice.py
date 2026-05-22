@@ -661,6 +661,40 @@ class Lattice:
         return _bip.jamming_angle(self.points,
                                   np.asarray(self.tri.simplices), self.C)
 
+    def edge_vector_poisson_ratio(self, theta: float = 0.1) -> float:
+        """Lattice-level generalized Poisson's ratio from the edge-vector
+        metric (see :mod:`auxetic.edge_poisson`), averaged over the
+        lattice's triangles at a small probe actuation ``theta`` (radians).
+
+        Each triangle's bipartite rotating-units mechanism is actuated by
+        ``theta`` and its edge-connection-point deformation distilled into
+        a principal Poisson's ratio; the lattice value is the mean over
+        all (non-degenerate, finite) triangles. Uses the lattice's
+        ``C``. Returns ``nan`` for 3D modes, for a lattice with no 2D
+        triangulation, or when no triangle yields a finite ratio (e.g.
+        ``theta = 0``)."""
+        from . import edge_poisson as _ep
+
+        if self.mode in _3D_MODES or self.tri is None:
+            return float("nan")
+        pts = np.asarray(self.points, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            return float("nan")
+        simplices = np.asarray(self.tri.simplices)
+        if simplices.ndim != 2 or simplices.shape[1] != 3:
+            return float("nan")
+
+        vals: list[float] = []
+        for s in simplices:
+            tri = pts[s]
+            try:
+                nu = _ep.generalized_poisson_ratio(tri, float(self.C), float(theta))
+            except ValueError:
+                continue
+            if np.isfinite(nu):
+                vals.append(float(nu))
+        return float(np.mean(vals)) if vals else float("nan")
+
     def _bipartite_theta(self) -> float:
         """Actuation angle for *static* mode-11 rendering — always 0
         (rest).
