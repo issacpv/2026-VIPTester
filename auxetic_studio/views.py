@@ -25,6 +25,10 @@ from PyQt6.QtWidgets import QWidget, QVBoxLayout, QGraphicsPolygonItem
 import pyvista as pv
 
 from auxetic import geometry as _geom
+from auxetic_studio.camera_controls import (
+    ZOOM_WHEEL_STEP as _ZOOM_WHEEL_STEP,
+    dolly_toward_cursor,
+)
 
 try:
     from pyvistaqt import QtInteractor
@@ -908,6 +912,13 @@ class View3D(QWidget):
         self.has_view_cube      = False
         self._view_cube_widget  = None
 
+        # Zoom-to-cursor wheel observers. Tags + raw interactor handle are
+        # kept so the wiring can be introspected / torn down; populated by
+        # ``_install_zoom_to_cursor`` and left empty when headless.
+        self.has_zoom_to_cursor   = False
+        self._zoom_observer_tags: list[int] = []
+        self._zoom_iren           = None
+
         if force_placeholder or not _PYVISTAQT_AVAILABLE:
             return
 
@@ -921,6 +932,7 @@ class View3D(QWidget):
         if self.interactor is not None:
             self._install_3d_navigation_aids()
             self._enable_tile_picking()
+            self._install_zoom_to_cursor()
 
     # ------------------------------------------------------------------
     # Surface-point picking (anchor-view-to-polygon)
@@ -960,6 +972,108 @@ class View3D(QWidget):
                 self.surfacePointPicked.emit(arr[:3].copy())
             else:
                 self.surfacePointPicked.emit(None)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Zoom-to-cursor (mouse-wheel dolly toward the point under the cursor)
+    # ------------------------------------------------------------------
+
+    def _install_zoom_to_cursor(self) -> None:
+        """Replace the default centred wheel-zoom with one that dollies
+        toward the point under the cursor.
+
+        Wired as **high-priority** observers (10.0) on the raw VTK
+        interactor for the wheel events, each of which aborts the
+        invocation (``vtkCommand.SetAbortFlag``) so the trackball style's
+        built-in centred dolly (priority 0.0) never runs. Fully guarded:
+        any failure (or a headless interactor) just leaves the default
+        zoom in place rather than taking down the viewer."""
+        if self.interactor is None:
+            return
+        try:
+            iren = self.interactor.iren.interactor  # raw vtkRenderWindowInteractor
+        except Exception:
+            return
+        if iren is None:
+            return
+        try:
+            t_fwd = iren.AddObserver(
+                "MouseWheelForwardEvent", self._on_wheel_forward, 10.0)
+            t_bwd = iren.AddObserver(
+                "MouseWheelBackwardEvent", self._on_wheel_backward, 10.0)
+        except Exception:
+            return
+        self._zoom_iren = iren
+        self._zoom_observer_tags = [t_fwd, t_bwd]
+        self.has_zoom_to_cursor = True
+
+    def _on_wheel_forward(self, caller, event) -> None:
+        """Wheel-forward = zoom in (camera moves toward the cursor point)."""
+        self._zoom_to_cursor(1.0 + _ZOOM_WHEEL_STEP)
+        self._abort_event(caller)
+
+    def _on_wheel_backward(self, caller, event) -> None:
+        """Wheel-backward = zoom out (camera moves away from the cursor point)."""
+        self._zoom_to_cursor(1.0 / (1.0 + _ZOOM_WHEEL_STEP))
+        self._abort_event(caller)
+
+    def _abort_event(self, caller) -> None:
+        """Set the abort flag on this object's wheel observers so the
+        trackball style's lower-priority centred-dolly handler is skipped
+        for the current wheel event."""
+        try:
+            for tag in self._zoom_observer_tags:
+                cmd = caller.GetCommand(tag)
+                if cmd is not None:
+                    cmd.SetAbortFlag(1)
+        except Exception:
+            pass
+
+    def _cursor_world_point(self, renderer, camera):
+        """World-space point under the cursor, projected onto the camera's
+        focal plane. Returns the focal point itself when the conversion is
+        unavailable (so a centred dolly is the safe fallback)."""
+        focal = camera.GetFocalPoint()
+        try:
+            x, y = self.interactor.iren.interactor.GetEventPosition()
+            # Display-space depth of the focal plane, then read the world
+            # point at the cursor (x, y) at that same depth.
+            renderer.SetWorldPoint(focal[0], focal[1], focal[2], 1.0)
+            renderer.WorldToDisplay()
+            depth = renderer.GetDisplayPoint()[2]
+            renderer.SetDisplayPoint(float(x), float(y), depth)
+            renderer.DisplayToWorld()
+            w = renderer.GetWorldPoint()
+            if abs(w[3]) > 1e-12:
+                return (w[0] / w[3], w[1] / w[3], w[2] / w[3])
+        except Exception:
+            pass
+        return focal
+
+    def _zoom_to_cursor(self, factor: float) -> None:
+        """Dolly the camera toward (or away from) the point under the
+        cursor by ``factor`` (>1 in, <1 out). Headless / failure safe."""
+        if self.interactor is None:
+            return
+        try:
+            renderer = self.interactor.renderer
+            camera = renderer.GetActiveCamera()
+            target = self._cursor_world_point(renderer, camera)
+            new_pos, new_foc = dolly_toward_cursor(
+                camera.GetPosition(), camera.GetFocalPoint(), target, factor)
+            camera.SetPosition(float(new_pos[0]), float(new_pos[1]),
+                               float(new_pos[2]))
+            camera.SetFocalPoint(float(new_foc[0]), float(new_foc[1]),
+                                 float(new_foc[2]))
+            # Parallel projection ignores camera distance, so the dolly
+            # alone wouldn't change apparent size — scale the parallel
+            # extent too. Scaling by 1/factor keeps the cursor point fixed
+            # in this mode as well (see dolly_toward_cursor docstring).
+            if camera.GetParallelProjection():
+                camera.SetParallelScale(camera.GetParallelScale() / float(factor))
+            renderer.ResetCameraClippingRange()
+            self.interactor.render()
         except Exception:
             pass
 
