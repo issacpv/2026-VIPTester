@@ -311,7 +311,7 @@ not commit them unless a task needs one as a test fixture.
 | # | Task | Status |
 |---|------|--------|
 | 1 | Bezier strut curving is wrong — fix curve direction/shape to match intent | TODO |
-| 2 | Kinematic sim playback flickers / mesh disappears mid-motion | TODO |
+| 2 | Kinematic sim playback flickers / mesh disappears mid-motion | DONE (93cc348) |
 | 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
 | 4 | Desktop-shortcut launch is slow — speed up cold start | TODO |
 | 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | TODO |
@@ -517,4 +517,39 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
   mid-motion (`views.py` ~L1230-1350: remove_actor → add_mesh leaves a frame with
   no mesh actor). Same redraw path family as Task 3. Working order: 6e → 3 →
   **2** → 1 → 4 → 5 → 6a–6d.
+
+### Iteration 3 (2026-05-22) — Task 2 sim-playback flicker (COMPLETE, 93cc348)
+- **Root cause.** Both `views.py::show_pose` (30 fps playback) and
+  `update_lattice` (static) swapped the mesh actor as `remove_actor(...)` then
+  `add_mesh(...)`, both with PyVista's default `render=True`. So `remove_actor`
+  rendered a frame with NO mesh actor before `add_mesh` re-added it → at 30 fps
+  the lattice strobes in/out. The anchor-outline redraw had the same pattern.
+- **Fix.** New module-level `views.py::_swap_mesh_actor(interactor, old, mesh,
+  **kw)` issues both the remove and the add with `render=False` and returns the
+  new actor. `show_pose` calls it, then `_update_anchor_outline(..., render=False)`
+  (new `render` kwarg), then a single `interactor.render()` → mesh + ring land in
+  ONE frame, never an empty one. `update_lattice` uses the helper too; its existing
+  `reset_camera()` provides that path's single final render. `_update_anchor_outline`
+  restructured so its internal remove/add are `render=False` and it renders once on
+  return only when `render=True` (preserves standalone-caller behavior).
+- **Tests.** `tests/test_pose_render_no_flicker.py` — 3 pure tests with a recording
+  fake interactor: a 5-step sweep keeps exactly one live mesh actor (never zero,
+  never leaking); remove+add are always `render=False` and the helper never renders
+  (caller owns it); add-failure returns None. No Qt widget → race-immune, safe alone.
+- **HONEST CAVEAT.** The pure tests pin the flicker-preventing invariant (one actor,
+  no render while mesh removed), which is exactly the mechanism `show_pose` uses. I
+  did NOT drive `show_pose` end-to-end with a fake interactor (would need a real
+  View3D QWidget → teardown-race risk) and could not observe actual on-screen
+  smoothness on EqTri/EqHex headlessly. A human should run a bistable sweep to
+  confirm visually.
+- Full suite **536 passed, 1 skipped** (+3), 0 failures (6m04s). Didn't touch
+  `auxetic/`; regression green within the suite. Coherent w/ Task 5 (no new blocking).
+- **Next step:** Task 1 — fix bezier strut curve DIRECTION (struts should curve
+  inward / re-entrant / concave, not bow outward). Geometry + regression-sensitive:
+  `auxetic/geometry.py::bezier_polyline` + `auxetic/export.py::collect_export_geometry`
+  (currently bows "away from the lattice centroid"). MUST keep OFF byte-identical
+  (`test_regression.py`). **OPEN QUESTION flagged in Batch-2 confirm-before-guessing:**
+  exact intended direction/magnitude — if ambiguous from the drawing, document the
+  chosen convention rather than guess silently. Working order: 6e → 3 → 2 → **1** →
+  4 → 5 → 6a–6d.
 
