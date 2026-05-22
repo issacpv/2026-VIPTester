@@ -1190,21 +1190,16 @@ class View3D(QWidget):
         except Exception:
             return
 
+        self._mesh_actor = _swap_mesh_actor(
+            self.interactor, self._mesh_actor, mesh,
+            color="lightsteelblue", show_edges=False, smooth_shading=True,
+        )
         if self._mesh_actor is not None:
+            self._apply_user_transform(lattice)
             try:
-                self.interactor.remove_actor(self._mesh_actor)
+                self.interactor.reset_camera()
             except Exception:
                 pass
-            self._mesh_actor = None
-
-        try:
-            self._mesh_actor = self.interactor.add_mesh(
-                mesh, color="lightsteelblue", show_edges=False, smooth_shading=True
-            )
-            self._apply_user_transform(lattice)
-            self.interactor.reset_camera()
-        except Exception:
-            self._mesh_actor = None
 
     def _apply_user_transform(self, lattice) -> None:
         """Push ``lattice.world_transform()`` onto the mesh actor as a
@@ -1292,20 +1287,17 @@ class View3D(QWidget):
         except Exception:
             return
 
-        if self._mesh_actor is not None:
-            try:
-                self.interactor.remove_actor(self._mesh_actor)
-            except Exception:
-                pass
-            self._mesh_actor = None
+        self._mesh_actor = _swap_mesh_actor(
+            self.interactor, self._mesh_actor, mesh,
+            color="lightsteelblue", show_edges=False, smooth_shading=True,
+        )
+        # Rebuild the anchor overlay without rendering, then issue a single
+        # render so the mesh + ring land in the same frame (no flicker).
+        self._update_anchor_outline(anchor_verts, mesh, render=False)
         try:
-            self._mesh_actor = self.interactor.add_mesh(
-                mesh, color="lightsteelblue", show_edges=False, smooth_shading=True,
-            )
+            self.interactor.render()
         except Exception:
-            self._mesh_actor = None
-
-        self._update_anchor_outline(anchor_verts, mesh)
+            pass
 
     def _compute_anchor_verts(self, tile_system, pose, tile_idx):
         """Posed vertices (Nx3) of the anchored tile, or ``None``. 2D tile
@@ -1330,38 +1322,47 @@ class View3D(QWidget):
             return np.hstack([v, np.zeros((v.shape[0], 1))])
         return v
 
-    def _update_anchor_outline(self, verts3d, mesh=None) -> None:
+    def _update_anchor_outline(self, verts3d, mesh=None, render: bool = True) -> None:
         """Draw (or clear) the gold ring marking the anchored polygon.
         Lifted just above the rendered solids and forced to render on-top
         (depth-independent) so it's equally visible from top, bottom, and
-        iso — the opaque mesh no longer occludes it when viewed from below."""
+        iso — the opaque mesh no longer occludes it when viewed from below.
+
+        Internal actor swaps are issued with ``render=False``. Pass
+        ``render=False`` from a caller (e.g. ``show_pose``) that batches a
+        single render after the whole scene is rebuilt, so playback doesn't
+        flicker; the default renders once on return for standalone callers."""
         if self.interactor is None:
             return
         if self._anchor_actor is not None:
             try:
-                self.interactor.remove_actor(self._anchor_actor)
+                self.interactor.remove_actor(self._anchor_actor, render=False)
             except Exception:
                 pass
             self._anchor_actor = None
-        if verts3d is None or len(verts3d) < 2:
-            return
-        try:
-            v = np.asarray(verts3d, dtype=float).copy()
-            if mesh is not None and getattr(mesh, "n_points", 0):
-                ztop = float(np.asarray(mesh.points)[:, 2].max())
-            else:
-                ztop = float(v[:, 2].max())
-            span = float(np.ptp(v[:, :2])) or 1.0
-            v[:, 2] = ztop + 0.05 * span
-            loop = np.vstack([v, v[0]])
-            poly = pv.lines_from_points(loop)
-            self._anchor_actor = self.interactor.add_mesh(
-                poly, color="#ffae00", line_width=6, pickable=False,
-                render_lines_as_tubes=True,
-            )
-            _force_actor_on_top(self._anchor_actor)
-        except Exception:
-            self._anchor_actor = None
+        if verts3d is not None and len(verts3d) >= 2:
+            try:
+                v = np.asarray(verts3d, dtype=float).copy()
+                if mesh is not None and getattr(mesh, "n_points", 0):
+                    ztop = float(np.asarray(mesh.points)[:, 2].max())
+                else:
+                    ztop = float(v[:, 2].max())
+                span = float(np.ptp(v[:, :2])) or 1.0
+                v[:, 2] = ztop + 0.05 * span
+                loop = np.vstack([v, v[0]])
+                poly = pv.lines_from_points(loop)
+                self._anchor_actor = self.interactor.add_mesh(
+                    poly, color="#ffae00", line_width=6, pickable=False,
+                    render_lines_as_tubes=True, render=False,
+                )
+                _force_actor_on_top(self._anchor_actor)
+            except Exception:
+                self._anchor_actor = None
+        if render:
+            try:
+                self.interactor.render()
+            except Exception:
+                pass
 
     def clear_pose(self) -> None:
         """Drop the simulation-playback mesh and re-render the cached
@@ -1802,3 +1803,26 @@ def _force_actor_on_top(actor) -> bool:
     except Exception:
         return False
     return True
+
+
+def _swap_mesh_actor(interactor, old_actor, mesh, **mesh_kwargs):
+    """Replace ``old_actor`` with a fresh actor for ``mesh`` *without*
+    rendering an intermediate empty frame.
+
+    Both the removal and the add are issued with ``render=False`` so the
+    caller can trigger a single render once the whole scene (mesh +
+    overlays) is rebuilt. This is what stops the simulation-playback
+    flicker: with the default ``render=True``, ``remove_actor`` renders a
+    frame that has no mesh actor before ``add_mesh`` puts the new one in,
+    so a 30 fps sweep strobes the lattice in and out. Returns the new
+    actor, or ``None`` if the add failed.
+    """
+    if old_actor is not None:
+        try:
+            interactor.remove_actor(old_actor, render=False)
+        except Exception:
+            pass
+    try:
+        return interactor.add_mesh(mesh, render=False, **mesh_kwargs)
+    except Exception:
+        return None
