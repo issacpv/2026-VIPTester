@@ -314,7 +314,7 @@ not commit them unless a task needs one as a test fixture.
 | 2 | Kinematic sim playback flickers / mesh disappears mid-motion | DONE (93cc348) |
 | 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
 | 4 | Desktop-shortcut launch is slow — speed up cold start | DONE (investigation; no safe code win — see notes) |
-| 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | TODO |
+| 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | DONE (34250a5) |
 | 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e DONE (583231d); 6a–6d TODO |
 
 **Working order (risk-managed, isolated/cheap first → big features last):**
@@ -642,4 +642,52 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
   cancel path; keep ALL numerics in `auxetic/` (worker only calls `Lattice` /
   `Simulator`). Lock with a test: worker output == synchronous `Simulator` output.
   Coherent with Task 2. Working order: 6e → 3 → 2 → 1 → 4 → **5** → 6a–6d.
+
+### Iteration 6 (2026-05-22) — Task 5 sim off the UI thread (COMPLETE, 34250a5)
+- **Root cause.** `simulation_panel.run_simulation` ran the whole kinematic
+  sweep (181 null-space solves + Poisson + locking) synchronously on the UI
+  thread → the Qt event loop blocked → the app froze for the sweep's duration.
+- **Fix (mirrors the proven `predictor_panel._TrainerWorker`).** Extracted the
+  heavy compute into a pure module-level `_solve_kinematic(tile_system, load_axis,
+  is_mode_11, jam)` (Simulator sweep + poissons + is_locked — no GUI, no lattice
+  access, thread-safe on the immutable tile_system) and a `_SimWorker(QObject)`
+  that runs it on a `QThread` with `started→run`, `finished(payload)` /
+  `failed(msg)` signals, and the `quit`→`deleteLater` cleanup chain. The toolbar
+  **Run button** now drives this non-blocking path (`_start_sim_async`) and toggles
+  to **Cancel**. `shutdown()` now quits+waits the worker thread (teardown safety).
+- **Thread-safety design.** Only `_build_sim_inputs` (main thread) reads the live
+  `Lattice` (QObject, not thread-safe); it returns an immutable `TileSystem`
+  (numpy data) handed to the worker. The worker never touches the lattice.
+- **Compatibility (kept the suite stable).** `run_simulation()` stays SYNCHRONOUS
+  (16 test + programmatic call sites depend on result-ready-on-return), refactored
+  to `_build_sim_inputs` + `_solve_kinematic` + `_apply_sim_result` /
+  `_apply_sim_failure`. No test clicks the Run button, so the test suite never
+  spins a worker thread → no new teardown-race exposure. Panel widget composition
+  at construction is unchanged (only the button's connected slot differs), so the
+  Task-4 teardown-race sensitivity isn't tripped — confirmed: full suite EXIT 0.
+- **Cancel = soft cancel.** A second click sets `_sim_cancelled`; the result is
+  discarded and the UI frees up when the thread finishes. The sweep is NOT
+  interrupted mid-flight (Qt can't safely kill a thread; the numpy loop has no
+  cancel hook). True mid-sweep interruption would need a `should_cancel` callback
+  threaded into `Simulator.sweep_*` in `auxetic/` — deferred (would touch the core
+  solver + regression). Documented honestly.
+- **Tests.** `tests/test_sim_worker.py` — 3 pure tests: `_solve_kinematic` is
+  numerically identical to direct `Simulator` calls (mode 1 sweep_theta + mode 11
+  sweep_mechanism: theta/actuation samples, bbox_extents, poissons, locked) and
+  returns the usable Simulator. No Qt widget / no thread → race-immune.
+- **HONEST CAVEAT.** UI responsiveness-during-sim and the Cancel button are the
+  async path, which can't be asserted headlessly (and tests use the sync path). I
+  verified the *compute* is identical and the thread wiring mirrors the proven
+  predictor worker; a human should confirm the window stays movable during a real
+  sweep and that Cancel frees the UI. Only the KINEMATIC sim is threaded;
+  `run_dynamics` (M2) left synchronous (separate path, out of scope).
+- Full suite **541 passed, 1 skipped** (+3), 0 failures, EXIT 0 (6m16s).
+- **Next step:** Task 6a — visualize the Poisson-tracked points (INITIAL in
+  magenta/yellow/teal, FINAL compressed in darker shades, animated) + two bboxes
+  (original vs compressed). Source the tracked points + bbox corners from a
+  Lattice/Simulator method (`simulation.py::poissons_ratio` is bbox-based, SPEC
+  §7.4 — expose the corners); render as point+box actors in `views.py`. Selection
+  geometry must come from `auxetic/`, not the GUI. Working order: … 5 → **6a** →
+  6b → 6c → 6d (6e already done). This is the start of the largest task; keep each
+  sub-step its own commit.
 
