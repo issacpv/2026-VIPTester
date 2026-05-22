@@ -41,9 +41,6 @@ def main_window():
 # ---------------------------------------------------------------------------
 
 _CAM_ACTION_NAMES = (
-    "cam_top_act",  "cam_bottom_act",
-    "cam_front_act","cam_back_act",
-    "cam_side_act",
     "cam_iso_act",
     "cam_fit_act",
 )
@@ -67,28 +64,13 @@ def test_camera_preset_clicks_call_view3d_methods(main_window, monkeypatch):
     test doesn't depend on a real VTK render window."""
     win = main_window
     calls: list[str] = []
-    monkeypatch.setattr(win.view_3d, "camera_top",
-                         lambda: calls.append("top"))
-    monkeypatch.setattr(win.view_3d, "camera_bottom",
-                         lambda: calls.append("bottom"))
-    monkeypatch.setattr(win.view_3d, "camera_front",
-                         lambda: calls.append("front"))
-    monkeypatch.setattr(win.view_3d, "camera_back",
-                         lambda: calls.append("back"))
-    monkeypatch.setattr(win.view_3d, "camera_side",
-                         lambda: calls.append("side"))
     monkeypatch.setattr(win.view_3d, "camera_isometric",
                          lambda: calls.append("iso"))
     monkeypatch.setattr(win.view_3d, "camera_fit",
                          lambda: calls.append("fit"))
-    win.cam_top_act.trigger()
-    win.cam_bottom_act.trigger()
-    win.cam_front_act.trigger()
-    win.cam_back_act.trigger()
-    win.cam_side_act.trigger()
     win.cam_iso_act.trigger()
     win.cam_fit_act.trigger()
-    assert calls == ["top", "bottom", "front", "back", "side", "iso", "fit"]
+    assert calls == ["iso", "fit"]
 
 
 # ---------------------------------------------------------------------------
@@ -100,11 +82,6 @@ def test_camera_methods_no_op_on_headless_view3d(main_window):
     should silently return rather than raising."""
     v = main_window.view_3d
     assert v.interactor is None
-    v.camera_top()
-    v.camera_bottom()
-    v.camera_front()
-    v.camera_back()
-    v.camera_side()
     v.camera_isometric()
     v.camera_fit()
 

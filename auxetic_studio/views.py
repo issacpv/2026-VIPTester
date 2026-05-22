@@ -1136,7 +1136,7 @@ class View3D(QWidget):
             self.has_view_cube = False
 
     # ------------------------------------------------------------------
-    # Camera presets (Top / Front / Side / Iso / Fit)
+    # Camera presets (Iso / Fit)
     # ------------------------------------------------------------------
     #
     # These drive the CAMERA only — they don't touch the lattice's
@@ -1145,51 +1145,6 @@ class View3D(QWidget):
     # LATTICE in world space (and go through the undo stack). The
     # InspectorPanel buttons rotate the auxetic; these buttons rotate
     # the user's viewpoint.
-
-    def camera_top(self) -> None:
-        """Look straight down the +Z axis (top-down)."""
-        if self.interactor is None:
-            return
-        try:
-            self.interactor.view_xy()
-        except Exception:
-            pass
-
-    def camera_bottom(self) -> None:
-        """Look straight up the -Z axis (bottom-up)."""
-        if self.interactor is None:
-            return
-        try:
-            self.interactor.view_xy(negative=True)
-        except Exception:
-            pass
-
-    def camera_front(self) -> None:
-        """Look along the +Y axis (front view)."""
-        if self.interactor is None:
-            return
-        try:
-            self.interactor.view_xz()
-        except Exception:
-            pass
-
-    def camera_back(self) -> None:
-        """Look along the -Y axis (back view)."""
-        if self.interactor is None:
-            return
-        try:
-            self.interactor.view_xz(negative=True)
-        except Exception:
-            pass
-
-    def camera_side(self) -> None:
-        """Look along the +X axis (right side)."""
-        if self.interactor is None:
-            return
-        try:
-            self.interactor.view_yz()
-        except Exception:
-            pass
 
     def camera_isometric(self) -> None:
         """Standard ISO 3/4 view."""
