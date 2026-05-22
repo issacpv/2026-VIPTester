@@ -100,6 +100,10 @@ def test_run_simulation_populates_poisson_tracking(main_window):
     assert tracking["final_corners"].shape == (2 ** dim, dim)
     assert tracking["initial_extremes"].shape == (dim, 2, dim)
     assert tracking["final_extremes"].shape == (dim, 2, dim)
+    # Batch 3 task 1: the third (expansion) bounds box geometry is handed
+    # over too — corners + per-axis extreme vertices.
+    assert tracking["expansion_corners"].shape == (2 ** dim, dim)
+    assert tracking["expansion_extremes"].shape == (dim, 2, dim)
 
     # Outdating the sim (e.g. a lattice change) clears the overlay.
     panel.mark_outdated()

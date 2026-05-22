@@ -89,6 +89,30 @@ def test_bbox_extreme_vertices_sit_on_the_bounds():
         assert np.any(np.all(np.isclose(verts, ext[d, 1]), axis=1))
 
 
+def test_expansion_pose_is_the_axial_maximum():
+    """Batch 3 task 1: the most axially-EXPANDED sweep pose (argmax of the
+    axial bbox extent) is distinct from the most-compressed pose (argmin)
+    and really is the axial maximum — the geometry behind the third
+    'expansion' bounds box. Its corners/extremes are well-formed."""
+    sim = _sim(mode=1, n_points=6, seed=3)
+    mode = sim.identify_kirigami_mode()
+    if mode is None:
+        pytest.skip("no kirigami mode for this lattice")
+    result = sim.sweep_theta()
+    extents = np.asarray(result.bbox_extents, dtype=float)
+    axial = sim._axial_index()
+    if float(np.ptp(extents[:, axial])) < 1e-9:
+        pytest.skip("axial extent is flat for this lattice; no expansion extreme")
+    comp_idx = int(np.argmin(extents[:, axial]))
+    exp_idx = int(np.argmax(extents[:, axial]))
+    assert exp_idx != comp_idx
+    assert extents[exp_idx, axial] == extents[:, axial].max()
+    exp_pose = result.poses[exp_idx]
+    assert sim.bbox_corners(exp_pose).shape == (2 ** sim.dimension, sim.dimension)
+    assert sim.bbox_extreme_vertices(exp_pose).shape == (
+        sim.dimension, 2, sim.dimension)
+
+
 def test_empty_tile_system_is_safe():
     sim = _sim(mode=1, n_points=6, seed=3)
     sim.n_tiles = 0                      # force the degenerate guard path

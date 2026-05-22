@@ -834,11 +834,12 @@ class SimulationPanel(QDockWidget):
         self._update_poisson_tracking()
 
     def _update_poisson_tracking(self) -> None:
-        """Refresh the 3D Poisson-tracking overlay (task 6a): the rest vs
-        the most axially-compressed sweep pose — the two bounding boxes and
-        the per-axis extreme points the Poisson calc tracks. Clears the
-        overlay when there's no fresh kinematic result. No-op without a 3D
-        view. All geometry comes from the Simulator (auxetic/), not here."""
+        """Refresh the 3D Poisson-tracking overlay (task 6a): the rest, the
+        most axially-compressed, and the most axially-expanded sweep poses —
+        three bounding boxes and the per-axis extreme points the Poisson
+        calc tracks. Clears the overlay when there's no fresh kinematic
+        result. No-op without a 3D view. All geometry comes from the
+        Simulator (auxetic/), not here."""
         view = self._view_3d
         if view is None:
             return
@@ -851,15 +852,20 @@ class SimulationPanel(QDockWidget):
             rest = sim.rest_pose()
             extents = np.asarray(result.bbox_extents, dtype=float)
             axial = sim._axial_index()
-            # Most axially-compressed sweep pose → the clearest contrast
-            # against rest for the bounding-box visual.
-            idx = int(np.argmin(extents[:, axial])) if extents.size else 0
-            final_pose = result.poses[idx]
+            # Most axially-compressed (argmin) and most axially-expanded
+            # (argmax) sweep poses → the clearest contrast against rest for
+            # the bounding-box visual.
+            comp_idx = int(np.argmin(extents[:, axial])) if extents.size else 0
+            exp_idx = int(np.argmax(extents[:, axial])) if extents.size else 0
+            final_pose = result.poses[comp_idx]
+            expansion_pose = result.poses[exp_idx]
             view.show_poisson_tracking(
                 sim.bbox_corners(rest),
                 sim.bbox_corners(final_pose),
                 sim.bbox_extreme_vertices(rest),
                 sim.bbox_extreme_vertices(final_pose),
+                sim.bbox_corners(expansion_pose),
+                sim.bbox_extreme_vertices(expansion_pose),
             )
         except Exception:
             view.clear_poisson_tracking()
