@@ -24,7 +24,7 @@ import math
 import traceback
 
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import QPalette
 from PyQt6.QtWidgets import (
     QDockWidget,
@@ -119,6 +119,76 @@ _ORIENT_SLIDER_MAX_DEG =  180.0
 _ORIENT_SLIDER_SCALE   = 10
 
 
+def _format_sim_error(exc: Exception) -> str:
+    """Format an exception for the readout. Must be called inside the
+    ``except`` block so ``format_exc`` reflects the live exception."""
+    return (f"{type(exc).__name__}: {exc}\n\n"
+            f"{traceback.format_exc().splitlines()[-1]}")
+
+
+def _solve_kinematic(tile_system, load_axis, is_mode_11: bool, jam: float):
+    """Run the quasi-static kinematic sweep + Poisson's ratio + locking
+    for a tile system. Pure compute — no GUI, no ``Lattice`` access — so
+    it produces identical results on the UI thread (``run_simulation``) or
+    a worker thread (:class:`_SimWorker`). Inputs come from
+    ``_build_sim_inputs`` on the main thread (the only place the live
+    lattice is read). Returns
+    ``(simulator, sim_result, poissons, locked, info)``."""
+    simulator = Simulator(tile_system, load_axis=load_axis)
+    if is_mode_11:
+        # Mode 11 is a large-amplitude rotating-units mechanism: follow the
+        # curved 1-DOF manifold out to the jamming angle (full hole closure)
+        # via sweep_mechanism — the fixed-rest-mode sweep_theta saturates
+        # part-way and never closes the holes.
+        sim_result = simulator.sweep_mechanism(max_actuation=jam)
+    else:
+        # M2.8: sweep the full ±π range with tile-tile collision detection
+        # so the plot shows what's physically reachable.
+        sim_result = simulator.sweep_theta(
+            n_steps=181, theta_max=np.pi, collision_stop=True,
+        )
+    poissons = simulator.poissons_ratio()
+    if is_mode_11:
+        # Reuse the real sweep's locking/compression; is_locked() would
+        # re-sweep with the tiny default ±π/2 amplitude and wrongly report
+        # a working auxetic as locked.
+        locked, info = sim_result.locked, sim_result.locking_info
+    else:
+        locked, info = simulator.is_locked()
+    return simulator, sim_result, poissons, locked, info
+
+
+class _SimWorker(QObject):
+    """Runs :func:`_solve_kinematic` off the UI thread so a long sweep
+    doesn't freeze the app (mirrors ``predictor_panel._TrainerWorker``).
+
+    Emits:
+    - ``finished(payload)`` — ``(tile_system, simulator, sim_result,
+      poissons, locked, info)`` on success
+    - ``failed(message)``   — formatted error text on any exception
+    """
+    finished = pyqtSignal(object)
+    failed   = pyqtSignal(str)
+
+    def __init__(self, tile_system, load_axis, is_mode_11: bool, jam: float,
+                 parent: QObject | None = None):
+        super().__init__(parent)
+        self._tile_system = tile_system
+        self._load_axis   = load_axis
+        self._is_mode_11  = is_mode_11
+        self._jam         = jam
+
+    def run(self) -> None:
+        """Slot connected to ``QThread.started``."""
+        try:
+            results = _solve_kinematic(
+                self._tile_system, self._load_axis,
+                self._is_mode_11, self._jam)
+            self.finished.emit((self._tile_system, *results))
+        except Exception as exc:
+            self.failed.emit(_format_sim_error(exc))
+
+
 class SimulationPanel(QDockWidget):
     # Class-level alias of the module constant, so tests / external
     # callers don't have to import the module to compute slider values.
@@ -173,6 +243,14 @@ class SimulationPanel(QDockWidget):
         self._locking_info    = None
         self._is_outdated     = False     # True after lattice change until rerun
         self._last_error      = None      # exception text if last run failed
+
+        # ---- async kinematic-solve worker (keeps the GUI responsive) -----
+        # The toolbar Run button drives the solve on a QThread so a long
+        # sweep can't freeze the event loop; run_simulation() itself stays
+        # synchronous for programmatic/test callers.
+        self._sim_thread    = None
+        self._sim_worker    = None
+        self._sim_cancelled = False
 
         # ---- anchor-view-to-polygon state (kinematic scrub only) ---------
         # The polygon tile the 3D view is rendered relative to (None =
@@ -386,7 +464,7 @@ class SimulationPanel(QDockWidget):
         self.run_button = QPushButton("Run Simulation", row)
         self.run_button.setToolTip(
             "Quasi-static kirigami sweep (Poisson's ratio, locking)")
-        self.run_button.clicked.connect(self.run_simulation)
+        self.run_button.clicked.connect(self._start_sim_async)
         layout.addWidget(self.run_button)
 
         # M2 — Newtonian dynamic sim. Reads forces / ground face / config
@@ -537,13 +615,21 @@ class SimulationPanel(QDockWidget):
         self._update_state_dependent_ui()
 
     def shutdown(self) -> None:
-        """Stop the play timer and close the matplotlib figure
-        explicitly. Called by ``MainWindow.closeEvent`` to release
-        these resources synchronously rather than letting them ride
-        Qt's deferred-deletion path — that's too slow for the test
-        suite, where back-to-back MainWindow lifetimes in one process
-        otherwise let stale ``QTimer`` and matplotlib canvas state
-        survive into the next test's event loop."""
+        """Stop the play timer, join any running kinematic-solve worker
+        thread, and close the matplotlib figure explicitly. Called by
+        ``MainWindow.closeEvent`` to release these resources synchronously
+        rather than letting them ride Qt's deferred-deletion path — that's
+        too slow for the test suite, where back-to-back MainWindow
+        lifetimes in one process otherwise let stale ``QTimer``, worker
+        threads, and matplotlib canvas state survive into the next test's
+        event loop."""
+        thread = self._sim_thread
+        if thread is not None:
+            try:
+                thread.quit()
+                thread.wait(2000)
+            except Exception:
+                pass
         if hasattr(self, "_play_timer") and self._play_timer is not None:
             try:
                 self._play_timer.stop()
@@ -671,64 +757,44 @@ class SimulationPanel(QDockWidget):
     # ==================================================================
 
     def run_simulation(self) -> None:
-        """Click handler for "Run Simulation". Wraps the entire pipeline
-        in try/except — any simulator failure is surfaced via the
+        """Run the quasi-static kirigami sweep synchronously and apply the
+        result. Kept synchronous for programmatic / test callers; the
+        toolbar Run button instead uses the non-blocking
+        :meth:`_start_sim_async`. Any simulator failure is surfaced via the
         readout, never crashes the GUI."""
         self._last_error = None
         try:
-            tile_system = TileSystem.from_lattice(self._lattice)
-            # Load axis fixed in world frame at -Y. Stage 6a's
-            # from_lattice already applied lattice.world_transform()
-            # to tile vertices, so the simulator's load axis stays
-            # fixed regardless of how the lattice is rotated — which
-            # is exactly the intent: rotating the lattice rotates the
-            # tile vertices in world frame, leaving load axis put.
-            if tile_system.dimension == 2:
-                load_axis = np.array([0.0, -1.0])
-            else:
-                load_axis = np.array([0.0, -1.0, 0.0])
-            simulator   = Simulator(tile_system, load_axis=load_axis)
-            is_mode_11 = int(getattr(self._lattice, "mode", 0)) == 11
-            if is_mode_11:
-                # Mode 11 is a large-amplitude rotating-units mechanism.
-                # Follow the curved 1-DOF manifold out to the jamming
-                # angle (full hole closure) via sweep_mechanism — the
-                # fixed-rest-mode sweep_theta saturates part-way and never
-                # closes the holes. The slider then maps to the *physical*
-                # actuation (closure) angle, not an abstract amplitude
-                # (see _mode11_pose_index_for_slider).
-                jam = float(self._lattice.bipartite_jamming_angle())
-                sim_result = simulator.sweep_mechanism(max_actuation=jam)
-            else:
-                # M2.8: sweep the full ±π range with tile-tile collision
-                # detection so the plot shows what's physically reachable.
-                sim_result = simulator.sweep_theta(
-                    n_steps=181, theta_max=np.pi, collision_stop=True,
-                )
-            poissons    = simulator.poissons_ratio()
-            if is_mode_11:
-                # Reuse the real sweep's locking/compression. is_locked()
-                # would re-sweep with the tiny default ±π/2 amplitude,
-                # which barely actuates this mechanism and wrongly reports
-                # a working auxetic as locked (~1.6% compression).
-                locked, info = sim_result.locked, sim_result.locking_info
-            else:
-                locked, info = simulator.is_locked()
+            tile_system, load_axis, is_mode_11, jam = self._build_sim_inputs()
+            results = _solve_kinematic(tile_system, load_axis, is_mode_11, jam)
         except Exception as exc:
-            self._last_error = (
-                f"{type(exc).__name__}: {exc}\n\n"
-                f"{traceback.format_exc().splitlines()[-1]}"
-            )
-            self._sim_result     = None
-            self._tile_system    = None
-            self._simulator      = None
-            self._poissons_ratio = None
-            self._locking_info   = None
-            self._is_outdated    = False
-            self._update_state_dependent_ui()
+            self._apply_sim_failure(_format_sim_error(exc))
             return
+        self._apply_sim_result(tile_system, *results)
 
-        # Success: replace stored state.
+    def _build_sim_inputs(self):
+        """Read the live lattice into the immutable inputs the solver
+        needs. Main-thread only (the lattice QObject isn't thread-safe);
+        the resulting ``tile_system`` is plain numpy data safe to hand to a
+        worker thread.
+
+        The load axis is fixed in world frame at -Y. ``from_lattice``
+        already applied ``lattice.world_transform()`` to the tile vertices,
+        so the load axis stays put regardless of how the lattice is
+        rotated — rotating the lattice rotates the tile vertices in world
+        frame, leaving the load axis fixed."""
+        tile_system = TileSystem.from_lattice(self._lattice)
+        if tile_system.dimension == 2:
+            load_axis = np.array([0.0, -1.0])
+        else:
+            load_axis = np.array([0.0, -1.0, 0.0])
+        is_mode_11 = int(getattr(self._lattice, "mode", 0)) == 11
+        jam = (float(self._lattice.bipartite_jamming_angle())
+               if is_mode_11 else 0.0)
+        return tile_system, load_axis, is_mode_11, jam
+
+    def _apply_sim_result(self, tile_system, simulator, sim_result,
+                          poissons, locked, info) -> None:
+        """Store a successful solve and refresh the UI (main thread)."""
         self._sim_result      = sim_result
         self._tile_system     = tile_system
         self._simulator       = simulator
@@ -740,10 +806,81 @@ class SimulationPanel(QDockWidget):
         if (self._anchor_tile is not None
                 and self._anchor_tile >= tile_system.n_tiles):
             self._anchor_tile = None
-
         self._update_plot()
         self._update_state_dependent_ui()
         self.simulationCompleted.emit()
+
+    def _apply_sim_failure(self, error_text: str) -> None:
+        """Clear stored state after a failed solve and surface the error."""
+        self._last_error     = error_text
+        self._sim_result     = None
+        self._tile_system    = None
+        self._simulator      = None
+        self._poissons_ratio = None
+        self._locking_info   = None
+        self._is_outdated    = False
+        self._update_state_dependent_ui()
+
+    # ---- Non-blocking solve (toolbar Run button) ---------------------
+    def _start_sim_async(self) -> None:
+        """Run the kinematic solve on a worker thread so the UI stays
+        responsive. A second click while running cancels: the result is
+        discarded and the UI frees up when the thread finishes — the thread
+        is allowed to run to completion, never force-killed (unsafe in Qt)."""
+        if self._sim_thread is not None:
+            # Already running → this click requests cancel.
+            self._sim_cancelled = True
+            self.run_button.setEnabled(False)
+            self.run_button.setText("Cancelling…")
+            return
+        self._last_error = None
+        try:
+            tile_system, load_axis, is_mode_11, jam = self._build_sim_inputs()
+        except Exception as exc:
+            self._apply_sim_failure(_format_sim_error(exc))
+            return
+
+        self._sim_cancelled = False
+        self.run_button.setText("Cancel")
+        self.run_button.setToolTip("Cancel the running simulation.")
+
+        thread = QThread(self)
+        worker = _SimWorker(tile_system, load_axis, is_mode_11, jam)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_sim_finished)
+        worker.failed.connect(self._on_sim_failed)
+        # Cleanup chain — quit the thread when the worker is done, then
+        # delete both objects (mirrors predictor_panel).
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_sim_thread_finished)
+        self._sim_thread = thread
+        self._sim_worker = worker
+        thread.start()
+
+    def _on_sim_finished(self, payload) -> None:
+        if self._sim_cancelled:
+            return   # result abandoned; UI resets in _on_sim_thread_finished
+        self._apply_sim_result(*payload)
+
+    def _on_sim_failed(self, message: str) -> None:
+        if self._sim_cancelled:
+            return
+        self._apply_sim_failure(message)
+
+    def _on_sim_thread_finished(self) -> None:
+        # Thread + worker are scheduled for deletion via deleteLater;
+        # clear refs and restore the Run button.
+        self._sim_thread    = None
+        self._sim_worker    = None
+        self._sim_cancelled = False
+        self.run_button.setText("Run Simulation")
+        self.run_button.setToolTip(
+            "Quasi-static kirigami sweep (Poisson's ratio, locking)")
+        self.run_button.setEnabled(True)
 
     def run_dynamics(self) -> None:
         """Click handler for "Run Dynamic" (M2). Wraps
