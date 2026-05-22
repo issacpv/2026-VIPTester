@@ -72,11 +72,17 @@ class ParameterChangeCommand(QUndoCommand):
     _ALLOWED = ("mode", "n_points", "ratio", "nz_layers",
                 # M1 additions — density gradient and physical scale.
                 "density_axis", "density_law", "density_strength",
-                "unit_scale_cm")
+                "unit_scale_cm",
+                # Mode-11 constant size ratio. Routed with
+                # regenerate=False (see below): C only repositions hinges
+                # on the existing triangulation, so re-rolling points
+                # would needlessly destroy the user's placed lattice.
+                "C")
 
     def __init__(self, lattice: Lattice, field: str,
                  old_value: Any, new_value: Any,
-                 on_change: Callback = None):
+                 on_change: Callback = None,
+                 *, regenerate: bool = True):
         if field not in self._ALLOWED:
             raise ValueError(f"ParameterChangeCommand: unsupported field {field!r}")
         super().__init__(f"Change {field}")
@@ -85,10 +91,15 @@ class ParameterChangeCommand(QUndoCommand):
         self.old_value  = old_value
         self.new_value  = new_value
         self.on_change  = on_change
+        # When False, the attribute is set without re-rolling the point
+        # cloud. Used for parameters that only affect derived geometry
+        # (e.g. mode-11 ``C``), never the point generation itself.
+        self.regenerate = bool(regenerate)
 
     def _apply(self, value: Any) -> None:
         setattr(self.lattice, self.field, value)
-        self.lattice.regenerate()
+        if self.regenerate:
+            self.lattice.regenerate()
         if self.on_change is not None:
             self.on_change()
 

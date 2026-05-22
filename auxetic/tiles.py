@@ -18,12 +18,19 @@ from .geometry import (
 )
 
 
-def collect_kirigami_tiles(points_nd, tri, ratio, mode, nz_layers):
+def collect_kirigami_tiles(points_nd, tri, ratio, mode, nz_layers,
+                           bipartite_C=1.0, bipartite_theta=0.0):
     """Polygonal tile faces for kirigami export.
 
     For 3D modes (3, 6) each shrunken tetrahedron is one tile (4 vertices)
     so PyKirigami treats it as a single rigid polyhedron rather than 4
     independent triangular faces.
+
+    Mode 11 (bipartite auxetic) produces one flat tile per polygon — the
+    central triangle and the three corner kites of each triangle — at the
+    current actuation angle ``bipartite_theta``. There is exactly one
+    z-layer (the structure is planar), so the simulator never sees the
+    spurious second layer the generic 2.5D path would have built.
     """
     tiles       = []
     tile_source = []
@@ -33,6 +40,33 @@ def collect_kirigami_tiles(points_nd, tri, ratio, mode, nz_layers):
         if len(verts_3d) >= 3:
             tiles.append(verts_3d)
             tile_source.append(source_meta)
+
+    if mode == 11:
+        from .bipartite import build_bipartite_network
+        net = build_bipartite_network(
+            points_nd, np.asarray(tri.simplices),
+            C=bipartite_C, theta=bipartite_theta)
+        for p_idx, poly in enumerate(net.polygons):
+            v3d = np.hstack([np.asarray(poly.vertices, float),
+                             np.zeros((poly.degree, 1))])
+            add_tile(v3d, {
+                'type':          'tri_face',   # flat polygon → extruded on export
+                'kind':          poly.kind,    # 'central' or 'corner'
+                'poly_idx':      p_idx,
+                'triangle_index': poly.triangle_index,
+            })
+        # Bonds are rigid 2-vertex bars linking adjacent kites along each
+        # shared edge. They are STRUCTURAL, not decorative: each corner
+        # kite is otherwise pinned only to its central polygon (one
+        # hinge) and would be free to spin; the bonds tie it to its
+        # neighbours so the whole network coheres into a single auxetic
+        # floppy mode (validated on rhombus + hex patches). Appended
+        # directly because ``add_tile`` rejects <3-vertex tiles.
+        for b_idx, bond in enumerate(net.bonds):
+            seg = np.hstack([np.asarray(bond, float), np.zeros((2, 1))])
+            tiles.append(seg)
+            tile_source.append({'type': 'bond', 'bond_idx': b_idx})
+        return tiles, tile_source
 
     if mode in [3, 6, 9]:
         pts_norm = points_nd

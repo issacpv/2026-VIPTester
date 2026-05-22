@@ -56,10 +56,10 @@ from auxetic import Lattice
 from auxetic import geometry as _geom
 
 
-PRESET_VERSION = 4  # M2 — adds the "dynamics" block (forces, ground
-                     # face, pre-rotation overrides, fixed tiles, dt /
-                     # stiffness config). v3 → v4 migration just fills
-                     # defaults; geometry payload is unchanged.
+PRESET_VERSION = 5  # Mode 11 — adds the bipartite-auxetic constant
+                     # size ratio "C" to the v3 generation block. v4 → v5
+                     # migration fills C = 1.0; geometry payload for every
+                     # other mode is unchanged.
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +110,9 @@ def _stub_generation() -> Dict[str, Any]:
         "mesh_path":        None,
         "mesh_vertices":    None,
         "unit_scale_cm":    1.0,
+        # Mode-11 constant size ratio (v5). 1.0 = symmetric / midpoint
+        # hinges, the behaviour-preserving default for every other mode.
+        "C":                1.0,
     }
 
 
@@ -201,6 +204,7 @@ def save_preset(
         "mesh_vertices":    (np.asarray(mesh_verts).tolist()
                              if mesh_verts is not None else None),
         "unit_scale_cm":    float(getattr(lattice, "unit_scale_cm", 1.0)),
+        "C":                float(getattr(lattice, "C", 1.0)),
     }
 
     # ---- M2 dynamics block (v4) -----------------------------------------
@@ -288,6 +292,9 @@ def load_preset(path: str) -> Lattice:
     if int(data.get("version", PRESET_VERSION)) == 3:
         data = _migrate_v3_to_v4(data)
 
+    if int(data.get("version", PRESET_VERSION)) == 4:
+        data = _migrate_v4_to_v5(data)
+
     # ---- M1 generation block (v3) ---------------------------------------
     # Pull these out first so they can be passed to the Lattice
     # constructor. Mesh-import modes (7, 8, 9) need ``mesh_vertices``
@@ -312,6 +319,7 @@ def load_preset(path: str) -> Lattice:
         mesh_path        = gen.get("mesh_path"),
         mesh_vertices    = mesh_vertices,
         unit_scale_cm    = float(gen.get("unit_scale_cm", 1.0)),
+        C                = float(gen.get("C", 1.0)),
     )
 
     # ---- install saved points (and freeze them as the new "original") --
@@ -438,4 +446,17 @@ def _migrate_v3_to_v4(data: Dict[str, Any]) -> Dict[str, Any]:
         inner_cfg.setdefault(k, v)
     dyn["config"] = inner_cfg
     out["dynamics"] = dyn
+    return out
+
+
+def _migrate_v4_to_v5(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote a v4 preset to v5: adds the mode-11 constant size ratio
+    ``C`` to the generation block, defaulting to 1.0 (symmetric /
+    midpoint hinges). v4 files load with no behaviour change — C is
+    only consulted by mode 11, which didn't exist in v4."""
+    out = dict(data)
+    out["version"] = 5
+    gen = dict(out.get("generation") or {})
+    gen.setdefault("C", 1.0)
+    out["generation"] = gen
     return out

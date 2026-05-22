@@ -48,35 +48,40 @@ from scipy.spatial.transform import Rotation
 # pre-existing random/grid combinations; modes 7/8/9 are the M1
 # mesh-import variants (dim 2D / 2.5D / 3D respectively).
 DIM_LABELS      = ["2D", "2.5D", "3D"]
-STRATEGY_LABELS = ["Random", "Grid", "Mesh import", "Cuboid grid"]
+STRATEGY_LABELS = ["Random", "Grid", "Mesh import", "Cuboid grid",
+                   "Bipartite auxetic"]
 
 # (dim, strategy) tuple → mode integer.
-# "Cuboid grid" is 3D-only — picking it from 2D / 2.5D auto-switches
-# the dim combo to 3D in ``_on_strategy_changed``.
+# "Cuboid grid" is 3D-only and "Bipartite auxetic" is 2D-only — picking
+# either from an incompatible dim auto-switches the dim combo in
+# ``_on_strategy_changed``.
 _DIM_STRAT_TO_MODE: dict[tuple[str, str], int] = {
-    ("2D",   "Random"):       1,
-    ("2.5D", "Random"):       2,
-    ("3D",   "Random"):       3,
-    ("2D",   "Grid"):         4,
-    ("2.5D", "Grid"):         5,
-    ("3D",   "Grid"):         6,
-    ("2D",   "Mesh import"):  7,
-    ("2.5D", "Mesh import"):  8,
-    ("3D",   "Mesh import"):  9,
-    ("3D",   "Cuboid grid"):  10,
+    ("2D",   "Random"):            1,
+    ("2.5D", "Random"):            2,
+    ("3D",   "Random"):            3,
+    ("2D",   "Grid"):              4,
+    ("2.5D", "Grid"):              5,
+    ("3D",   "Grid"):              6,
+    ("2D",   "Mesh import"):       7,
+    ("2.5D", "Mesh import"):       8,
+    ("3D",   "Mesh import"):       9,
+    ("3D",   "Cuboid grid"):       10,
+    ("2D",   "Bipartite auxetic"): 11,
 }
 # Inverse for refresh_from_lattice — only canonical (dim, strategy)
-# pairs map back. Mode 10 → ("3D", "Cuboid grid").
+# pairs map back. Mode 10 → ("3D", "Cuboid grid"); 11 → ("2D",
+# "Bipartite auxetic").
 _MODE_TO_DIM_STRAT: dict[int, tuple[str, str]] = {
     v: k for k, v in _DIM_STRAT_TO_MODE.items()
 }
 
-_RANDOM_MODES = (1, 2, 3)
-_GRID_MODES   = (4, 5, 6)
-_MESH_MODES   = (7, 8, 9)
-_CUBOID_MODES = (10,)
-_2D_MODES     = (1, 2, 4, 5, 7, 8)   # 2D and 2.5D
-_3D_MODES     = (3, 6, 9, 10)
+_RANDOM_MODES    = (1, 2, 3)
+_GRID_MODES      = (4, 5, 6)
+_MESH_MODES      = (7, 8, 9)
+_CUBOID_MODES    = (10,)
+_BIPARTITE_MODES = (11,)
+_2D_MODES        = (1, 2, 4, 5, 7, 8, 11)   # 2D and 2.5D
+_3D_MODES        = (3, 6, 9, 10)
 
 # Vertex-count threshold above which mesh import prompts for decimation.
 _MESH_DECIMATE_PROMPT_THRESHOLD = 500
@@ -139,6 +144,21 @@ class InspectorPanel(QWidget):
         self.ratio_spin.setDecimals(3)
         self.ratio_spin.valueChanged.connect(self._on_ratio_changed)
 
+        # Mode-11 constant size ratio C = b_ji / a_ij (Acuna et al.
+        # 2022, step 3). Sits where ``Ratio`` would be but is a distinct
+        # parameter: it slides each hinge along its corner→centroid
+        # segment (C=1 → midpoint) instead of shrinking tiles toward a
+        # centroid. Visible only for mode 11.
+        self.c_ratio_spin = QDoubleSpinBox(lat_box)
+        self.c_ratio_spin.setRange(0.05, 20.0)
+        self.c_ratio_spin.setSingleStep(0.05)
+        self.c_ratio_spin.setDecimals(3)
+        self.c_ratio_spin.setToolTip(
+            "Constant size ratio C = b/a (Acuna et al. 2022). C=1 puts "
+            "each hinge at the midpoint of its corner→centroid segment; "
+            "larger C pushes hinges toward the corners.")
+        self.c_ratio_spin.valueChanged.connect(self._on_c_ratio_changed)
+
         self.nz_layers_spin = QSpinBox(lat_box)
         self.nz_layers_spin.setRange(2, 64)
         self.nz_layers_spin.valueChanged.connect(self._on_nz_layers_changed)
@@ -146,8 +166,12 @@ class InspectorPanel(QWidget):
         form.addRow(QLabel("Dimensionality"), self.dim_combo)
         form.addRow(QLabel("Strategy"),       self.strategy_combo)
         form.addRow(QLabel("N points"),       self.n_points_spin)
-        form.addRow(QLabel("Ratio"),          self.ratio_spin)
-        form.addRow(QLabel("Nz layers"),      self.nz_layers_spin)
+        self._ratio_label = QLabel("Ratio")
+        form.addRow(self._ratio_label,        self.ratio_spin)
+        self._c_ratio_label = QLabel("C ratio")
+        form.addRow(self._c_ratio_label,      self.c_ratio_spin)
+        self._nz_layers_label = QLabel("Nz layers")
+        form.addRow(self._nz_layers_label,    self.nz_layers_spin)
 
         # ---- Mesh import row (visible only when strategy = Mesh) -------
         self._mesh_row = QWidget(lat_box)
@@ -289,6 +313,7 @@ class InspectorPanel(QWidget):
 
             self.n_points_spin.setValue(int(self._lattice.n_points))
             self.ratio_spin.setValue(float(self._lattice.ratio))
+            self.c_ratio_spin.setValue(float(getattr(self._lattice, "C", 1.0)))
             self.nz_layers_spin.setValue(int(self._lattice.nz_layers))
 
             # Density widgets: visible only for Random strategy.
@@ -363,13 +388,21 @@ class InspectorPanel(QWidget):
         # the user picks Cuboid from a non-3D dim.
         new_dim   = str(self.dim_combo.currentData())
         cur_strat = str(self.strategy_combo.currentData())
-        if new_dim != "3D" and cur_strat == "Cuboid grid":
-            si_grid = self.strategy_combo.findData("Grid")
-            if si_grid >= 0:
+        # Cuboid grid is 3D-only; Bipartite auxetic is 2D-only. If the
+        # new dim is incompatible with the current strategy, fall back
+        # to the nearest always-valid strategy (Grid / Random).
+        incompatible = (
+            (new_dim != "3D" and cur_strat == "Cuboid grid")
+            or (new_dim != "2D" and cur_strat == "Bipartite auxetic")
+        )
+        if incompatible:
+            fallback = "Grid" if cur_strat == "Cuboid grid" else "Random"
+            si_fb = self.strategy_combo.findData(fallback)
+            if si_fb >= 0:
                 self._suspend = True
                 try:
-                    self.strategy_combo.setCurrentIndex(si_grid)
-                    self._last_valid_strategy_idx = si_grid
+                    self.strategy_combo.setCurrentIndex(si_fb)
+                    self._last_valid_strategy_idx = si_fb
                 finally:
                     self._suspend = False
         # Mesh-strategy + new dim with no mesh loaded → can't change yet.
@@ -395,6 +428,18 @@ class InspectorPanel(QWidget):
                 try:
                     self.dim_combo.setCurrentIndex(di_3d)
                     self._last_valid_dim_idx = di_3d
+                finally:
+                    self._suspend = False
+        # Bipartite auxetic is 2D-only — auto-flip the dim combo to 2D
+        # so ``_DIM_STRAT_TO_MODE`` resolves to mode 11 (mirrors the
+        # Cuboid-grid → 3D switch above).
+        if new_strat == "Bipartite auxetic":
+            di_2d = self.dim_combo.findData("2D")
+            if di_2d >= 0 and self.dim_combo.currentIndex() != di_2d:
+                self._suspend = True
+                try:
+                    self.dim_combo.setCurrentIndex(di_2d)
+                    self._last_valid_dim_idx = di_2d
                 finally:
                     self._suspend = False
         if new_strat == "Mesh import":
@@ -430,6 +475,10 @@ class InspectorPanel(QWidget):
 
     def _on_ratio_changed(self, value):
         self._emit_param("ratio", float(self._lattice.ratio), float(value))
+
+    def _on_c_ratio_changed(self, value):
+        self._emit_param("C", float(getattr(self._lattice, "C", 1.0)),
+                         float(value))
 
     def _on_nz_layers_changed(self, value):
         self._emit_param("nz_layers", int(self._lattice.nz_layers), int(value))
@@ -519,6 +568,7 @@ class InspectorPanel(QWidget):
         is_random = mode in _RANDOM_MODES
         is_grid   = mode in _GRID_MODES
         is_mesh   = mode in _MESH_MODES
+        is_bipartite = mode in _BIPARTITE_MODES
 
         # Orientation rows depend only on dim.
         self._row_2d.setVisible(is_2d)
@@ -531,9 +581,18 @@ class InspectorPanel(QWidget):
         # Mesh row only meaningful for mesh modes.
         self._mesh_row.setVisible(is_mesh)
 
-        # nz_layers is only used by extruded (2.5D) modes — 2 / 5 / 8.
-        # Existing pre-M1 UI showed the spinbox unconditionally; preserve
-        # that for backwards compatibility (no test expects it hidden).
+        # Mode 11 (bipartite auxetic) is driven by C, not the
+        # shrink-toward-centroid Ratio, and has no z-extrusion — so swap
+        # the Ratio row for the C-ratio row and hide Nz layers. Every
+        # other mode keeps the legacy layout (Ratio shown, C hidden);
+        # Nz layers stays visible there for backwards compatibility (no
+        # existing test expects it hidden).
+        self._ratio_label.setVisible(not is_bipartite)
+        self.ratio_spin.setVisible(not is_bipartite)
+        self._c_ratio_label.setVisible(is_bipartite)
+        self.c_ratio_spin.setVisible(is_bipartite)
+        self._nz_layers_label.setVisible(not is_bipartite)
+        self.nz_layers_spin.setVisible(not is_bipartite)
 
     # Back-compat alias for the original method name. test_rotation.py
     # and other internal call-sites used the orientation-only name.

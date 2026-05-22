@@ -316,6 +316,40 @@ def flippable_edges(tri, points):
     return out
 
 
+def edge_flip_apexes(tri, edge):
+    """Return the two apex vertices ``(c, d)`` of the quad whose diagonal
+    is ``edge`` — the pair a diagonal flip of ``edge`` would connect.
+
+    ``edge`` is an ``(i, j)`` tuple of vertex indices. The apexes are the
+    third vertices of the two triangles sharing ``edge``. Returns a
+    sorted ``(c, d)`` tuple, or ``None`` when ``edge`` is not a shared
+    interior edge of exactly two triangles in ``tri`` (boundary edges,
+    edges absent from the triangulation, or 3D triangulations).
+
+    Used by the GUI's edge-flip interaction: once the user selects an
+    edge, these two corners are highlighted as the Ctrl-click targets
+    that confirm the flip.
+    """
+    simplices = np.asarray(tri.simplices)
+    if simplices.size == 0 or simplices.ndim != 2 or simplices.shape[1] != 3:
+        return None
+    a, b = int(edge[0]), int(edge[1])
+    if a > b:
+        a, b = b, a
+    opps: list[int] = []
+    for simplex in simplices:
+        verts = [int(v) for v in simplex]
+        if a in verts and b in verts:
+            for v in verts:
+                if v != a and v != b:
+                    opps.append(v)
+                    break
+    if len(opps) != 2:
+        return None
+    c, d = sorted(opps)
+    return (c, d)
+
+
 def apply_edge_flips(tri, points, flips):
     """Apply ``flips`` (an iterable of ``(i, j)`` edges) to ``tri``.
 
@@ -661,7 +695,9 @@ def build_3d_groups(pts_norm, tri, ratio):
 
 def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
                               cuboid_tiles=None,
-                              cuboid_constraints=None):
+                              cuboid_constraints=None,
+                              bipartite_C=1.0,
+                              bipartite_theta=0.0):
     """Build the strut curves, solid triangles, and joint positions for STL/OBJ/SCAD output."""
     strut_curves  = []
     all_triangles = []
@@ -701,6 +737,28 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
             except (IndexError, TypeError):
                 continue
             add_strut(p_a, p_b)
+        return strut_curves, all_triangles, joint_positions
+
+    # Mode-11 bipartite auxetic: extrude each kite / central polygon into
+    # a flat slab and connect adjacent kites with bond struts. Geometry
+    # comes from the rotating-units network at the current actuation
+    # angle (``bipartite_theta``), so a posed lattice exports posed.
+    if mode == 11:
+        from . import bipartite as _bip
+        net = _bip.build_bipartite_network(
+            points_nd, np.asarray(tri.simplices),
+            C=bipartite_C, theta=bipartite_theta)
+        for poly in net.polygons:
+            v2d = np.asarray(poly.vertices, float)
+            if len(v2d) < 3:
+                continue
+            face3 = np.hstack([v2d, np.zeros((len(v2d), 1))])
+            all_triangles.extend(extrude_polygon_solid(face3))
+            for pt in face3:
+                register_joint(pt)
+        for bond in net.bonds:
+            b = np.asarray(bond, float)
+            add_strut([b[0, 0], b[0, 1], 0.0], [b[1, 0], b[1, 1], 0.0])
         return strut_curves, all_triangles, joint_positions
 
     if mode in [3, 6, 9]:
@@ -870,6 +928,11 @@ def collect_export_geometry_from_posed_tiles(
             all_triangles.extend(triangles_for_solid_tetrahedron(verts3d))
         elif type_ == 'hub_polyhedron':
             all_triangles.extend(triangles_for_convex_solid(verts3d))
+        elif type_ == 'bond':
+            # Mode-11 bond bar: a 2-vertex rigid link rendered as a
+            # strut tube between its (pose-transformed) endpoints.
+            if len(verts3d) >= 2 and np.linalg.norm(verts3d[1] - verts3d[0]) > 1e-9:
+                strut_curves.append(np.array([verts3d[0], verts3d[1]]))
 
         for v in verts3d:
             joint_positions.add(tuple(np.round(v, 8)))

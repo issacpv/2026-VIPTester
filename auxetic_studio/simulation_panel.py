@@ -49,6 +49,7 @@ from PyQt6.QtWidgets import (
 
 from matplotlib.backends.backend_qtagg import FigureCanvas
 from matplotlib.figure import Figure
+from scipy.spatial.transform import Rotation
 
 from auxetic import TileSystem, Simulator
 from auxetic.dynamics import build_dynamics_simulator_from_lattice
@@ -85,6 +86,15 @@ def simulator_theta_to_slider(theta_rad: float) -> float:
     return float(np.degrees(theta_rad) / 2.0 + 90.0)
 
 
+def _rotations_close(a: Rotation, b: Rotation, tol: float = 1e-9) -> bool:
+    """Quaternion-equivalent comparison — duplicated from the Inspector
+    so the orientation sliders here can suppress no-op emits without
+    pulling that helper into the public API."""
+    qa = np.asarray(a.as_quat())
+    qb = np.asarray(b.as_quat())
+    return bool(np.linalg.norm(qa - qb) < tol or np.linalg.norm(qa + qb) < tol)
+
+
 # Slider range and resolution (sub-degree granularity via tenths-of-deg
 # integer values, since QSlider doesn't do floats natively).
 _SLIDER_MIN_DEG  = 0.0
@@ -99,6 +109,14 @@ _SLIDER_MAX_DEG_THETA_MAX = +np.pi   # slider 180° → math +π
 # Animation: 30 fps, full bistable cycle in ~3 s.
 _PLAY_FPS_INTERVAL_MS = 33
 _PLAY_CYCLE_FRAMES    = 90
+
+# Orientation slider (Dynamic mode): one slider per Euler axis. Range
+# matches the inspector's spinboxes — [-180°, +180°]. Same tenths-of-deg
+# integer encoding as the joint slider so QSlider can hold sub-degree
+# values.
+_ORIENT_SLIDER_MIN_DEG = -180.0
+_ORIENT_SLIDER_MAX_DEG =  180.0
+_ORIENT_SLIDER_SCALE   = 10
 
 
 class SimulationPanel(QDockWidget):
@@ -123,6 +141,12 @@ class SimulationPanel(QDockWidget):
     # the MainWindow can wrap the change in a ForceListChangeCommand.
     forcesChangeRequested = pyqtSignal(object, object)
 
+    # Emitted when the orientation sliders (Dynamic mode) commit a
+    # change to ``lattice.rigid_rotation``. MainWindow wraps the
+    # (old, new) ``Rotation`` pair in a ``RotationChangeCommand`` so
+    # undo/redo works the same as the Inspector's orientation widgets.
+    rotationChangeRequested = pyqtSignal(object, object)
+
     # ------------------------------------------------------------------
 
     def __init__(self, lattice, view_3d=None, parent=None):
@@ -137,6 +161,9 @@ class SimulationPanel(QDockWidget):
         # Captured at slider press; the angle to compare against on
         # release so the QUndoStack receives one (old, new) pair.
         self._press_angle_rad: float | None = None
+        # Same role for the orientation sliders — captured at slider
+        # press so release can emit (old_rotation, new_rotation).
+        self._press_rotation: Rotation | None = None
 
         # ---- simulation result state -------------------------------------
         self._sim_result      = None
@@ -146,6 +173,14 @@ class SimulationPanel(QDockWidget):
         self._locking_info    = None
         self._is_outdated     = False     # True after lattice change until rerun
         self._last_error      = None      # exception text if last run failed
+
+        # ---- anchor-view-to-polygon state (kinematic scrub only) ---------
+        # The polygon tile the 3D view is rendered relative to (None =
+        # world frame). Set by clicking a tile in the 3D view. The most
+        # recently displayed kinematic pose is kept so a click can be
+        # resolved to the nearest polygon in the geometry actually on screen.
+        self._anchor_tile: int | None = None
+        self._displayed_pose = None
 
         # ---- M2 dynamic-sim state ----------------------------------------
         self._dynamics_result = None      # most recent DynamicsResult, if any
@@ -179,6 +214,7 @@ class SimulationPanel(QDockWidget):
 
         self.refresh_from_lattice()
         self._update_state_dependent_ui()
+        self._wire_view3d(self._view_3d)
 
     # ==================================================================
     # Construction helpers
@@ -245,7 +281,7 @@ class SimulationPanel(QDockWidget):
         v.addWidget(piston_row)
 
         piston_help = QLabel(
-            "<i>Pre-rotate the lattice via Inspector → Orientation, "
+            "<i>Pre-rotate the lattice via the orientation sliders below, "
             "then click <b>Run Dynamic</b>. The piston pushes from the "
             "top of the lattice in its current world orientation.</i>",
             self._dynamics_config_box,
@@ -253,6 +289,45 @@ class SimulationPanel(QDockWidget):
         piston_help.setTextFormat(Qt.TextFormat.RichText)
         piston_help.setWordWrap(True)
         v.addWidget(piston_help)
+
+        # ---- Orientation sliders (drives lattice.rigid_rotation) -------
+        # Three Euler XYZ sliders, applied extrinsic X→Y→Z (matches the
+        # Inspector's orientation block). Lets the user pre-rotate the
+        # lattice without leaving the dynamics workflow.
+        orient_box = QGroupBox("Lattice orientation", self._dynamics_config_box)
+        ov = QFormLayout(orient_box)
+        self._orient_sliders: dict[str, QSlider] = {}
+        self._orient_spins:   dict[str, QDoubleSpinBox] = {}
+        for axis in ("X", "Y", "Z"):
+            row = QWidget(orient_box)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            sl = QSlider(Qt.Orientation.Horizontal, row)
+            sl.setRange(int(_ORIENT_SLIDER_MIN_DEG * _ORIENT_SLIDER_SCALE),
+                        int(_ORIENT_SLIDER_MAX_DEG * _ORIENT_SLIDER_SCALE))
+            sl.setSingleStep(_ORIENT_SLIDER_SCALE)
+            sl.setPageStep(_ORIENT_SLIDER_SCALE * 10)
+            sl.valueChanged.connect(
+                lambda v, a=axis: self._on_orient_slider_changed(a, v))
+            sl.sliderPressed.connect(self._on_orient_slider_pressed)
+            sl.sliderReleased.connect(self._on_orient_slider_released)
+            sp = QDoubleSpinBox(row)
+            sp.setRange(_ORIENT_SLIDER_MIN_DEG, _ORIENT_SLIDER_MAX_DEG)
+            sp.setDecimals(1)
+            sp.setSingleStep(1.0)
+            sp.setSuffix("°")
+            sp.editingFinished.connect(self._on_orient_spin_committed)
+            sp.valueChanged.connect(
+                lambda v, a=axis: self._on_orient_spin_value_changed(a, v))
+            sp.setToolTip(
+                f"Rotation about world {axis}, applied in XYZ extrinsic order.")
+            row_layout.addWidget(sl, 1)
+            row_layout.addWidget(sp)
+            ov.addRow(QLabel(axis), row)
+            self._orient_sliders[axis] = sl
+            self._orient_spins[axis] = sp
+        v.addWidget(orient_box)
+        self._orient_box = orient_box
 
         # ---- Ground face row -------------------------------------------
         gf_row = QWidget(self._dynamics_config_box)
@@ -393,6 +468,73 @@ class SimulationPanel(QDockWidget):
         (depending on construction order); use this to inject the
         reference once it's available."""
         self._view_3d = view_3d
+        self._wire_view3d(view_3d)
+
+    def _wire_view3d(self, view_3d) -> None:
+        """Connect the View3D's surface-pick signal so clicking a polygon
+        anchors the kinematic view to it. Idempotent — safe to call from
+        both ``__init__`` and ``set_view_3d``."""
+        if view_3d is None or not hasattr(view_3d, "surfacePointPicked"):
+            return
+        try:
+            view_3d.surfacePointPicked.disconnect(self._on_surface_point_picked)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            view_3d.surfacePointPicked.connect(self._on_surface_point_picked)
+        except (TypeError, RuntimeError):
+            pass
+
+    # ==================================================================
+    # Anchor view to a polygon (kinematic scrub only)
+    # ==================================================================
+
+    def _on_surface_point_picked(self, point) -> None:
+        """Handle a 3D surface-pick. Resolves the clicked point to the
+        nearest polygon in the displayed pose and toggles it as the anchor
+        (click the anchored polygon again, or empty space, to release).
+        Anchoring only affects the kinematic scrub."""
+        if self._scrub_mode != "kinematic":
+            return
+        if point is None:
+            if self._anchor_tile is not None:
+                self._set_anchor_tile(None)
+            return
+        tile = self._resolve_clicked_tile(point)
+        if tile is None:
+            return
+        new_anchor = None if tile == self._anchor_tile else tile
+        self._set_anchor_tile(new_anchor)
+
+    def _resolve_clicked_tile(self, point) -> int | None:
+        """Nearest polygon (>=3 vertices) to ``point`` in the currently
+        displayed kinematic pose. Bonds / degenerate bars are skipped so
+        the anchor is always a real polygon."""
+        if self._simulator is None or self._tile_system is None:
+            return None
+        pose = self._displayed_pose
+        if pose is None:
+            return None
+        dim = self._tile_system.dimension
+        pt = np.asarray(point, dtype=float).ravel()[:dim]
+        best, best_d = None, float("inf")
+        for i in range(self._tile_system.n_tiles):
+            if self._tile_system.tiles[i].shape[0] < 3:
+                continue
+            centroid = self._simulator._tile_world_vertices(pose, i).mean(axis=0)
+            d = float(np.linalg.norm(centroid - pt))
+            if d < best_d:
+                best_d, best = d, i
+        return best
+
+    def _set_anchor_tile(self, tile: int | None) -> None:
+        """Set (or clear) the anchored polygon and re-render the current
+        kinematic pose in that polygon's frame."""
+        if tile == self._anchor_tile:
+            return
+        self._anchor_tile = tile
+        self._drive_pose_from_slider(self._slider_value_deg())
+        self._update_state_dependent_ui()
 
     def shutdown(self) -> None:
         """Stop the play timer and close the matplotlib figure
@@ -446,6 +588,9 @@ class SimulationPanel(QDockWidget):
             gi = self.ground_face_combo.findData(target)
             if gi >= 0:
                 self.ground_face_combo.setCurrentIndex(gi)
+            # Sync the orientation sliders / spinboxes from
+            # lattice.rigid_rotation so undo/redo keeps them in step.
+            self._sync_orient_widgets_from_lattice()
         finally:
             self._suspend = False
         # Populate the force table from the current lattice. This call
@@ -496,6 +641,11 @@ class SimulationPanel(QDockWidget):
         if self._is_outdated:
             return
         self._is_outdated = True
+        # The lattice changed, so the anchored polygon's index may no
+        # longer refer to the same tile — release the anchor (and the
+        # cached displayed pose) to a clean world-frame state.
+        self._anchor_tile = None
+        self._displayed_pose = None
         # Dynamic sim result is invalidated — its trajectory was for the
         # pre-change lattice. Clear it; the user clicks Run Dynamic again.
         self._dynamics_result = None
@@ -538,13 +688,32 @@ class SimulationPanel(QDockWidget):
             else:
                 load_axis = np.array([0.0, -1.0, 0.0])
             simulator   = Simulator(tile_system, load_axis=load_axis)
-            # M2.8: sweep the full ±π range with tile-tile collision
-            # detection so the plot shows what's physically reachable.
-            sim_result  = simulator.sweep_theta(
-                n_steps=181, theta_max=np.pi, collision_stop=True,
-            )
+            is_mode_11 = int(getattr(self._lattice, "mode", 0)) == 11
+            if is_mode_11:
+                # Mode 11 is a large-amplitude rotating-units mechanism.
+                # Follow the curved 1-DOF manifold out to the jamming
+                # angle (full hole closure) via sweep_mechanism — the
+                # fixed-rest-mode sweep_theta saturates part-way and never
+                # closes the holes. The slider then maps to the *physical*
+                # actuation (closure) angle, not an abstract amplitude
+                # (see _mode11_pose_index_for_slider).
+                jam = float(self._lattice.bipartite_jamming_angle())
+                sim_result = simulator.sweep_mechanism(max_actuation=jam)
+            else:
+                # M2.8: sweep the full ±π range with tile-tile collision
+                # detection so the plot shows what's physically reachable.
+                sim_result = simulator.sweep_theta(
+                    n_steps=181, theta_max=np.pi, collision_stop=True,
+                )
             poissons    = simulator.poissons_ratio()
-            locked, info = simulator.is_locked()
+            if is_mode_11:
+                # Reuse the real sweep's locking/compression. is_locked()
+                # would re-sweep with the tiny default ±π/2 amplitude,
+                # which barely actuates this mechanism and wrongly reports
+                # a working auxetic as locked (~1.6% compression).
+                locked, info = sim_result.locked, sim_result.locking_info
+            else:
+                locked, info = simulator.is_locked()
         except Exception as exc:
             self._last_error = (
                 f"{type(exc).__name__}: {exc}\n\n"
@@ -566,6 +735,11 @@ class SimulationPanel(QDockWidget):
         self._poissons_ratio  = poissons
         self._locking_info    = info
         self._is_outdated     = False
+        # Drop a stale anchor whose index no longer exists (tile count
+        # changed); otherwise keep it across re-runs of the same lattice.
+        if (self._anchor_tile is not None
+                and self._anchor_tile >= tile_system.n_tiles):
+            self._anchor_tile = None
 
         self._update_plot()
         self._update_state_dependent_ui()
@@ -594,6 +768,20 @@ class SimulationPanel(QDockWidget):
         # Dynamic mode so they can see the trajectory.
         if self._dynamics_result is not None and not self.mode_dynamic_radio.isChecked():
             self.mode_dynamic_radio.setChecked(True)
+        # Snap the scrub slider to 0 (start of trajectory) so the user
+        # sees the un-compressed initial pose with the piston plate at
+        # its starting height. From there they can scrub forward, click
+        # Play, or watch the floor + piston move as compression
+        # progresses. Without this reset, a previous slider position
+        # (e.g. 90° from a kinematic sweep) would land us mid-trajectory
+        # and the piston would appear already partially descended.
+        if self._dynamics_result is not None:
+            self._suspend = True
+            try:
+                self.slider.setValue(int(round(_SLIDER_MIN_DEG * _SLIDER_SCALE)))
+                self.spin.setValue(_SLIDER_MIN_DEG)
+            finally:
+                self._suspend = False
         self._update_plot()
         self._drive_pose_from_slider(self._slider_value_deg())
         self._update_state_dependent_ui()
@@ -627,9 +815,20 @@ class SimulationPanel(QDockWidget):
             return
 
         axial = self._simulator._axial_index()
-        x_deg = np.array([
-            simulator_theta_to_slider(t) for t in self._sim_result.theta_samples
-        ])
+        if int(getattr(self._lattice, "mode", 0)) == 11:
+            # Mode 11's sweep is parameterised by physical actuation
+            # (closure) angle, mapped to the slider the same way
+            # _mode11_pose_index_for_slider does: 90°→rest, 180°→+jamming.
+            jam_deg = math.degrees(float(self._lattice.bipartite_jamming_angle()))
+            if jam_deg < 1e-6:
+                jam_deg = 90.0
+            x_deg = (_SLIDER_REST_DEG
+                     + np.degrees(self._sim_result.actuation_angles)
+                     / jam_deg * 90.0)
+        else:
+            x_deg = np.array([
+                simulator_theta_to_slider(t) for t in self._sim_result.theta_samples
+            ])
         y = self._sim_result.bbox_extents[:, axial]
 
         if self._plot_line is None:
@@ -702,20 +901,37 @@ class SimulationPanel(QDockWidget):
         look like right now"."""
         has_result = self._sim_result is not None
         fresh = has_result and not self._is_outdated
+        # Play is also available in Dynamic mode when a fresh dynamics
+        # result is loaded — animates the piston pressing down through
+        # the trajectory.
+        has_dyn = self._dynamics_result is not None
+        play_enabled = fresh or has_dyn
 
-        self.play_button.setEnabled(fresh)
+        self.play_button.setEnabled(play_enabled)
         # Plot greys out when outdated — visually consistent with the
         # readout's dimmed-stale pattern.
         if self._plot_line is not None:
-            self._plot_line.set_alpha(1.0 if fresh else 0.3)
+            self._plot_line.set_alpha(1.0 if (fresh or has_dyn) else 0.3)
             self._canvas.draw_idle()
 
         self.readout.setText(self._compose_readout_html())
 
     def _compose_readout_html(self) -> str:
+        anchor_html    = self._compose_anchor_readout_html()
         kinematic_html = self._compose_kinematic_readout_html()
         dynamic_html   = self._compose_dynamic_readout_html()
-        return kinematic_html + dynamic_html
+        return anchor_html + kinematic_html + dynamic_html
+
+    def _compose_anchor_readout_html(self) -> str:
+        """A small banner naming the anchored polygon, shown while the
+        kinematic view is locked to a tile's frame."""
+        if self._anchor_tile is None:
+            return ""
+        return (
+            f"<p style='color:#b8860b'><b>View anchored to polygon "
+            f"#{self._anchor_tile}</b> — click it again (or empty space) "
+            f"to release.</p>"
+        )
 
     def _compose_kinematic_readout_html(self) -> str:
         if self._last_error is not None:
@@ -878,6 +1094,7 @@ class SimulationPanel(QDockWidget):
         self._update_marker(slider_deg)
         if self._view_3d is None:
             return
+
         if self._scrub_mode == "dynamic":
             if self._dynamics_result is None:
                 return
@@ -889,6 +1106,13 @@ class SimulationPanel(QDockWidget):
                                  (slider_deg - _SLIDER_MIN_DEG)
                                  / max(_SLIDER_MAX_DEG - _SLIDER_MIN_DEG, 1e-9)))
             idx = int(round(frac * (n - 1)))
+            # Defensive: even with the simulator's divergence guard,
+            # a stale / partially-clamped trajectory might still hold a
+            # non-finite pose. Walk backward to the nearest finite one
+            # so the renderer never receives Inf/NaN.
+            if not np.all(np.isfinite(poses[idx])):
+                while idx > 0 and not np.all(np.isfinite(poses[idx])):
+                    idx -= 1
             try:
                 # Reuse the kinematic tile_system if present (the
                 # dynamics solver is built on the same TileSystem).
@@ -922,13 +1146,51 @@ class SimulationPanel(QDockWidget):
                 pass
         if self._sim_result is None or self._is_outdated:
             return
-        theta_rad = slider_to_simulator_theta(slider_deg)
-        idx = int(np.argmin(np.abs(self._sim_result.theta_samples - theta_rad)))
+        sr = self._sim_result
+        if getattr(self._lattice, "mode", None) == 11:
+            # Mode 11's sweep is parameterised by physical closure angle;
+            # map the slider to it (90°→rest, 180°→jamming) and pick the
+            # nearest swept pose by actuation (see the helper).
+            idx = self._mode11_pose_index_for_slider(slider_deg)
+        else:
+            theta_rad = slider_to_simulator_theta(slider_deg)
+            idx = int(np.argmin(np.abs(sr.theta_samples - theta_rad)))
+        # When a polygon is anchored, render every frame in that polygon's
+        # frame so it stays fixed and the rest moves relative to it.
+        raw_pose = sr.poses[idx]
+        if self._anchor_tile is not None and self._simulator is not None:
+            pose = self._simulator.relativize_pose(raw_pose, self._anchor_tile)
+        else:
+            pose = raw_pose
+        self._displayed_pose = np.asarray(pose, dtype=float)
         try:
-            self._view_3d.show_pose(self._tile_system,
-                                     self._sim_result.poses[idx])
+            self._view_3d.show_pose(self._tile_system, pose,
+                                    highlight_tile=self._anchor_tile)
         except Exception:
             pass
+
+    def _mode11_pose_index_for_slider(self, slider_deg: float) -> int:
+        """Pose index whose *physical actuation* (closure) angle matches
+        the slider, for the mode-11 manifold-following sweep.
+
+        The slider maps linearly onto the mechanism's reachable range:
+        90°→rest (0 closure), 180°→+jamming (full closure, holes shut),
+        0°→−jamming. Poses are picked by their recorded
+        ``actuation_angles`` — the kite-vs-central relative rotation, i.e.
+        what the eye reads as "how far the units turned". Selecting on
+        that (rather than a single tile's rotation, which is ~half the
+        closure because the two families counter-rotate) is what removes
+        the old factor-of-2: slider 135° now shows ~45° of closure, not
+        ~90°."""
+        sr = self._sim_result
+        act_deg = np.degrees(np.asarray(sr.actuation_angles, dtype=float))
+        if act_deg.size == 0:
+            return 0
+        jam_deg = math.degrees(float(self._lattice.bipartite_jamming_angle()))
+        if jam_deg < 1e-6:
+            return int(np.argmin(np.abs(act_deg)))
+        target = (float(slider_deg) - _SLIDER_REST_DEG) / 90.0 * jam_deg
+        return int(np.argmin(np.abs(act_deg - target)))
 
     # ==================================================================
     # Mode toggle handler
@@ -939,6 +1201,15 @@ class SimulationPanel(QDockWidget):
             return   # only react to the "becoming-checked" half of the toggle
         self._scrub_mode = "dynamic" if button_id == 1 else "kinematic"
         self._dynamics_config_box.setVisible(self._scrub_mode == "dynamic")
+        # Stop any running playback — the tick handler reads scrub_mode
+        # at the top, so a stale cycle from the previous mode would
+        # otherwise keep firing.
+        if self._play_timer.isActive():
+            self._play_timer.stop()
+            self.play_button.blockSignals(True)
+            self.play_button.setChecked(False)
+            self.play_button.setText("▶ Play")
+            self.play_button.blockSignals(False)
         # Refresh the plot for the new mode and re-drive the slider so
         # the View3D pose updates to the right trajectory.
         self._update_plot()
@@ -979,6 +1250,83 @@ class SimulationPanel(QDockWidget):
             self._dynamics_result = None
             self._dynamics_error  = None
             self._update_state_dependent_ui()
+
+    # ==================================================================
+    # Orientation slider handlers
+    # ==================================================================
+
+    def _build_rotation_from_orient_widgets(self) -> Rotation:
+        """Read the three orientation spinboxes back into a scipy
+        ``Rotation``. Slider and spin are kept in lock-step via
+        ``_on_orient_slider_changed`` / ``_on_orient_spin_value_changed``,
+        so the spin values are the canonical source."""
+        x = float(self._orient_spins["X"].value())
+        y = float(self._orient_spins["Y"].value())
+        z = float(self._orient_spins["Z"].value())
+        return Rotation.from_euler("xyz", [x, y, z], degrees=True)
+
+    def _on_orient_slider_pressed(self) -> None:
+        # Stash the current rotation so release can emit (old, new).
+        self._press_rotation = self._lattice.rigid_rotation
+
+    def _on_orient_slider_changed(self, axis: str, value: int) -> None:
+        if self._suspend:
+            return
+        self._suspend = True
+        try:
+            deg = float(value) / _ORIENT_SLIDER_SCALE
+            self._orient_spins[axis].setValue(deg)
+        finally:
+            self._suspend = False
+
+    def _on_orient_slider_released(self) -> None:
+        if self._suspend:
+            return
+        old = self._press_rotation
+        self._press_rotation = None
+        if old is None:
+            old = self._lattice.rigid_rotation
+        new = self._build_rotation_from_orient_widgets()
+        if _rotations_close(old, new):
+            return
+        self.rotationChangeRequested.emit(old, new)
+
+    def _on_orient_spin_value_changed(self, axis: str, value: float) -> None:
+        if self._suspend:
+            return
+        self._suspend = True
+        try:
+            sl = self._orient_sliders[axis]
+            sl.setValue(int(round(value * _ORIENT_SLIDER_SCALE)))
+        finally:
+            self._suspend = False
+
+    def _on_orient_spin_committed(self) -> None:
+        if self._suspend:
+            return
+        new = self._build_rotation_from_orient_widgets()
+        old = self._lattice.rigid_rotation
+        if _rotations_close(old, new):
+            return
+        self.rotationChangeRequested.emit(old, new)
+
+    def _sync_orient_widgets_from_lattice(self) -> None:
+        """Pull ``lattice.rigid_rotation`` back into the orientation
+        sliders + spinboxes. Decompose as XYZ extrinsic to match the
+        Inspector's spinboxes; suppress scipy's gimbal-lock warning so
+        Top/Front/Side preset rotations don't spam test output."""
+        import warnings
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                x, y, z = self._lattice.rigid_rotation.as_euler(
+                    "xyz", degrees=True)
+        except Exception:
+            x = y = z = 0.0
+        for axis, deg in (("X", x), ("Y", y), ("Z", z)):
+            self._orient_spins[axis].setValue(float(deg))
+            self._orient_sliders[axis].setValue(
+                int(round(float(deg) * _ORIENT_SLIDER_SCALE)))
 
     # ==================================================================
     # Force-table handlers (M2.9)
@@ -1105,7 +1453,15 @@ class SimulationPanel(QDockWidget):
     # ==================================================================
 
     def _on_play_toggled(self, checked: bool) -> None:
-        if checked and self._sim_result is not None and not self._is_outdated:
+        # In Dynamic mode play sweeps the slider 0%→100% so the user
+        # sees the piston pressing in from rest; in Kinematic mode it
+        # oscillates through the full bistable cycle.
+        kine_ready = (self._sim_result is not None
+                      and not self._is_outdated
+                      and self._scrub_mode == "kinematic")
+        dyn_ready  = (self._dynamics_result is not None
+                      and self._scrub_mode == "dynamic")
+        if checked and (kine_ready or dyn_ready):
             self._play_phase = 0
             self._play_timer.start()
             self.play_button.setText("⏸ Pause")
@@ -1115,15 +1471,22 @@ class SimulationPanel(QDockWidget):
             # If we got toggled OFF, leave slider where it landed.
 
     def _on_play_tick(self) -> None:
-        # 90 frames/cycle, sine oscillation:
-        # phase 0   : slider 90° (rest)
-        # phase π/2 : slider 180° (compressed-B)
-        # phase π   : slider 90° (back through rest)
-        # phase 3π/2: slider 0° (compressed-A)
-        # phase 2π  : slider 90° (cycle complete)
-        self._play_phase = (self._play_phase + 1) % _PLAY_CYCLE_FRAMES
-        phase = 2.0 * math.pi * (self._play_phase / _PLAY_CYCLE_FRAMES)
-        slider_deg = _SLIDER_REST_DEG + 90.0 * math.sin(phase)
+        if self._scrub_mode == "dynamic":
+            # Linear forward sweep, then loop. 0% → 100% over the cycle.
+            self._play_phase = (self._play_phase + 1) % _PLAY_CYCLE_FRAMES
+            frac = self._play_phase / max(_PLAY_CYCLE_FRAMES - 1, 1)
+            slider_deg = _SLIDER_MIN_DEG + frac * (
+                _SLIDER_MAX_DEG - _SLIDER_MIN_DEG)
+        else:
+            # 90 frames/cycle, sine oscillation:
+            # phase 0   : slider 90° (rest)
+            # phase π/2 : slider 180° (compressed-B)
+            # phase π   : slider 90° (back through rest)
+            # phase 3π/2: slider 0° (compressed-A)
+            # phase 2π  : slider 90° (cycle complete)
+            self._play_phase = (self._play_phase + 1) % _PLAY_CYCLE_FRAMES
+            phase = 2.0 * math.pi * (self._play_phase / _PLAY_CYCLE_FRAMES)
+            slider_deg = _SLIDER_REST_DEG + 90.0 * math.sin(phase)
         # Programmatic slider move — _on_slider_changed will drive
         # the pose via _drive_pose_from_slider.
         self._suspend = True

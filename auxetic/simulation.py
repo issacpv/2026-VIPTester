@@ -78,6 +78,15 @@ class SimResult:
       and positive halves of the sweep. ``None`` if no collision was
       seen on that side. Used by the GUI to render shaded
       "unreachable" regions on the sweep plot.
+    - ``actuation_angles`` (radians, shape ``(n_steps,)``) — the
+      *physical* mechanism actuation per sample, signed. For a
+      bipartite rotating-units lattice (mode 11) this is the relative
+      rotation between the corner-kite family and the central-polygon
+      family — the closure angle that runs 0 (rest) → jamming (holes
+      shut). Distinct from ``theta_samples``, which for the fixed-mode
+      ``sweep_theta`` is the abstract null-space amplitude; the
+      manifold-following ``sweep_mechanism`` sets the two equal. Empty
+      for sweeps that don't track actuation.
     """
     theta_samples:     np.ndarray
     poses:             np.ndarray
@@ -89,6 +98,8 @@ class SimResult:
         default_factory=lambda: np.zeros(0, dtype=bool))
     collision_theta_min:   float | None = None
     collision_theta_max:   float | None = None
+    actuation_angles:      np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=float))
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +165,11 @@ class TileSystem:
             tile_arrays_3d, source = _tiles.collect_kirigami_tiles(
                 lattice.points, lattice.tri, lattice.ratio,
                 lattice.mode, lattice.nz_layers,
+                # Mode 11: the solver starts from the rest tile (theta=0)
+                # and finds the deformation itself; pass the lattice's C
+                # so the rest tile matches the design.
+                bipartite_C=float(getattr(lattice, "C", 1.0)),
+                bipartite_theta=0.0,
             )
             constraint_tuples = _tiles.build_kirigami_constraints(
                 tile_arrays_3d, source,
@@ -326,6 +342,43 @@ class Simulator:
         t, R = self._decompose_pose(pose, tile_i)
         tile = self.tile_system.tiles[tile_i]
         return tile @ R.T + t
+
+    def relativize_pose(self, pose: np.ndarray, ref_tile: int) -> np.ndarray:
+        """Express ``pose`` in the frame of tile ``ref_tile``.
+
+        Returns a new pose, rigidly transformed so the reference tile sits
+        at its *rest* placement (identity rotation, zero translation) —
+        i.e. the reference polygon's own rigid motion (translation **and**
+        rotation/tilt) is subtracted from the whole structure, and every
+        other tile is shown relative to it.
+
+        Used by the GUI's "anchor view to a polygon" feature: in the
+        rotating-units mechanism the central polygons genuinely
+        counter-rotate, so anchoring to one and watching the rest move in
+        its frame isolates the relative kirigami motion from the global
+        tilt. The transform is the inverse of the reference tile's pose,
+        applied as a global rigid motion ``G(x) = R_ref⁻¹ (x − t_ref)`` —
+        so all constraints (coincident vertices) are preserved exactly.
+
+        ``ref_tile`` out of range returns an unchanged copy."""
+        pose = np.asarray(pose, dtype=float)
+        if not (0 <= int(ref_tile) < self.n_tiles):
+            return pose.copy()
+        out = pose.copy()
+        t_ref, R_ref = self._decompose_pose(pose, int(ref_tile))
+        R_g = R_ref.T
+        for i in range(self.n_tiles):
+            s = i * self.dofs
+            t_i, R_i = self._decompose_pose(pose, i)
+            t_new = R_g @ (t_i - t_ref)
+            R_new = R_g @ R_i
+            if self.dimension == 2:
+                out[s], out[s + 1] = t_new[0], t_new[1]
+                out[s + 2] = float(np.arctan2(R_new[1, 0], R_new[0, 0]))
+            else:
+                out[s:s + 3] = t_new
+                out[s + 3:s + 6] = Rotation.from_matrix(R_new).as_rotvec()
+        return out
 
     # ==================================================================
     # Constraint residual
@@ -792,6 +845,7 @@ class Simulator:
                      theta_max: float | None = None,
                      collision_stop: bool = False,
                      collision_tol: float = 1.0e-6,
+                     from_rest: bool = False,
                      ) -> SimResult:
         """Sweep θ along the kirigami mode and project to the manifold
         at each step.
@@ -823,6 +877,14 @@ class Simulator:
         recorded (the array shape stays predictable) but their
         ``collision_at_theta`` flag is True. Always False for 3D
         tile systems (collision detection is 2D-only in M2).
+
+        ``from_rest=True`` integrates outward from rest (θ=0) in both
+        directions instead of starting at ``-θ_max``. Use it for large
+        amplitudes (mode 11 actuates the rotating-units mechanism to
+        ~±90°): starting at ``-θ_max`` feeds ``project_to_manifold`` a
+        huge linear extrapolation that lands on a far/wrong branch and
+        leaves the rest pose drifted; marching from rest keeps θ=0
+        exact and follows the manifold accurately to large rotations.
         """
         if theta_max is None:
             theta_max = float(np.pi / 2.0)
@@ -859,39 +921,51 @@ class Simulator:
                 collision_at_theta=collision_flags,
             )
 
-        prev_pose = None
-        prev_theta = 0.0
-        for i, theta in enumerate(theta_samples):
-            if not warm_start or prev_pose is None:
-                initial = float(theta) * mode
-            else:
-                initial = prev_pose + float(theta - prev_theta) * mode
-            projected = self.project_to_manifold(initial)
+        def _record(i, projected):
             poses[i] = projected
             bbox_extents[i] = self._bbox_extents(projected)
             if collider is not None and collider.has_collision(projected):
                 collision_flags[i] = True
-                if theta < 0.0 and collision_theta_min is None:
-                    # First collision on the negative half (sweeping toward
-                    # rest the linspace passes here first, but the FIRST
-                    # collision on this half going outward from rest is the
-                    # one closest to 0, which is the LAST one we'll see in
-                    # the linspace order before crossing rest. Track all
-                    # negative-half collisions and pick the maximum θ later.
-                    pass
-                elif theta > 0.0 and collision_theta_max is None:
-                    collision_theta_max = float(theta)
-            prev_pose = projected
-            prev_theta = theta
 
-        # Resolve collision_theta_min: for the negative half, the
-        # *innermost* (closest to 0) collision is the bound — anything
-        # farther out has already collided. Pick the LARGEST negative θ
-        # that has a collision (i.e., the smallest |θ|).
+        if from_rest:
+            # March outward from the rest sample (θ ≈ 0) in both
+            # directions; each step warm-starts from the neighbour closer
+            # to the centre, so the rest pose is exact and the manifold
+            # is tracked accurately out to large rotations.
+            center = int(np.argmin(np.abs(theta_samples)))
+            _record(center, self.project_to_manifold(
+                float(theta_samples[center]) * mode))
+            for rng, nbr in ((range(center + 1, n_steps), -1),
+                             (range(center - 1, -1, -1), +1)):
+                for i in rng:
+                    theta = float(theta_samples[i])
+                    prev = poses[i + nbr]
+                    prev_theta = float(theta_samples[i + nbr])
+                    initial = (prev + (theta - prev_theta) * mode
+                               if warm_start else theta * mode)
+                    _record(i, self.project_to_manifold(initial))
+        else:
+            prev_pose = None
+            prev_theta = 0.0
+            for i, theta in enumerate(theta_samples):
+                if not warm_start or prev_pose is None:
+                    initial = float(theta) * mode
+                else:
+                    initial = prev_pose + float(theta - prev_theta) * mode
+                _record(i, self.project_to_manifold(initial))
+                prev_pose = poses[i]
+                prev_theta = theta
+
+        # Resolve the collision bounds from the recorded flags — the
+        # innermost (closest to 0) collision on each half is the reachable
+        # boundary; anything farther out has already collided. Order-
+        # independent, so it works for both sweep directions.
+        pos_collisions = theta_samples[(theta_samples > 0.0) & collision_flags]
+        if pos_collisions.size > 0:
+            collision_theta_max = float(pos_collisions.min())  # closest to 0
         neg_collisions = theta_samples[(theta_samples < 0.0) & collision_flags]
         if neg_collisions.size > 0:
             collision_theta_min = float(neg_collisions.max())  # closest to 0
-        # collision_theta_max already set on first hit going forward.
 
         # SPEC §7.4 Option A compression ratio. Only consider non-collided
         # samples — values past the collision boundary are physically
@@ -918,6 +992,202 @@ class Simulator:
             collision_at_theta=collision_flags,
             collision_theta_min=collision_theta_min,
             collision_theta_max=collision_theta_max,
+        )
+
+    # ==================================================================
+    # Mechanism actuation (physical closure angle)
+    # ==================================================================
+
+    def _bipartite_tile_groups(self) -> tuple[list[int], list[int]] | None:
+        """``(central_indices, corner_indices)`` from the tile source's
+        ``kind`` field (``'central'`` / ``'corner'``, set by
+        ``collect_kirigami_tiles`` for mode 11), or ``None`` when the
+        system isn't a 2D bipartite rotating-units tiling.
+
+        This is the only place the solver knows about the bipartite
+        construction; everything else stays mechanism-agnostic."""
+        if self.dimension != 2:
+            return None
+        central, corner = [], []
+        for i, src in enumerate(self.tile_system.tile_source):
+            kind = src.get("kind")
+            if kind == "central":
+                central.append(i)
+            elif kind == "corner":
+                corner.append(i)
+        if not central or not corner:
+            return None
+        return central, corner
+
+    def actuation_angle(self, pose: np.ndarray) -> float:
+        """Signed physical actuation of the mechanism at ``pose`` (radians).
+
+        For a bipartite rotating-units tiling this is the relative
+        rotation between the corner-kite family and the central-polygon
+        family — i.e. how far a kite has turned about its hinge *as seen
+        from its central neighbour*. This is the angle the eye reads as
+        "how far the units rotated", and the one that runs 0 (rest) →
+        jamming (holes shut).
+
+        The discovered floppy mode lets the two families counter-rotate,
+        so a single tile's rotation DOF is only ~half this value — using
+        it directly (as the per-tile ``max`` did) under-reports the
+        closure by ~2×.
+
+        Falls back to the largest per-tile rotation magnitude (unsigned)
+        when the system isn't bipartite-classified."""
+        rot = np.asarray(pose, dtype=float)[2::3]
+        groups = self._bipartite_tile_groups()
+        if groups is None:
+            return float(np.max(np.abs(rot))) if rot.size else 0.0
+        central, corner = groups
+        return float(np.mean(rot[corner]) - np.mean(rot[central]))
+
+    def _kirigami_tangent(self, pose: np.ndarray, prev_tangent: np.ndarray,
+                          rigid_orth: np.ndarray) -> np.ndarray | None:
+        """Unit kinematic-mode tangent at ``pose``: null space of J(pose)
+        with rigid-body modes removed, continued in the direction of
+        ``prev_tangent`` (so the path doesn't jump branches at a
+        crossing). Returns ``None`` if the mechanism has locked up (no
+        non-rigid null space — e.g. at jamming)."""
+        J = self.assemble_jacobian(pose)
+        null = scipy.linalg.null_space(J, rcond=1e-8)
+        if null.size == 0:
+            return None
+        if rigid_orth.shape[1] > 0:
+            null = null - rigid_orth @ (rigid_orth.T @ null)
+        U, S, _Vt = np.linalg.svd(null, full_matrices=False)
+        tol = max(1e-8, 1e-8 * (S[0] if S.size else 0.0))
+        basis = U[:, :int(np.sum(S > tol))]
+        if basis.shape[1] == 0:
+            return None
+        # Continue along prev_tangent by projecting it onto the current
+        # tangent space; this keeps a consistent branch through the sweep.
+        t = basis @ (basis.T @ prev_tangent)
+        n = float(np.linalg.norm(t))
+        if n < 1e-9:
+            t = basis[:, 0]
+            n = float(np.linalg.norm(t))
+            if n < 1e-12:
+                return None
+        t = t / n
+        if float(np.dot(t, prev_tangent)) < 0.0:
+            t = -t
+        return t
+
+    def sweep_mechanism(self, *, max_actuation: float | None = None,
+                         n_half_steps: int = 120,
+                         collision_stop: bool = False,
+                         collision_tol: float = 1.0e-6) -> SimResult:
+        """Predictor-corrector continuation of the kirigami mechanism.
+
+        Unlike :meth:`sweep_theta` — which extrapolates along the single
+        *rest-pose* mode and projects, and so saturates once the 1-DOF
+        manifold has curved away from that fixed direction — this method
+        re-evaluates the tangent at every step (``_kirigami_tangent``)
+        and follows the curved mechanism path out to large actuation.
+        That's what lets a rotating-units lattice reach its jamming angle
+        (full hole closure) instead of stalling part-way.
+
+        Marches outward from rest (actuation 0) in both directions until
+        ``|actuation|`` reaches ``max_actuation`` (default ``π/2``) or the
+        mechanism jams (tangent vanishes). Step length is adapted so the
+        recorded samples are spaced roughly uniformly in actuation angle.
+
+        ``theta_samples`` and ``actuation_angles`` are both set to the
+        signed actuation per sample, ascending from ``−max`` to ``+max``
+        with the exact rest pose (0) in the middle. Intended for mode 11;
+        for non-bipartite systems the actuation falls back to the largest
+        per-tile rotation (see :meth:`actuation_angle`)."""
+        if max_actuation is None:
+            max_actuation = float(np.pi / 2.0)
+        max_actuation = abs(float(max_actuation))
+
+        rest = self.rest_pose()
+        mode = self.identify_kirigami_mode()
+        if mode is None:
+            bbox = self._bbox_extents(rest)
+            zero = np.zeros(1, dtype=float)
+            _, info = self._compute_locking(None, 0.0)
+            return SimResult(
+                theta_samples=zero, poses=rest[None, :],
+                bbox_extents=bbox[None, :], compression_ratio=0.0,
+                locked=True, locking_info=info,
+                collision_at_theta=np.zeros(1, dtype=bool),
+                actuation_angles=zero.copy(),
+            )
+
+        # Orient the mode so the +tangent direction increases actuation.
+        if self.actuation_angle(rest + 1.0e-3 * mode) < 0.0:
+            mode = -mode
+        rigid_orth = scipy.linalg.orth(self._build_rigid_basis())
+
+        collider = None
+        if collision_stop and self.dimension == 2:
+            from .collision import CollisionChecker
+            collider = CollisionChecker(self.tile_system, tol=collision_tol)
+
+        target_inc = max_actuation / max(n_half_steps, 1)
+
+        def march(sign: int):
+            poses: list[np.ndarray] = []
+            acts:  list[float] = []
+            cols:  list[bool] = []
+            pose = rest.copy()
+            tangent = (sign * mode).copy()
+            a_prev = 0.0
+            h = target_inc
+            for _ in range(8 * n_half_steps):
+                tangent = self._kirigami_tangent(pose, tangent, rigid_orth)
+                if tangent is None:
+                    break
+                new = self.project_to_manifold(pose + h * tangent)
+                a_new = self.actuation_angle(new)
+                da = abs(a_new) - abs(a_prev)
+                if da <= 1.0e-5:
+                    break   # mechanism jammed / stalled — stop this half
+                poses.append(new)
+                acts.append(a_new)
+                cols.append(bool(collider.has_collision(new))
+                            if collider is not None else False)
+                pose, a_prev = new, a_new
+                # Adapt the step toward a uniform actuation increment.
+                h *= float(np.clip(target_inc / da, 0.3, 3.0))
+                h = float(np.clip(h, 1.0e-4, 10.0 * target_inc))
+                if abs(a_new) >= max_actuation - 1.0e-4:
+                    break
+            return poses, acts, cols
+
+        pos_p, pos_a, pos_c = march(+1)
+        neg_p, neg_a, neg_c = march(-1)
+
+        poses_list = list(reversed(neg_p)) + [rest.copy()] + pos_p
+        acts_list  = list(reversed(neg_a)) + [0.0]         + pos_a
+        cols_list  = list(reversed(neg_c)) + [False]       + pos_c
+
+        poses = np.asarray(poses_list, dtype=float)
+        acts  = np.asarray(acts_list, dtype=float)
+        bbox_extents = np.asarray(
+            [self._bbox_extents(p) for p in poses], dtype=float)
+        collision_flags = np.asarray(cols_list, dtype=bool)
+
+        valid_mask = ~collision_flags
+        axial = self._axial_index()
+        axial_extent = bbox_extents[:, axial]
+        comp_ratio = 0.0
+        if valid_mask.any():
+            valid_axial = axial_extent[valid_mask]
+            max_axial = float(valid_axial.max())
+            if max_axial > 0:
+                comp_ratio = (max_axial - float(valid_axial.min())) / max_axial
+
+        locked, locking_info = self._compute_locking(mode, comp_ratio)
+        return SimResult(
+            theta_samples=acts, poses=poses, bbox_extents=bbox_extents,
+            compression_ratio=comp_ratio, locked=locked,
+            locking_info=locking_info,
+            collision_at_theta=collision_flags,
+            actuation_angles=acts.copy(),
         )
 
     # ==================================================================

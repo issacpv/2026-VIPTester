@@ -24,6 +24,7 @@ from auxetic.geometry import (
     _orient_ccw,
     _quad_is_strictly_convex,
     apply_edge_flips,
+    edge_flip_apexes,
     flippable_edges,
     generate_points,
 )
@@ -205,3 +206,70 @@ def test_orient_ccw_swaps_when_needed():
     assert _orient_ccw([0, 1, 2], pts) == [0, 1, 2]
     # CW: swap b and c → should flip
     assert _orient_ccw([0, 2, 1], pts) == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# edge_flip_apexes — the corner pair a flip would connect.
+# ---------------------------------------------------------------------------
+
+def test_edge_flip_apexes_square_returns_other_diagonal():
+    """For the canonical square, the apexes of the current diagonal are
+    exactly the two endpoints of the *other* diagonal — and together
+    the four indices span all of {0, 1, 2, 3}."""
+    tri = _square_tri()
+    edge = flippable_edges(tri, SQUARE)[0]
+    apx = edge_flip_apexes(tri, edge)
+    assert apx is not None
+    c, d = apx
+    assert c < d                                  # returned sorted
+    assert {edge[0], edge[1], c, d} == {0, 1, 2, 3}
+    # The apex pair is the OTHER square diagonal.
+    assert (c, d) in [(0, 2), (1, 3)]
+    assert (c, d) != tuple(sorted(edge))
+
+
+def test_edge_flip_apexes_accepts_unsorted_edge():
+    tri = _square_tri()
+    a, b = flippable_edges(tri, SQUARE)[0]
+    # Passing the edge reversed must give the same apex pair.
+    assert edge_flip_apexes(tri, (b, a)) == edge_flip_apexes(tri, (a, b))
+
+
+def test_edge_flip_apexes_boundary_edge_returns_none():
+    """A hull (boundary) edge borders only one triangle — no flip,
+    so no apex pair."""
+    from scipy.spatial import ConvexHull
+    tri = _square_tri()
+    hull = ConvexHull(SQUARE)
+    a, b = sorted((int(hull.simplices[0][0]), int(hull.simplices[0][1])))
+    assert edge_flip_apexes(tri, (a, b)) is None
+
+
+def test_edge_flip_apexes_unknown_edge_returns_none():
+    tri = _square_tri()
+    assert edge_flip_apexes(tri, (0, 99)) is None
+
+
+def test_edge_flip_apexes_3d_returns_none():
+    pts = np.random.RandomState(0).rand(8, 3)
+    tri = Delaunay(pts)
+    assert edge_flip_apexes(tri, (0, 1)) is None
+
+
+def test_edge_flip_apexes_matches_apply_edge_flips_result():
+    """The apexes reported for an edge must be exactly the new edge
+    that ``apply_edge_flips`` introduces when that edge is flipped."""
+    np.random.seed(321)
+    pts, tri = generate_points(16, 1)
+    edge = flippable_edges(tri, pts)[0]
+    apx = edge_flip_apexes(tri, edge)
+    assert apx is not None
+    flipped = apply_edge_flips(tri, pts, {edge})
+    # The flipped triangulation should contain the apex pair as an edge.
+    new_edges = set()
+    for s in flipped.simplices:
+        v = [int(x) for x in s]
+        for k in range(3):
+            e = tuple(sorted((v[k], v[(k + 1) % 3])))
+            new_edges.add(e)
+    assert apx in new_edges

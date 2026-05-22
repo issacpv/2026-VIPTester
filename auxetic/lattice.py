@@ -51,9 +51,13 @@ from . import export as _export
 # Modes 7, 8, 9 are mesh-import variants of 1, 2, 3 respectively.
 # Mode 10 is the rotating-cuboids 3D kirigami (sibling of mode 6 but
 # with cube tiles instead of tetrahedra).
+# Mode 11 is the bipartite-polygon auxetic (Acuna et al. 2022): a 2D
+# point cloud is Delaunay-triangulated and the corner/centroid
+# bipartition drives the polygon network (see ``auxetic.bipartite``).
 _3D_MODES = (3, 6, 9, 10)
-_DELAUNAY_MODES = (1, 2, 3, 7, 8, 9)  # modes that re-Delaunay on each retriangulation
+_DELAUNAY_MODES = (1, 2, 3, 7, 8, 9, 11)  # modes that re-Delaunay on each retriangulation
 _CUBOID_MODES = (10,)                  # modes that bypass Delaunay entirely
+_BIPARTITE_MODES = (11,)               # modes built via auxetic.bipartite
 
 # Lattice-space centroid that all rigid rotations / flips pivot around.
 _CENTROID = np.array([0.5, 0.5, 0.5])
@@ -74,12 +78,17 @@ class Lattice:
                  edge_flips=None,
                  mesh_path: str | None = None,
                  mesh_vertices: np.ndarray | None = None,
-                 unit_scale_cm: float = 1.0):
+                 unit_scale_cm: float = 1.0,
+                 # Mode-11 bipartite auxetic: constant size ratio C =
+                 # b_ji / a_ij (Acuna et al. 2022, step 3). Ignored by
+                 # every other mode. C=1 is the symmetric midpoint case.
+                 C: float = 1.0):
         self.mode      = mode
         self.n_points  = n_points
         self.ratio     = ratio
         self.nz_layers = nz_layers
         self.seed      = seed
+        self.C         = float(C)
 
         # Shape parameters per SPEC §5.1's ``shape_params`` block.
         self.ngon_thickness      = (_geom.NGON_THICKNESS      if ngon_thickness      is None else float(ngon_thickness))
@@ -453,6 +462,16 @@ class Lattice:
         canonical points (Nx2 or Nx3). Stored points unchanged."""
         return self._apply_matrix(self.world_transform(), self.points)
 
+    def transform_points(self, points: np.ndarray) -> np.ndarray:
+        """Apply the current ``world_transform`` to an arbitrary (N, D)
+        point array (D ∈ {2, 3}).
+
+        Lets a view render *derived* geometry — e.g. mode-11 bipartite
+        polygon vertices — in the same oriented frame as
+        ``transformed_points()`` without reaching into the private
+        matrix helper. Stored points are untouched."""
+        return self._apply_matrix(self.world_transform(), points)
+
     def _transform_collection(self, collection: Iterable, M: np.ndarray) -> list:
         """Map ``_apply_matrix`` over an iterable of point arrays
         (e.g. triangle list, strut curves, tile vertex arrays)."""
@@ -464,6 +483,16 @@ class Lattice:
     # ==================================================================
 
     def _ensure_export_geometry(self):
+        # Mode-11 geometry depends on the live joint angle (the kite
+        # rotation), which changes without a re-triangulation — so the
+        # cache would go stale. Rebuild it every call instead.
+        if self.mode in _BIPARTITE_MODES:
+            (self._strut_curves,
+             self._solid_triangles,
+             self._joint_positions) = _geom.collect_export_geometry(
+                self.points, self.tri, self.ratio, self.mode, self.nz_layers,
+                bipartite_C=self.C, bipartite_theta=self._bipartite_theta())
+            return
         if self._strut_curves is None:
             (self._strut_curves,
              self._solid_triangles,
@@ -508,9 +537,59 @@ class Lattice:
                                ratio=self.ratio, verbose=verbose)
         return triangles
 
+    def bipartite_jamming_angle(self) -> float:
+        """The mechanism's jamming angle (radians) for the current
+        mode-11 lattice — the largest ``|theta|`` the kites can rotate
+        about their hinges before colliding with the central polygons.
+        Returns ``pi/2`` for non-bipartite modes."""
+        if self.mode not in _BIPARTITE_MODES or self.tri is None:
+            return float(math.pi / 2.0)
+        from . import bipartite as _bip
+        return _bip.jamming_angle(self.points,
+                                  np.asarray(self.tri.simplices), self.C)
+
+    def _bipartite_theta(self) -> float:
+        """Actuation angle for *static* mode-11 rendering — always 0
+        (rest).
+
+        The earlier deterministic per-kite spin (rotate each kite about
+        its hinge) pinwheeled because the kites weren't tied to each
+        other. It's been replaced by the coherent floppy-mode mechanism
+        the kirigami Simulator finds over the kite + central + bond tile
+        system. So the 2D/3D *design* views always show the rest tile;
+        the *deformation* is produced by the simulation (Run Simulation
+        → scrub), which keeps every hinge connected."""
+        return 0.0
+
+    def build_bipartite(self, theta: float | None = None):
+        """Build the bipartite polygon network for the current mode-11
+        lattice, actuated by the rotating-units mechanism.
+
+        Each corner kite is rotated about its hinge by ``theta`` (the
+        central polygons stay fixed). When ``theta`` is ``None`` the
+        lattice's ``joint_angle`` is used (clamped to the jamming angle),
+        so the simulation/kinematic angle slider drives the rotation.
+
+        Returns an :class:`auxetic.bipartite.BipartiteNetwork`. Polygons
+        are in **canonical** lattice space; pass each polygon's
+        ``vertices`` through :meth:`transform_points` to draw them in the
+        oriented world frame.
+
+        Raises ``RuntimeError`` for any non-bipartite mode."""
+        if self.mode not in _BIPARTITE_MODES:
+            raise RuntimeError(
+                f"build_bipartite() is only valid for bipartite modes "
+                f"{_BIPARTITE_MODES}; current mode is {self.mode}")
+        from . import bipartite as _bip
+        simplices = np.asarray(self.tri.simplices)
+        th = self._bipartite_theta() if theta is None else float(theta)
+        return _bip.build_bipartite_network(self.points, simplices,
+                                            self.C, theta=th)
+
     def collect_kirigami(self):
         tiles, source = _tiles.collect_kirigami_tiles(
-            self.points, self.tri, self.ratio, self.mode, self.nz_layers)
+            self.points, self.tri, self.ratio, self.mode, self.nz_layers,
+            bipartite_C=self.C, bipartite_theta=self._bipartite_theta())
         constraints = _tiles.build_kirigami_constraints(tiles, source)
         return tiles, source, constraints
 
