@@ -86,6 +86,25 @@ def test_inspector_binds_and_regenerates(main_window):
     assert win.lattice.ratio == pytest.approx(0.50)
 
 
+def test_tessellate_from_inspector_rebuilds_lattice(main_window):
+    """Task 6d: the inspector's Tessellate control rebuilds the lattice as a
+    2D equilateral-fill tessellation at the chosen density (geometry via
+    Lattice.from_tessellation). End-to-end: button click → request → swap."""
+    win = main_window
+    insp = win.inspector
+    assert hasattr(insp, "tess_n_triangles_spin")
+    assert hasattr(insp, "tessellate_button")
+
+    insp.tess_n_triangles_spin.setValue(60)
+    insp.tessellate_button.click()      # → tessellateRequested → MainWindow swap
+
+    lat = win.lattice
+    assert lat.mode in (1, 2, 4, 5, 11)            # a 2D mode
+    assert lat.points.ndim == 2 and lat.points.shape[1] == 2
+    assert lat.points.shape[0] > 5                 # 60-triangle fill >> default 5
+    assert win.undo_stack.count() == 0             # major action clears undo
+
+
 def test_export_stl_matches_direct_lattice_call(main_window, tmp_path):
     """MainWindow.export_stl(path) writes the same STL payload as
     Lattice.to_stl(path) — i.e. the GUI export path doesn't add any

@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
         self.inspector.rotationChangeRequested.connect(self._on_rotation_change_requested)
         self.inspector.flipChangeRequested.connect(self._on_flip_change_requested)
         self.inspector.meshImportRequested.connect(self._on_mesh_import_requested)
+        self.inspector.tessellateRequested.connect(self._on_tessellate_requested)
 
         dock = QDockWidget("Inspector", self)
         dock.setAllowedAreas(
@@ -763,6 +764,37 @@ class MainWindow(QMainWindow):
         self._current_path = None
         self.setWindowTitle(
             f"Auxetic Studio — {os.path.basename(path)} (mesh)")
+        self._refresh_state()
+
+    def _on_tessellate_requested(self, n_triangles):
+        """Replace ``self.lattice`` with an equilateral-fill tessellation of
+        a unit square at ~``n_triangles`` triangles (task 6d). Always a 2D
+        lattice; like mesh import / File→Open this is a major action that
+        clears the undo stack. The geometry is computed in ``auxetic``
+        (Lattice.from_tessellation); the GUI only drives it."""
+        from auxetic import Lattice
+        import numpy as np
+        boundary = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+        cur = int(getattr(self.lattice, "mode", 1))
+        mode = cur if cur in (1, 2, 4, 5, 11) else 1
+        try:
+            new_lattice = Lattice.from_tessellation(
+                boundary, n_triangles=int(n_triangles), mode=mode,
+                ratio=float(self.lattice.ratio))
+        except Exception as e:
+            QMessageBox.critical(self, "Tessellation failed", str(e))
+            return
+        self.lattice = new_lattice
+        self.inspector.set_lattice(self.lattice)
+        self.simulation_panel.set_lattice(self.lattice)
+        self.predictor_panel.set_lattice(self.lattice)
+        self.coordinates_panel.set_lattice(self.lattice)
+        self.undo_stack.clear()
+        self._current_path = None
+        self.setWindowTitle("Auxetic Studio — tessellation")
+        self.statusBar().showMessage(
+            f"Tessellated square (~{int(n_triangles)} triangles → "
+            f"{len(self.lattice.points)} points)")
         self._refresh_state()
 
     def _on_save(self):

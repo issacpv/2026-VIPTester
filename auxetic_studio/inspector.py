@@ -106,6 +106,8 @@ class InspectorPanel(QWidget):
     flipChangeRequested     = pyqtSignal(bool, bool)
     # path: str, decimate_to: int | None
     meshImportRequested     = pyqtSignal(str, object)
+    # n_triangles: int — request an equilateral-fill tessellation (task 6d)
+    tessellateRequested     = pyqtSignal(int)
 
     def __init__(self, lattice, parent=None):
         super().__init__(parent)
@@ -319,6 +321,30 @@ class InspectorPanel(QWidget):
         bez_form.addRow(QLabel("Segments"), self.bezier_segments_spin)
 
         outer.addWidget(bezier_box)
+
+        # =================================================================
+        # Tessellation section (task 6d) — fill a square region with an
+        # equilateral-fill triangular lattice at a chosen density. Builds a
+        # fresh 2D lattice via Lattice.from_tessellation (geometry in
+        # auxetic/); a major action like mesh import.
+        # =================================================================
+        tess_box = QGroupBox("Tessellation", self)
+        tess_form = QFormLayout(tess_box)
+        self.tess_n_triangles_spin = QSpinBox(tess_box)
+        self.tess_n_triangles_spin.setRange(2, 4000)
+        self.tess_n_triangles_spin.setValue(50)
+        self.tess_n_triangles_spin.setToolTip(
+            "Approximate number of triangles to fill a unit-square region "
+            "with — higher = more points / finer mesh.")
+        self.tessellate_button = QPushButton("Tessellate square", tess_box)
+        self.tessellate_button.setToolTip(
+            "Replace the lattice with an equilateral-fill tessellation of a "
+            "square at the chosen triangle count (a 2D lattice; clears undo).")
+        self.tessellate_button.clicked.connect(self._on_tessellate_clicked)
+        tess_form.addRow(QLabel("Triangles"), self.tess_n_triangles_spin)
+        tess_form.addRow(self.tessellate_button)
+        outer.addWidget(tess_box)
+
         outer.addStretch(1)
 
         self.refresh_from_lattice()
@@ -548,6 +574,16 @@ class InspectorPanel(QWidget):
     def _on_bezier_segments_changed(self, value):
         old = int(getattr(self._lattice, "bezier_segments", 12))
         self._emit_param("bezier_segments", old, int(value))
+
+    # ---- tessellation handler (task 6d) ----------------------------------
+
+    def _on_tessellate_clicked(self):
+        """Request a tessellation rebuild at the chosen triangle count.
+        MainWindow runs the geometry via ``Lattice.from_tessellation`` and
+        swaps the lattice in (a major action, like mesh import)."""
+        if self._suspend:
+            return
+        self.tessellateRequested.emit(int(self.tess_n_triangles_spin.value()))
 
     # ---- density gradient handlers ---------------------------------------
 
