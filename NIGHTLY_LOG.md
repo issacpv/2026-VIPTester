@@ -315,7 +315,7 @@ not commit them unless a task needs one as a test fixture.
 | 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
 | 4 | Desktop-shortcut launch is slow — speed up cold start | DONE (investigation; no safe code win — see notes) |
 | 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | DONE (34250a5) |
-| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e (583231d), 6a (762bd45), 6b (3ef75b5) DONE; 6c–6d TODO |
+| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e (583231d), 6a (762bd45), 6b (3ef75b5), 6c (0a2694f) DONE; 6d TODO |
 
 **Working order (risk-managed, isolated/cheap first → big features last):**
 6e (remove buttons — trivial) → 3 (small render fix) → 2 (render fix, same redraw path)
@@ -763,4 +763,42 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
   that takes a triangle index). 2D picking already exists; 3D is new. Selection /
   ν computation in `auxetic/`; the GUI only displays. Working order: … 6b → **6c**
   → 6d.
+
+### Iteration 9 (2026-05-22) — Task 6c Ctrl-click triangle → ν (COMPLETE, 0a2694f)
+- **auxetic/ (selection + ν, tested).** `Lattice.poisson_ratio_at_point(point,
+  theta=0.1, *, world=True)`: inverse-`world_transform`s a world point to lattice
+  space, finds the containing Delaunay triangle via `tri.find_simplex` (nearest-
+  centroid fallback outside the hull), returns `(triangle_index,
+  generalized_poisson_ratio(tri, C, theta))`. `(None, nan)` for 3D / no tri. The
+  per-triangle counterpart of `edge_vector_poisson_ratio` (6b = whole-structure
+  mean; 6c = one triangle).
+- **views.py.** New `trianglePoissonPicked` signal. Reused the existing surface
+  picker but `_on_surface_pick` now branches on the **Ctrl** modifier (read via
+  `QApplication.keyboardModifiers()` at pick time, since the VTK callback doesn't
+  carry it): plain left-click → `surfacePointPicked` (anchor, unchanged);
+  Ctrl+left-click → `trianglePoissonPicked`.
+- **main_window.py.** Connected `trianglePoissonPicked` → `_on_triangle_poisson_
+  picked`, which calls the Lattice method and shows "Triangle k: ν = ±x.xxxx" in
+  the status bar (formatting only; geometry in auxetic/).
+- **Tests.** `test_edge_poisson.py` +5 pure (containing triangle; equilateral→-1;
+  world==lattice under identity orientation; 3D→None; outside-hull fallback).
+  `test_simulation_gui.py` +1 (handler → status-bar path headlessly; None pick safe).
+- **HONEST CAVEATS.** (1) The actual Ctrl+left-click INTERACTION — VTK's pick
+  observer firing on a Ctrl-modified click + the modifier read — can't be asserted
+  headlessly; a human must confirm the readout appears on Ctrl-click and the plain
+  click still anchors (if VTK's interactor style swallows Ctrl+Left, the modifier
+  may need a different gesture). (2) World→lattice mapping is exact under the
+  default identity orientation; for a rotated raw-coordinate lattice the existing
+  `world_transform` (rotates about the 0.5,0.5,0.5 centroid) is a pre-existing
+  quirk → mapping may be approximate. (3) During an active sim pose, mapping uses
+  the static lattice triangulation (ν is a static per-triangle property anyway).
+- Full suite **555 passed, 1 skipped** (+6), 0 failures, EXIT 0 (5m20s). Regression
+  byte-identical.
+- **Next step (LAST sub-step):** Task 6d — tessellation in the GUI. `auxetic/
+  tessellation.py::generate_tessellation` + `Lattice.from_tessellation` exist with
+  NO GUI entry point. Add inspector controls (density via `target_edge` and/or
+  `n_triangles` spinbox + a boundary source) wired through `Lattice.from_tessellation`
+  (no geometry in the GUI). If it changes persisted lattice state, bump the preset
+  version + add a migration. Working order: … 6c → **6d** (then Batch 2 COMPLETE →
+  full-suite verify → final summary → STOP).
 
