@@ -315,7 +315,7 @@ not commit them unless a task needs one as a test fixture.
 | 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
 | 4 | Desktop-shortcut launch is slow — speed up cold start | DONE (investigation; no safe code win — see notes) |
 | 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | DONE (34250a5) |
-| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e (583231d), 6a (762bd45), 6b (3ef75b5), 6c (0a2694f) DONE; 6d TODO |
+| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | DONE — 6e (583231d), 6a (762bd45), 6b (3ef75b5), 6c (0a2694f), 6d (207fc07) |
 
 **Working order (risk-managed, isolated/cheap first → big features last):**
 6e (remove buttons — trivial) → 3 (small render fix) → 2 (render fix, same redraw path)
@@ -801,4 +801,79 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
   (no geometry in the GUI). If it changes persisted lattice state, bump the preset
   version + add a migration. Working order: … 6c → **6d** (then Batch 2 COMPLETE →
   full-suite verify → final summary → STOP).
+
+### Iteration 10 (2026-05-22) — Task 6d tessellation GUI (COMPLETE, 207fc07)
+- **Shipped.** Gave `Lattice.from_tessellation` a GUI entry point. Inspector
+  "Tessellation" group: `tess_n_triangles_spin` (chose `n_triangles` as the
+  clearer "more triangles" density control over `target_edge`) + "Tessellate
+  square" button → new `tessellateRequested(int)` signal. `MainWindow.
+  _on_tessellate_requested` builds a fresh 2D lattice via
+  `Lattice.from_tessellation(unit_square, n_triangles=N, mode=<current 2D else 1>)`
+  and swaps it in by mirroring the proven mesh-import path (rebind inspector /
+  sim / predictor / coordinates panels, clear undo, refresh). Geometry stays in
+  `auxetic/`.
+- **Boundary decision (documented).** Used a fixed unit-square boundary (the
+  spec's "boundary source" left open). It's the clearest "fill a region at density
+  N" UX without a boundary-drawing tool; a richer source (current hull / drawn
+  polygon) is a noted future enhancement.
+- **No preset bump (justified).** The result is an ordinary 2D lattice; its saved
+  points + Delaunay-on-load reproduce the convex-square tessellation, so the
+  existing schema round-trips it — no new persisted state, so no version bump /
+  migration needed (per the "only bump if persisted state changes" rule).
+- **Test.** `test_app.py`: end-to-end — clicking the inspector button rebuilds the
+  lattice as a 2D tessellation with more points and clears the undo stack.
+- Full suite **556 passed, 1 skipped** (+1), 0 failures, EXIT 0 (5m10s). `auxetic/`
+  untouched this iteration.
+
+---
+
+## Final summary (Batch 2)
+
+**Status: COMPLETE. All 6 Batch-2 tasks (1–5 + 6a–6e) meet their acceptance
+criteria; full suite green — 556 passed, 1 skipped [openscad CLI absent], 0
+failures, EXIT 0.** Branch `nightly/auto-2026-05-22`, ~20 commits on top of Batch 1.
+
+What shipped (risk-managed order 6e → 3 → 2 → 1 → 4 → 5 → 6a–6d):
+- **6e — remove Top/Bottom/Front/Back/Side camera buttons (583231d).** Dropped the
+  5 toolbar actions + their orphaned `View3D.camera_*` methods; kept Iso/Fit + the
+  XYZ gizmo; Inspector orientation buttons untouched. Nav test trimmed, all 6
+  functions kept (composition preserved).
+- **3 — anchor highlight visible from all sides (9e82a3c).** The gold ring was
+  lifted +Z so the mesh occluded it from below; `_force_actor_on_top` (large
+  negative coincident-topology depth offsets) makes it render over the mesh from
+  any angle. 4 pure mapper-call tests.
+- **2 — sim-playback flicker (93cc348).** `remove_actor`+`add_mesh` at default
+  `render=True` drew an empty frame mid-swap; `_swap_mesh_actor` issues both with
+  `render=False` and batches a single render. 3 pure smoke tests.
+- **1 — bezier struts curve inward (5f99d7f).** Flipped the bow reference from
+  away-from-centroid to toward-centroid → concave/re-entrant (the auxetic look).
+  OFF byte-identical; 2 direction tests fail on the old sign.
+- **4 — slow cold start (investigation, 034e45a).** ML already lazy; matplotlib
+  import forced by pyvista; dominant cost is the 3D stack + scipy (needs a
+  high-risk lazy-View3D — flagged for human). No safe code win; `.lnk` advice given.
+  (A sim-panel matplotlib deferral was tried + reverted: it destabilised the GUI
+  teardown race — the eager FigureCanvas incidentally stabilises it.)
+- **5 — kinematic sim off the UI thread (34250a5).** `_solve_kinematic` (pure) +
+  `_SimWorker` QThread mirroring predictor; Run button toggles to Cancel.
+  `run_simulation()` stays synchronous for the 16 test callers → suite never spins
+  a worker → teardown race untouched. 3 pure tests (worker == direct Simulator).
+- **6a — Poisson tracked-points + bbox overlay (762bd45).** Simulator geometry API
+  (`all_world_vertices`/`bbox_bounds`/`bbox_corners`/`bbox_extreme_vertices`) +
+  View3D overlay (two AABB wireframes + per-axis extreme points, X/Y/Z colours).
+- **6b — full-structure ν readout (3ef75b5).** Surfaced the edge-vector full-
+  structure ν (the true −1 on EqHex, where the bbox ν reads ~0) in the sim readout.
+- **6c — Ctrl-click a triangle → its ν (0a2694f).** `Lattice.poisson_ratio_at_point`
+  (world→lattice→triangle→`generalized_poisson_ratio`) + a Ctrl-modified pick →
+  status-bar readout.
+- **6d — tessellation GUI (207fc07).** Inspector control → `Lattice.from_tessellation`.
+
+**Caveats requiring a human (visual / interaction — not headlessly verifiable,
+flagged honestly in-line above):** anchor visibility from below (3); playback
+smoothness (2); bezier curve matching the drawing on EqTri (1); the Poisson overlay
+rendering + its deferred slider-animation (6a); the Ctrl+left-click VTK interaction
+(6c); the tessellation result on screen (6d). All geometry/numerics are tested
+purely in `auxetic/`; `test_regression.py` and the load-bearing `test_app.py`
+STL-diff test stayed green throughout and were never modified.
+
+**STOP.** All Batch-2 tasks DONE, full suite green. No new work invented.
 
