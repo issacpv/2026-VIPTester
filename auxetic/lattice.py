@@ -82,13 +82,30 @@ class Lattice:
                  # Mode-11 bipartite auxetic: constant size ratio C =
                  # b_ji / a_ij (Acuna et al. 2022, step 3). Ignored by
                  # every other mode. C=1 is the symmetric midpoint case.
-                 C: float = 1.0):
+                 C: float = 1.0,
+                 # Bezier-curved strut edges (opt-in). Default OFF so every
+                 # mode's export is byte-for-byte identical to before.
+                 # ``bezier_strength`` is the perpendicular control-point
+                 # offset as a fraction of strut length; ``bezier_segments``
+                 # is the polyline tessellation density (>=2 to curve).
+                 bezier_enabled: bool = False,
+                 bezier_strength: float = 0.25,
+                 bezier_segments: int = 12):
         self.mode      = mode
         self.n_points  = n_points
         self.ratio     = ratio
         self.nz_layers = nz_layers
         self.seed      = seed
         self.C         = float(C)
+
+        # ---- Bezier-curved strut edges (opt-in, SPEC task 1) ------------
+        # When enabled, struts export as tessellated quadratic-Bezier
+        # polylines instead of straight 2-point segments. Default OFF =>
+        # byte-identical export. ``_clear_caches`` is triggered by
+        # :meth:`set_bezier` so a settings change re-runs the geometry.
+        self.bezier_enabled  = bool(bezier_enabled)
+        self.bezier_strength = float(bezier_strength)
+        self.bezier_segments = int(bezier_segments)
 
         # Shape parameters per SPEC §5.1's ``shape_params`` block.
         self.ngon_thickness      = (_geom.NGON_THICKNESS      if ngon_thickness      is None else float(ngon_thickness))
@@ -384,6 +401,29 @@ class Lattice:
         self._set_points_and_tri(original, new_tri)
 
     # ==================================================================
+    # Bezier-curved strut edges (SPEC task 1)
+    # ==================================================================
+
+    def set_bezier(self, *,
+                   enabled: bool | None = None,
+                   strength: float | None = None,
+                   segments: int | None = None) -> None:
+        """Update the Bezier-strut export options and invalidate the
+        cached export geometry so the next export/render re-runs with
+        the new settings. Only the provided fields change.
+
+        Curving is active only when ``enabled`` is true, ``strength`` is
+        non-zero, and ``segments >= 2``; otherwise struts export straight
+        (byte-for-byte identical to curves-off)."""
+        if enabled is not None:
+            self.bezier_enabled = bool(enabled)
+        if strength is not None:
+            self.bezier_strength = float(strength)
+        if segments is not None:
+            self.bezier_segments = int(segments)
+        self._clear_caches()
+
+    # ==================================================================
     # SPEC §6: world transform (rigid rotation + flip)
     # ==================================================================
 
@@ -491,7 +531,10 @@ class Lattice:
              self._solid_triangles,
              self._joint_positions) = _geom.collect_export_geometry(
                 self.points, self.tri, self.ratio, self.mode, self.nz_layers,
-                bipartite_C=self.C, bipartite_theta=self._bipartite_theta())
+                bipartite_C=self.C, bipartite_theta=self._bipartite_theta(),
+                bezier_enabled=self.bezier_enabled,
+                bezier_strength=self.bezier_strength,
+                bezier_segments=self.bezier_segments)
             return
         if self._strut_curves is None:
             (self._strut_curves,
@@ -499,7 +542,10 @@ class Lattice:
              self._joint_positions) = _geom.collect_export_geometry(
                 self.points, self.tri, self.ratio, self.mode, self.nz_layers,
                 cuboid_tiles=self.cuboid_tiles,
-                cuboid_constraints=self.cuboid_constraints)
+                cuboid_constraints=self.cuboid_constraints,
+                bezier_enabled=self.bezier_enabled,
+                bezier_strength=self.bezier_strength,
+                bezier_segments=self.bezier_segments)
 
     def build_export_triangles(self, **kwargs):
         """Final triangle list including strut tubes + joint spheres."""
