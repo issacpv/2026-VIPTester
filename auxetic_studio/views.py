@@ -1401,43 +1401,54 @@ class View3D(QWidget):
     def show_poisson_tracking(self, initial_corners, final_corners,
                               initial_extremes, final_extremes,
                               expansion_corners=None,
-                              expansion_extremes=None) -> None:
+                              expansion_extremes=None,
+                              *, show_initial=True, show_compressed=True,
+                              show_expansion=True) -> None:
         """Draw the Poisson-tracking overlay: the rest ("initial"),
         compressed ("final") and — when supplied — fully-expanded
         ("expansion") axis-aligned bounding boxes as wireframes (initial
         grey, final white, expansion green), plus the per-axis extreme
         vertices that define them (initial X magenta / Y yellow / Z teal;
         final the same hues darker; expansion a distinct green/cyan family).
-        All geometry is computed in ``auxetic`` (Simulator) and passed in —
-        this method only renders. Headless-safe (records
-        ``last_poisson_tracking`` then no-ops without an interactor)."""
+        The ``show_*`` flags gate each box (+ its extreme points)
+        individually — a disabled box is neither drawn nor recorded (its
+        ``last_poisson_tracking`` geometry is ``None``). All geometry is
+        computed in ``auxetic`` (Simulator) and passed in — this method only
+        renders. Headless-safe (records ``last_poisson_tracking`` then
+        no-ops without an interactor)."""
+        def _vis(arr, show):
+            return None if (arr is None or not show) else np.asarray(arr, float)
+
         self.last_poisson_tracking = {
-            "initial_corners":  np.asarray(initial_corners, float),
-            "final_corners":    np.asarray(final_corners, float),
-            "initial_extremes": np.asarray(initial_extremes, float),
-            "final_extremes":   np.asarray(final_extremes, float),
-            "expansion_corners":  (None if expansion_corners is None
-                                   else np.asarray(expansion_corners, float)),
-            "expansion_extremes": (None if expansion_extremes is None
-                                   else np.asarray(expansion_extremes, float)),
+            "initial_corners":  _vis(initial_corners,  show_initial),
+            "final_corners":    _vis(final_corners,    show_compressed),
+            "initial_extremes": _vis(initial_extremes, show_initial),
+            "final_extremes":   _vis(final_extremes,   show_compressed),
+            "expansion_corners":  _vis(expansion_corners,  show_expansion),
+            "expansion_extremes": _vis(expansion_extremes, show_expansion),
+            "show_initial":    bool(show_initial),
+            "show_compressed": bool(show_compressed),
+            "show_expansion":  bool(show_expansion),
         }
         if self.interactor is None:
             return
         self._clear_poisson_actors(render=False)
         try:
-            self._add_bbox_wireframe(initial_corners, color="#8a8a8a", width=2)
-            self._add_bbox_wireframe(final_corners,   color="#f0f0f0", width=3)
             # X magenta, Y yellow, Z teal; final poses use darker shades.
             init_colors  = ("#ff00ff", "#ffd400", "#17becf")
             final_colors = ("#800080", "#8a7400", "#0a6b75")
-            self._add_extreme_points(initial_extremes, init_colors,  size=11)
-            self._add_extreme_points(final_extremes,   final_colors, size=15)
+            if show_initial:
+                self._add_bbox_wireframe(initial_corners, color="#8a8a8a", width=2)
+                self._add_extreme_points(initial_extremes, init_colors, size=11)
+            if show_compressed:
+                self._add_bbox_wireframe(final_corners, color="#f0f0f0", width=3)
+                self._add_extreme_points(final_extremes, final_colors, size=15)
             # Expansion box (max axial extent): a distinct green/cyan family
             # so it reads apart from the grey/white compression pair.
-            if expansion_corners is not None:
+            if show_expansion and expansion_corners is not None:
                 self._add_bbox_wireframe(
                     expansion_corners, color="#33dd55", width=3)
-            if expansion_extremes is not None:
+            if show_expansion and expansion_extremes is not None:
                 exp_colors = ("#39ff14", "#00e5ff", "#1de9b6")
                 self._add_extreme_points(
                     expansion_extremes, exp_colors, size=15)

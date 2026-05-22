@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QFormLayout,
     QGroupBox,
+    QCheckBox,
     QLabel,
     QSlider,
     QDoubleSpinBox,
@@ -285,6 +286,7 @@ class SimulationPanel(QDockWidget):
         self._build_run_row(outer)
         self._build_dynamics_config_box(outer)
         self._build_joint_slider_box(outer)
+        self._build_poisson_bounds_box(outer)
         self._build_plot(outer)
         self._build_readout(outer)
 
@@ -513,6 +515,27 @@ class SimulationPanel(QDockWidget):
         slider_layout.addWidget(self.spin)
 
         form.addRow(QLabel("θ"), slider_row)
+        outer.addWidget(box)
+
+    def _build_poisson_bounds_box(self, outer):
+        """Per-bound visibility toggles for the Poisson-tracking overlay
+        (Batch 3 task 3). Pure GUI visibility state — toggling a box shows/
+        hides its wireframe + extreme points; the geometry is unchanged."""
+        box = QGroupBox("Poisson bounds", self)
+        layout = QHBoxLayout(box); layout.setContentsMargins(8, 4, 8, 4)
+        self.show_initial_cb    = QCheckBox("Initial", box)
+        self.show_compressed_cb = QCheckBox("Compressed", box)
+        self.show_expansion_cb  = QCheckBox("Expansion", box)
+        for cb in (self.show_initial_cb, self.show_compressed_cb,
+                   self.show_expansion_cb):
+            cb.setChecked(True)
+            # Re-render the overlay live when a box is toggled.
+            cb.toggled.connect(self._update_poisson_tracking)
+            layout.addWidget(cb)
+        layout.addStretch(1)
+        box.setToolTip(
+            "Show/hide the rest, most-compressed and most-expanded "
+            "bounding boxes of the kinematic sweep.")
         outer.addWidget(box)
 
     def _build_plot(self, outer):
@@ -839,9 +862,10 @@ class SimulationPanel(QDockWidget):
         three bounding boxes and the per-axis extreme points the Poisson
         calc tracks. When a polygon is anchored, the bounds are computed in
         that polygon's frame so they enclose the on-screen (relativized)
-        structure. Clears the overlay when there's no fresh kinematic
-        result. No-op without a 3D view. All geometry comes from the
-        Simulator (auxetic/), not here."""
+        structure. The three "Poisson bounds" checkboxes gate which boxes
+        draw (pure visibility; geometry unchanged). Clears the overlay when
+        there's no fresh kinematic result. No-op without a 3D view. All
+        geometry comes from the Simulator (auxetic/), not here."""
         view = self._view_3d
         if view is None:
             return
@@ -877,6 +901,9 @@ class SimulationPanel(QDockWidget):
                 sim.bbox_extreme_vertices(final_pose),
                 sim.bbox_corners(expansion_pose),
                 sim.bbox_extreme_vertices(expansion_pose),
+                show_initial=self.show_initial_cb.isChecked(),
+                show_compressed=self.show_compressed_cb.isChecked(),
+                show_expansion=self.show_expansion_cb.isChecked(),
             )
         except Exception:
             view.clear_poisson_tracking()

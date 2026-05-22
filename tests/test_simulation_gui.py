@@ -153,6 +153,40 @@ def test_anchored_poisson_bounds_use_relativized_poses(main_window):
         assert not np.allclose(tracking["final_corners"], abs_comp)
 
 
+def test_poisson_bound_toggles_hide_individual_boxes(main_window):
+    """Batch 3 task 3: the three Poisson-bound checkboxes gate which boxes
+    reach the view. Unchecking one omits its geometry from the recorded
+    overlay (None) and flips its visibility flag — and toggling re-renders
+    live; re-checking restores it. The other boxes are unaffected."""
+    win = main_window
+    panel = win.simulation_panel
+    panel.run_simulation()
+    tr = win.view_3d.last_poisson_tracking
+    assert tr is not None
+    dim = panel._tile_system.dimension
+    # Default: all three boxes present and flagged visible.
+    assert tr["initial_corners"].shape == (2 ** dim, dim)
+    assert tr["final_corners"].shape == (2 ** dim, dim)
+    assert tr["expansion_corners"].shape == (2 ** dim, dim)
+    assert tr["show_initial"] and tr["show_compressed"] and tr["show_expansion"]
+
+    # Unchecking "Compressed" re-renders live (toggled → _update_poisson_
+    # tracking) and omits ONLY that box's geometry; the others are intact.
+    panel.show_compressed_cb.setChecked(False)
+    tr = win.view_3d.last_poisson_tracking
+    assert tr["show_compressed"] is False
+    assert tr["final_corners"] is None
+    assert tr["final_extremes"] is None
+    assert tr["initial_corners"].shape == (2 ** dim, dim)
+    assert tr["expansion_corners"].shape == (2 ** dim, dim)
+
+    # Re-checking restores it.
+    panel.show_compressed_cb.setChecked(True)
+    tr = win.view_3d.last_poisson_tracking
+    assert tr["show_compressed"] is True
+    assert tr["final_corners"].shape == (2 ** dim, dim)
+
+
 # ---------------------------------------------------------------------------
 # 1c. Ctrl-click a triangle in 3D shows its ν in the status bar (task 6c)
 # ---------------------------------------------------------------------------
