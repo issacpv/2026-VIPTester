@@ -313,7 +313,7 @@ not commit them unless a task needs one as a test fixture.
 | 1 | Bezier strut curving is wrong — fix curve direction/shape to match intent | DONE (5f99d7f) |
 | 2 | Kinematic sim playback flickers / mesh disappears mid-motion | DONE (93cc348) |
 | 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
-| 4 | Desktop-shortcut launch is slow — speed up cold start | TODO |
+| 4 | Desktop-shortcut launch is slow — speed up cold start | DONE (investigation; no safe code win — see notes) |
 | 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | TODO |
 | 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e DONE (583231d); 6a–6d TODO |
 
@@ -591,4 +591,55 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
   before/after; `tests/test_app.py` green. CAVEAT: part is OS `.lnk` config (lives
   on the Windows Desktop, outside the repo) — optimize imports regardless, advise
   on the shortcut separately. Working order: 6e → 3 → 2 → 1 → **4** → 5 → 6a–6d.
+
+### Iteration 5 (2026-05-22) — Task 4 slow cold start (INVESTIGATION; no safe code change)
+- **Measured cold start.** `import auxetic_studio` ≈ **4.1s** (Python 3.14, this
+  machine). importtime breakdown (cumulative): pyvistaqt 1.28s, pyvista.plotting
+  1.03s, scipy.spatial 0.93s, matplotlib.pyplot 0.54s, vtk 1.08s, pyqtgraph 0.39s.
+- **torch / ML already lazy ✓ (prime suspect ruled out).** `predictor_panel.py`
+  imports `auxetic_ml` only inside methods (lines 87/88/376/392/411/424/425); no
+  eager torch anywhere in `auxetic_studio` or `auxetic`. So ML is NOT on the
+  startup path. Good.
+- **matplotlib import is forced by pyvista, not by us.** Traced the first
+  matplotlib import to `pyvista/plotting/colors.py:21` (`from matplotlib import
+  colormaps`), pulled in via `pyvistaqt` at startup. `matplotlib.pyplot` is also
+  loaded by the 3D stack. So the 0.5s matplotlib cost is NOT deferrable while we
+  import the 3D viewport at startup.
+- **The only deferrable bit in our code (~30ms) is actively UNSAFE.** I tried
+  making `simulation_panel`'s matplotlib plot lazy (placeholder until first sim;
+  `_ensure_plot_built`). Measured win was tiny: backend_qtagg+figure import is only
+  ~12ms once matplotlib core is loaded (pyvista loads it anyway), + ~18ms Figure
+  construction. **And it broke the suite:** the full suite went EXIT 127 (hard
+  abort) reliably at the 2nd MainWindow lifetime (`test_bezier_gui`'s first test),
+  twice. **Finding:** the eagerly-created matplotlib `FigureCanvas` is
+  *incidentally* stabilizing the documented Win+PyQt6+pyvistaqt teardown race;
+  removing it from the default MainWindow flips the race into a reliable crash.
+  **Reverted** (`git checkout`); full suite back to **538 passed, 1 skipped,
+  EXIT 0** — confirming the revert and that the change was the cause.
+- **Conclusion / recommendation (honest).**
+  1. The import chain is already lean: ML lazy, no stray eager heavy imports of
+     ours. The 4.1s is dominated by libraries genuinely needed at startup — the 3D
+     viewport stack (vtk+pyvista+pyvistaqt ≈ 2.3s, incl. matplotlib) and scipy
+     (≈0.9s, Delaunay for the default lattice). Deferring scipy only shifts its
+     cost from import-phase to first-triangulation (still at startup) — no win.
+  2. **Biggest lever = defer the 3D stack via a lazy View3D** (construct the
+     pyvistaqt interactor only when the 3D view first shows). This is the only
+     change that could cut ~2s, BUT it touches the most fragile code (the 3D
+     viewport + the load-bearing `test_app.py` STL-diff test) and the teardown
+     race just proved how sensitive that area is. **Deferred — flagged for human
+     review; too risky for an autonomous run.**
+  3. **`.lnk` (the actual likely culprit):** the shortcut lives on the Windows
+     Desktop, outside the repo. If it activates a conda/venv each launch, that env
+     activation often dwarfs the 4s import. **Advise:** point the shortcut directly
+     at the env's `pythonw.exe` (e.g. `...\envs\auxetic\pythonw.exe -m
+     auxetic_studio`), no per-launch activation; and a splash/"Loading…" window for
+     perceived speed.
+- No functional regression (no code change landed); `tests/test_app.py` green in
+  the full suite (538 passed).
+- **Next step:** Task 5 — kinematic sim runs synchronously on the UI thread and
+  freezes the app. Move the solve to a `QThread`/`QRunnable` worker (mirror
+  `predictor_panel.py`'s background worker), emit progress+result signals, add a
+  cancel path; keep ALL numerics in `auxetic/` (worker only calls `Lattice` /
+  `Simulator`). Lock with a test: worker output == synchronous `Simulator` output.
+  Coherent with Task 2. Working order: 6e → 3 → 2 → 1 → 4 → **5** → 6a–6d.
 
