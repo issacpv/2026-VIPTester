@@ -13,9 +13,9 @@ This file is the cross-iteration state. Read it FIRST every iteration.
 | # | Task | Status |
 |---|------|--------|
 | 3 | Zoom-to-cursor in the 3D view | DONE (13fd991) |
-| 2 | SCAD intact — integration test guarding to_scad | DONE (commit) |
-| 1 | Bezier-curve edges before export | IN PROGRESS (next) |
-| 5 | Tessellation generator | PENDING |
+| 2 | SCAD intact — integration test guarding to_scad | DONE (7b00de6) |
+| 1 | Bezier-curve edges before export | DONE (8a8c282, aedd64a, ccd873c) |
+| 5 | Tessellation generator | IN PROGRESS (next) |
 | 4 | Generalized Poisson's ratio on triangle edge vectors | PENDING |
 
 Working order: 3 → 2 → 1 → 5 → 4 (risk-managed, per prompt).
@@ -113,12 +113,65 @@ Working order: 3 → 2 → 1 → 5 → 4 (risk-managed, per prompt).
     polyline, endpoints preserved, midpoint offset along normal); all three
     exporters with curves ON produce valid output; with OFF byte-identical
     (regression already covers OFF for modes 1-9). Reuse test_scad_export guard.
-- **Next step:** read `auxetic_studio/preset.py` (current version + migration
-  pattern) and the inspector panel to find where to add the GUI control; confirm
-  whether tile/strut EDGES vs strut CURVES is the right curve target (struts are
-  the clean target; "tile edges" => curve the polygon outline before extrude —
-  decide scope). Then implement `bezier_polyline` + wire `add_strut`, update SCAD
-  per-segment cylinders, preset v6 + migration, GUI control, tests.
+- **Next step (was):** implement bezier core, preset, GUI. (DONE — see below.)
+
+### Iteration 5 (2026-05-22) — Task 1 bezier edges (COMPLETE)
+- **Scope decision:** bezier curving targets **struts** (the connective edges of
+  the kirigami graph), not tile-face polygon outlines. Struts are the clean,
+  well-defined curve target; bowing closed polygon outlines is ambiguous
+  (which way?) and riskier. "tile/strut edges" is satisfied by the strut edges.
+  Posed/simulation-playback struts stay straight (export-time feature only).
+- 1a (8a8c282): `geometry.bezier_polyline` (pure quadratic Bezier; OFF returns
+  exact [p0,p1]); `collect_export_geometry` threads bezier_* and bows struts
+  away from the lattice centroid; SCAD emits one cylinder per polyline segment
+  (2-pt strut => identical single cylinder). Lattice fields + `set_bezier()`
+  (clears export cache). 20 tests. Regression byte-identical (OFF).
+- 1b (aedd64a): preset **v6** + `bezier` block + `_migrate_v5_to_v6` (OFF). Bumped
+  PRESET_VERSION 5->6. Relaxed test_preset_v5's exact-version pin to `>=5`
+  (exact pin now in test_preset_v6); added "bezier" to schema key-set test.
+- 1c (ccd873c): InspectorPanel "Bezier edges" group (checkbox+strength+segments)
+  -> parameterChanged -> ParameterChangeCommand(regenerate=False); command's
+  non-regenerate branch now `_clear_caches()`. End-to-end GUI test via headless
+  MainWindow.
+- **GUI-test race (confirmed + resolved):** a SINGLE Qt/MainWindow test in a tiny
+  offscreen session hits the documented VTK/Qt atexit teardown race (EXIT 127,
+  no junit xml) — even `coordinates_panel`'s 18-test file passes alone but an
+  8-test file may not; it's nondeterministic/ordering-sensitive, NOT a real
+  failure (no assertion ever fails). PROOF my tests are correct: running
+  `test_coordinates_panel + test_bezier_gui` => 26/0/0 EXIT 0, and a 6-file
+  suite-ordered batch => 64/0/0 EXIT 0. In the full suite `test_app.py` precedes
+  my files alphabetically so they're never the leading Qt module. Rule for
+  future GUI tests: never rely on running a GUI test file alone; verify in
+  company / via the full suite.
+- Broad regression batch (touched modules + new tests) running in background
+  (id bwgitajt9) — verifying inspector/commands/main_window edits didn't
+  regress rotation/edit/bipartite/predictor.
+
+### Iteration 6 (2026-05-22) — Task 5 tessellation generator (STARTING)
+- **Plan:** new `auxetic/tessellation.py`. Given n boundary points defining a
+  region (polygon) + a target tile density (edge length or count), fill the
+  interior with a near-equilateral triangular lattice and close the boundary.
+  - Approach: build a triangular (equilateral) point grid covering the region's
+    bbox at spacing `h`; keep interior points (inside polygon, with margin);
+    add the boundary polygon vertices (optionally resampled at ~h). Delaunay
+    the union, then clip triangles whose centroid is outside the polygon.
+    Interior triangles from the triangular grid are ~equilateral; boundary
+    triangles (grid-to-boundary) are isosceles/scalene closers.
+  - Public API (typed, dataclass result): e.g.
+    `generate_tessellation(boundary_pts, density, *, margin=...) ->
+    TessellationResult(points, simplices)`. Density param = target edge length
+    OR triangle count; pick edge-length (`target_edge`) as primary, derive from
+    count if needed.
+  - Integrate with Lattice: a `from_tessellation(...)` classmethod or a mode/
+    points injection so it can drive kirigami/bipartite + export. Cleanest:
+    build points + (optionally) set them via `regenerate_from_points` on a 2D
+    mode, OR add a thin classmethod. Keep geometry in auxetic/.
+  - Tests: coverage (every region sub-area covered; triangulation spans the
+    polygon), interior near-equilaterality (interior triangles' angles within
+    tolerance of 60°), boundary closure (no gaps; union of triangles ≈ polygon
+    area within tolerance).
+- **Next step:** write `auxetic/tessellation.py` + `tests/test_tessellation.py`;
+  then wire a Lattice entry point; keep numpy/scipy only.
 
 ---
 
