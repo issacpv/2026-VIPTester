@@ -310,7 +310,7 @@ not commit them unless a task needs one as a test fixture.
 
 | # | Task | Status |
 |---|------|--------|
-| 1 | Bezier strut curving is wrong — fix curve direction/shape to match intent | TODO |
+| 1 | Bezier strut curving is wrong — fix curve direction/shape to match intent | DONE (5f99d7f) |
 | 2 | Kinematic sim playback flickers / mesh disappears mid-motion | DONE (93cc348) |
 | 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
 | 4 | Desktop-shortcut launch is slow — speed up cold start | TODO |
@@ -552,4 +552,43 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
   exact intended direction/magnitude — if ambiguous from the drawing, document the
   chosen convention rather than guess silently. Working order: 6e → 3 → 2 → **1** →
   4 → 5 → 6a–6d.
+
+### Iteration 4 (2026-05-22) — Task 1 bezier curve direction (COMPLETE, 5f99d7f)
+- **Root cause.** `auxetic/geometry.py::collect_export_geometry`'s `add_strut`
+  set the bow hint to `0.5*(p0+p1) - _bow_center` = midpoint MINUS centroid =
+  pointing AWAY from the lattice centroid. `bezier_polyline` offsets the control
+  point along that (perp component), so struts bowed OUTWARD into convex arcs
+  (the rounded-triangle / trefoil the user saw).
+- **Fix (one-line sign flip + comments).** `bow = _bow_center - 0.5*(p0+p1)` =
+  toward the centroid → struts curve INWARD (concave / re-entrant). Endpoints
+  untouched (only the perpendicular component is used); OFF path unchanged.
+- **CHOSEN CONVENTION (documented per Batch-2 confirm-before-guessing).** Struts
+  bow toward the **structure centroid** (`points.mean`). For compact / convex
+  presets (EqTri, EqHex, EqRho) the centroid IS the cell center, so this is the
+  correct concave/re-entrant direction and matches the user's hand drawing.
+  **Known limitation (deferred, flagged):** for large or strongly non-convex
+  lattices, "toward global centroid" is only a heuristic for the local concave
+  side; a fully correct version would bow each bond toward its *own* cell center,
+  which needs per-bond cell association in the bipartite/2D export paths
+  (regression-sensitive, larger change). Not needed for the reported EqTri bug;
+  noted for future refinement. Batch-1 scope stands: bezier = strut edges, not
+  tile-face outlines; posed/playback struts stay straight.
+- **viewport == export.** The live 3D view builds its strut curves from the SAME
+  `collect_export_geometry` path (views.py has no bezier code of its own), so the
+  inward bow appears identically in the viewport and in STL/OBJ/SCAD by
+  construction. (Not headlessly verifiable visually — a human should eyeball
+  presetEqTri with curves ON to confirm it matches the drawing.)
+- **Tests.** `tests/test_bezier_edges.py` +2: EqTri repro (mode 11, the exact 3
+  points) and a mode-6 grid both assert no curved strut bows outward and ≥1 bows
+  genuinely inward (dot of apex-offset with chord→centroid). These FAIL on the old
+  outward sign, so they lock the direction. Mandatory `test_regression.py`
+  byte-identical (OFF). `test_scad_export.py` green.
+- Full suite **538 passed, 1 skipped** (+2), 0 failures (5m19s).
+- **Next step:** Task 4 — slow desktop-shortcut cold start. Investigate the
+  `auxetic_studio` import chain (`__main__.py` / `__init__.py`): is torch / ML
+  imported eagerly (`predictor_panel.py` training worker)? Are pyvista/vtk/scipy
+  pulled at import time? Lazy-import heavy/optional deps; measure cold start
+  before/after; `tests/test_app.py` green. CAVEAT: part is OS `.lnk` config (lives
+  on the Windows Desktop, outside the repo) — optimize imports regardless, advise
+  on the shortcut separately. Working order: 6e → 3 → 2 → 1 → **4** → 5 → 6a–6d.
 
