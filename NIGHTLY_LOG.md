@@ -315,7 +315,7 @@ not commit them unless a task needs one as a test fixture.
 | 3 | Reference-polygon highlight only visible from top, not bottom | DONE (9e82a3c) |
 | 4 | Desktop-shortcut launch is slow — speed up cold start | DONE (investigation; no safe code win — see notes) |
 | 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | DONE (34250a5) |
-| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e DONE (583231d); 6a–6d TODO |
+| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e (583231d), 6a (762bd45) DONE; 6b–6d TODO |
 
 **Working order (risk-managed, isolated/cheap first → big features last):**
 6e (remove buttons — trivial) → 3 (small render fix) → 2 (render fix, same redraw path)
@@ -690,4 +690,44 @@ Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
   geometry must come from `auxetic/`, not the GUI. Working order: … 5 → **6a** →
   6b → 6c → 6d (6e already done). This is the start of the largest task; keep each
   sub-step its own commit.
+
+### Iteration 7 (2026-05-22) — Task 6a Poisson tracked-points + bbox (COMPLETE, 762bd45)
+- **auxetic/ data API (the geometry-rule core, fully tested).** Added to
+  `Simulator`: `all_world_vertices(pose)` (the tracked point cloud), `bbox_bounds`
+  (lo/hi), `bbox_corners` (2^dim corners), `bbox_extreme_vertices` (per-axis
+  min/max vertices — the points that DEFINE the bbox, hence the Poisson extent).
+  Refactored `_bbox_extents` to reuse `all_world_vertices` → regression
+  byte-identical. (`itertools` import added.)
+- **views.py overlay.** `show_poisson_tracking(initial_corners, final_corners,
+  initial_extremes, final_extremes)` + `clear_poisson_tracking()`: two AABB
+  wireframes (rest grey, compressed white) + per-axis extreme points. All
+  headless-guarded; uses the Task-2 render=False+single-render batch so it doesn't
+  flicker. Wired `clear_pose` to also clear the overlay (so `mark_outdated`'s
+  existing `clear_pose` call covers invalidation).
+- **CHOSEN COLOR CONVENTION (documented; spec was 3 colors).** Per-axis extreme
+  points: X = magenta, Y = yellow, Z = teal; the compressed-pose ("final") set
+  uses darker shades of each. Interpreting the spec's magenta/yellow/teal as the
+  three spatial axes is meaningful — it shows which points drive the lateral vs
+  axial strain. 2D points lifted to z=0.
+- **Wiring.** `SimulationPanel._update_poisson_tracking` (geometry from the
+  Simulator, not the GUI) shows rest vs the **most axially-compressed sweep pose**
+  (`argmin` of `sim_result.bbox_extents[:, axial]`) on each solve; clears when no
+  fresh result. Called from `_apply_sim_result` / `_apply_sim_failure`.
+- **DEFERRED (honest).** "Animate the points as they move with the sim" — I show a
+  STATIC rest-vs-most-compressed contrast, NOT a per-slider animation. Hooking it
+  into the 30 fps `_drive_pose_from_slider` would churn ~8 actors/frame and risk
+  the playback path I just fixed (Tasks 2/5). Animation deferred as a follow-up.
+- **HONEST CAVEAT.** The geometry API + the panel→view hand-off are tested
+  (`tests/test_poisson_bbox.py` 6 pure tests; `test_simulation_gui.py` records
+  `view_3d.last_poisson_tracking` headlessly and checks shapes). The actual overlay
+  RENDERING (boxes/points on screen, colors) needs a real interactor — a human
+  should eyeball it on presetEqHex.
+- Full suite **548 passed, 1 skipped** (+7), 0 failures, EXIT 0 (4m27s). Regression
+  byte-identical.
+- **Next step:** Task 6b — a clear "full-structure ν" readout (whole EqHex, not one
+  triangle). `Lattice.edge_vector_poisson_ratio` (mean over 2D tris) and the bbox
+  `Simulator.poissons_ratio` are already whole-structure — surface a clear readout
+  that works on `presetEqHex.json`. Likely in the Predictor "Geometry metrics" box
+  (where `edge_vector_poisson_ratio` already shows) and/or the sim readout. Working
+  order: … 6a → **6b** → 6c → 6d.
 
