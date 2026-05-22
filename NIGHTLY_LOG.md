@@ -245,4 +245,52 @@ Working order: 3 → 2 → 1 → 5 → 4 (risk-managed, per prompt).
 ---
 
 ## Final summary
-_(written at the end of the run)_
+
+**Status: COMPLETE. All 5 tasks meet their acceptance criteria; full suite green
+(529 passed, 1 skipped [openscad CLI absent], 0 failures, ~3m15s).**
+
+Branch `nightly/auto-2026-05-22`, 12 commits on top of the baseline checkpoint.
+
+What shipped (working order 3 → 2 → 1 → 5 → 4):
+
+- **Task 3 — Zoom-to-cursor (13fd991).** Pure `auxetic_studio/camera_controls.py`
+  (`dolly_toward_cursor`) scales camera position + focal point toward the cursor
+  world-point (its fixed point), preserving view direction; centred zoom
+  degenerates to the classic dolly so presets are unaffected. `View3D` installs
+  high-priority VTK wheel observers that abort the default centred dolly; all
+  headless-guarded. Handles parallel projection. 18 pure tests.
+- **Task 2 — SCAD guard (7b00de6).** `tests/test_scad_export.py` validates
+  `to_scad` structure / balanced delimiters / finite coords / in-range face
+  indices / positive struts across modes 1/4/2/6, + optional openscad-CLI parse.
+- **Task 1 — Bezier strut edges (8a8c282, aedd64a, ccd873c).** Opt-in, default
+  OFF (modes 1–9 byte-identical). `geometry.bezier_polyline` + threaded through
+  `collect_export_geometry`; SCAD emits one cylinder per segment; STL/OBJ tube
+  the polylines. `Lattice.bezier_*` fields + `set_bezier()`. Preset **v6** +
+  `_migrate_v5_to_v6`. Inspector "Bezier edges" control via the undoable command
+  path (regenerate=False, cache-invalidating). 20 + 8 + preset tests.
+- **Task 5 — Tessellation generator (876d5e8).** `auxetic/tessellation.py` fills
+  a region with a near-equilateral grid + boundary closers (concavities carved by
+  centroid-clip). `Lattice.from_tessellation` (uniform-normalized, preserves the
+  clipped triangulation) drives kirigami/bipartite/STL/OBJ/SCAD. 25 tests.
+- **Task 4 — Edge-vector Poisson (265050d).** `auxetic/edge_poisson.py`. Found and
+  documented that corner motion is shape-independent/isotropic (ν≡-1), so the
+  metric uses the non-affine per-edge bond-midpoint triangle: equilateral → -1,
+  varies with shape & C. Sweep + `Lattice.edge_vector_poisson_ratio` + read-only
+  Predictor-panel display. 31 + 2 tests.
+
+Key decisions & caveats (details inline above):
+- Committed pre-existing uncommitted WIP as a baseline (c05241c) so my increments
+  diff cleanly; `.claude/` gitignored (a8f0513).
+- Bezier scope = strut (connective) edges, not tile-face polygon outlines
+  (well-defined; the latter is ambiguous). Sim-playback struts stay straight.
+- **GUI-test teardown race:** on this platform (Win + PyQt6 + pyvistaqt + offscreen)
+  a small pytest session that constructs Qt widgets can abort at *teardown* (EXIT
+  127, no junit xml) — assertions still pass first. New GUI test files therefore
+  must be verified in company / via the full suite (where `test_app.py` precedes
+  them and the conftest drains state), never run alone. All GUI tests here pass in
+  the full suite.
+- Loose root scratch presets (`preset*.json`) left untracked (unreferenced; not
+  mine to commit).
+
+Regression (`tests/test_regression.py`) stayed green throughout; goldens and the
+load-bearing GUI STL-diff test were never modified.
