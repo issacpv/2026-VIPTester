@@ -904,6 +904,11 @@ class View3D(QWidget):
         # tile, and a test-friendly tap recording the last highlight call.
         self._anchor_actor = None
         self.last_anchor_highlight = None
+        # Poisson-tracking overlay (task 6a): bbox wireframes + per-axis
+        # extreme points for the rest ("initial") and current ("final",
+        # compressed) poses. Test-friendly tap records the last call.
+        self._poisson_actors: list = []
+        self.last_poisson_tracking: dict | None = None
 
         # Track whether the orientation/widget extras are active so
         # tests / external callers can introspect.
@@ -1372,8 +1377,107 @@ class View3D(QWidget):
         self.last_show_pose_args = None
         self._update_anchor_outline(None)
         self.last_anchor_highlight = None
+        self.clear_poisson_tracking()
         if self._cached_lattice is not None:
             self.update_lattice(self._cached_lattice)
+
+    # ------------------------------------------------------------------
+    # Poisson-tracking overlay (task 6a)
+    # ------------------------------------------------------------------
+
+    def show_poisson_tracking(self, initial_corners, final_corners,
+                              initial_extremes, final_extremes) -> None:
+        """Draw the Poisson-tracking overlay: the rest ("initial") and
+        compressed ("final") axis-aligned bounding boxes as wireframes
+        (initial grey, final white), plus the per-axis extreme vertices
+        that define them (X magenta, Y yellow, Z teal; final shades
+        darker). All geometry is computed in ``auxetic`` (Simulator) and
+        passed in — this method only renders. Headless-safe (records
+        ``last_poisson_tracking`` then no-ops without an interactor)."""
+        self.last_poisson_tracking = {
+            "initial_corners":  np.asarray(initial_corners, float),
+            "final_corners":    np.asarray(final_corners, float),
+            "initial_extremes": np.asarray(initial_extremes, float),
+            "final_extremes":   np.asarray(final_extremes, float),
+        }
+        if self.interactor is None:
+            return
+        self._clear_poisson_actors(render=False)
+        try:
+            self._add_bbox_wireframe(initial_corners, color="#8a8a8a", width=2)
+            self._add_bbox_wireframe(final_corners,   color="#f0f0f0", width=3)
+            # X magenta, Y yellow, Z teal; final poses use darker shades.
+            init_colors  = ("#ff00ff", "#ffd400", "#17becf")
+            final_colors = ("#800080", "#8a7400", "#0a6b75")
+            self._add_extreme_points(initial_extremes, init_colors,  size=11)
+            self._add_extreme_points(final_extremes,   final_colors, size=15)
+        except Exception:
+            pass
+        try:
+            self.interactor.render()
+        except Exception:
+            pass
+
+    def _add_bbox_wireframe(self, corners, *, color: str, width: int) -> None:
+        c = np.asarray(corners, dtype=float)
+        if c.ndim != 2 or c.shape[0] == 0:
+            return
+        dim = c.shape[1]
+        lo = c.min(axis=0)
+        hi = c.max(axis=0)
+        if dim == 2:
+            loop = np.array([
+                [lo[0], lo[1], 0.0], [hi[0], lo[1], 0.0],
+                [hi[0], hi[1], 0.0], [lo[0], hi[1], 0.0],
+                [lo[0], lo[1], 0.0],
+            ])
+            mesh = pv.lines_from_points(loop)
+            actor = self.interactor.add_mesh(
+                mesh, color=color, line_width=width,
+                render_lines_as_tubes=True, pickable=False, render=False)
+        else:
+            box = pv.Box(bounds=(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+            actor = self.interactor.add_mesh(
+                box, color=color, style="wireframe", line_width=width,
+                pickable=False, render=False)
+        if actor is not None:
+            self._poisson_actors.append(actor)
+
+    def _add_extreme_points(self, extremes, colors, *, size: int) -> None:
+        e = np.asarray(extremes, dtype=float)        # (dim, 2, dim)
+        if e.ndim != 3:
+            return
+        for d in range(e.shape[0]):
+            pts = e[d]
+            if pts.shape[1] == 2:
+                pts = np.hstack([pts, np.zeros((pts.shape[0], 1))])
+            actor = self.interactor.add_mesh(
+                pv.PolyData(pts), color=colors[d % len(colors)],
+                render_points_as_spheres=True, point_size=size,
+                pickable=False, render=False)
+            if actor is not None:
+                self._poisson_actors.append(actor)
+
+    def _clear_poisson_actors(self, *, render: bool = True) -> None:
+        if self.interactor is None:
+            self._poisson_actors = []
+            return
+        for actor in self._poisson_actors:
+            try:
+                self.interactor.remove_actor(actor, render=False)
+            except Exception:
+                pass
+        self._poisson_actors = []
+        if render:
+            try:
+                self.interactor.render()
+            except Exception:
+                pass
+
+    def clear_poisson_tracking(self) -> None:
+        """Remove the Poisson-tracking overlay (no-op if not shown)."""
+        self.last_poisson_tracking = None
+        self._clear_poisson_actors(render=True)
 
     # ------------------------------------------------------------------
     # Force-arrow glyphs (M2 polish — visual feedback for ForceVectors)

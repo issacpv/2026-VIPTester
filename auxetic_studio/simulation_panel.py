@@ -808,6 +808,7 @@ class SimulationPanel(QDockWidget):
             self._anchor_tile = None
         self._update_plot()
         self._update_state_dependent_ui()
+        self._update_poisson_tracking()
         self.simulationCompleted.emit()
 
     def _apply_sim_failure(self, error_text: str) -> None:
@@ -820,6 +821,38 @@ class SimulationPanel(QDockWidget):
         self._locking_info   = None
         self._is_outdated    = False
         self._update_state_dependent_ui()
+        self._update_poisson_tracking()
+
+    def _update_poisson_tracking(self) -> None:
+        """Refresh the 3D Poisson-tracking overlay (task 6a): the rest vs
+        the most axially-compressed sweep pose — the two bounding boxes and
+        the per-axis extreme points the Poisson calc tracks. Clears the
+        overlay when there's no fresh kinematic result. No-op without a 3D
+        view. All geometry comes from the Simulator (auxetic/), not here."""
+        view = self._view_3d
+        if view is None:
+            return
+        sim = self._simulator
+        result = self._sim_result
+        if sim is None or result is None or self._is_outdated:
+            view.clear_poisson_tracking()
+            return
+        try:
+            rest = sim.rest_pose()
+            extents = np.asarray(result.bbox_extents, dtype=float)
+            axial = sim._axial_index()
+            # Most axially-compressed sweep pose → the clearest contrast
+            # against rest for the bounding-box visual.
+            idx = int(np.argmin(extents[:, axial])) if extents.size else 0
+            final_pose = result.poses[idx]
+            view.show_poisson_tracking(
+                sim.bbox_corners(rest),
+                sim.bbox_corners(final_pose),
+                sim.bbox_extreme_vertices(rest),
+                sim.bbox_extreme_vertices(final_pose),
+            )
+        except Exception:
+            view.clear_poisson_tracking()
 
     # ---- Non-blocking solve (toolbar Run button) ---------------------
     def _start_sim_async(self) -> None:

@@ -77,6 +77,34 @@ def test_simulation_panel_run_button_populates_results(main_window):
 
 
 # ---------------------------------------------------------------------------
+# 1b. Poisson-tracking overlay geometry is handed to the 3D view (task 6a)
+# ---------------------------------------------------------------------------
+
+def test_run_simulation_populates_poisson_tracking(main_window):
+    """Task 6a: after a sim, the panel feeds View3D the Poisson-tracking
+    geometry (two bbox corner sets + per-axis extreme vertices), all
+    sourced from the Simulator. The overlay actors need a real interactor,
+    but the geometry hand-off is recorded headlessly via
+    ``view_3d.last_poisson_tracking`` and asserted here."""
+    win = main_window
+    panel = win.simulation_panel
+    assert win.view_3d.last_poisson_tracking is None
+    panel.run_simulation()
+
+    tracking = win.view_3d.last_poisson_tracking
+    assert tracking is not None
+    dim = panel._tile_system.dimension
+    assert tracking["initial_corners"].shape == (2 ** dim, dim)
+    assert tracking["final_corners"].shape == (2 ** dim, dim)
+    assert tracking["initial_extremes"].shape == (dim, 2, dim)
+    assert tracking["final_extremes"].shape == (dim, 2, dim)
+
+    # Outdating the sim (e.g. a lattice change) clears the overlay.
+    panel.mark_outdated()
+    assert win.view_3d.last_poisson_tracking is None
+
+
+# ---------------------------------------------------------------------------
 # 2. Slider drives View3D.show_pose when a fresh result is present
 # ---------------------------------------------------------------------------
 

@@ -24,6 +24,7 @@ Pose layout (the contract):
 
 from __future__ import annotations
 
+import itertools
 import warnings
 from dataclasses import dataclass, field
 
@@ -820,16 +821,66 @@ class Simulator:
     # Bounding-box helpers (used by sweep + Poisson + locking)
     # ==================================================================
 
-    def _bbox_extents(self, pose: np.ndarray) -> np.ndarray:
-        """``(max - min)`` per spatial dimension over all tile vertices
-        in the given pose. Shape ``(dimension,)``."""
+    def all_world_vertices(self, pose: np.ndarray) -> np.ndarray:
+        """Every tile vertex in world frame under ``pose``, shape
+        ``(N, dimension)``. These are the points whose axis-aligned
+        bounding box drives the Poisson's-ratio and locking metrics
+        (SPEC §7.4); the GUI uses them to visualise what the Poisson
+        calc tracks."""
         if self.n_tiles == 0:
-            return np.zeros(self.dimension)
-        all_verts = np.concatenate(
+            return np.zeros((0, self.dimension))
+        return np.concatenate(
             [self._tile_world_vertices(pose, i) for i in range(self.n_tiles)],
             axis=0,
         )
-        return all_verts.max(axis=0) - all_verts.min(axis=0)
+
+    def bbox_bounds(self, pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(lo, hi)`` corners of the axis-aligned bounding box over all
+        tile vertices under ``pose``; each shape ``(dimension,)``."""
+        verts = self.all_world_vertices(pose)
+        if verts.shape[0] == 0:
+            z = np.zeros(self.dimension)
+            return z, z.copy()
+        return verts.min(axis=0), verts.max(axis=0)
+
+    def bbox_corners(self, pose: np.ndarray) -> np.ndarray:
+        """Corner points of the axis-aligned bounding box under ``pose``:
+        4 corners in 2D, 8 in 3D, shape ``(2**dimension, dimension)``.
+        Lets the GUI draw the box as a wireframe."""
+        lo, hi = self.bbox_bounds(pose)
+        return np.array(
+            [[(hi[d] if bit else lo[d]) for d, bit in enumerate(combo)]
+             for combo in itertools.product((0, 1), repeat=self.dimension)],
+            dtype=float,
+        )
+
+    def bbox_extreme_vertices(self, pose: np.ndarray) -> np.ndarray:
+        """For each spatial axis, the two tile vertices at the min and max
+        coordinate along that axis — the points that define the bounding
+        box (hence the Poisson extent) along that axis.
+
+        Shape ``(dimension, 2, dimension)``: ``out[d, 0]`` is the min-side
+        vertex along axis ``d``, ``out[d, 1]`` the max-side vertex. The GUI
+        colours these per axis to show which points drive the lateral vs
+        axial strain. Selection lives here (not the GUI) per the geometry
+        rule."""
+        verts = self.all_world_vertices(pose)
+        dim = self.dimension
+        if verts.shape[0] == 0:
+            return np.zeros((dim, 2, dim))
+        out = np.empty((dim, 2, dim), dtype=float)
+        for d in range(dim):
+            out[d, 0] = verts[int(np.argmin(verts[:, d]))]
+            out[d, 1] = verts[int(np.argmax(verts[:, d]))]
+        return out
+
+    def _bbox_extents(self, pose: np.ndarray) -> np.ndarray:
+        """``(max - min)`` per spatial dimension over all tile vertices
+        in the given pose. Shape ``(dimension,)``."""
+        verts = self.all_world_vertices(pose)
+        if verts.shape[0] == 0:
+            return np.zeros(self.dimension)
+        return verts.max(axis=0) - verts.min(axis=0)
 
     def _axial_index(self) -> int:
         """Spatial-dimension index whose unit vector best aligns with
