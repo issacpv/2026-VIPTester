@@ -77,7 +77,13 @@ class ParameterChangeCommand(QUndoCommand):
                 # regenerate=False (see below): C only repositions hinges
                 # on the existing triangulation, so re-rolling points
                 # would needlessly destroy the user's placed lattice.
-                "C")
+                "C",
+                # Task 1 bezier-strut options. Also regenerate=False —
+                # they only affect derived export/render geometry, never
+                # the point cloud — but they DO change the cached strut
+                # curves, so the non-regenerate branch invalidates the
+                # export-geometry cache below.
+                "bezier_enabled", "bezier_strength", "bezier_segments")
 
     def __init__(self, lattice: Lattice, field: str,
                  old_value: Any, new_value: Any,
@@ -100,6 +106,12 @@ class ParameterChangeCommand(QUndoCommand):
         setattr(self.lattice, self.field, value)
         if self.regenerate:
             self.lattice.regenerate()
+        else:
+            # Non-regenerating params (C, bezier_*) leave the point cloud
+            # untouched but change derived export/render geometry — drop
+            # the cached strut/triangle/joint data so the next render or
+            # export rebuilds it with the new value.
+            self.lattice._clear_caches()
         if self.on_change is not None:
             self.on_change()
 

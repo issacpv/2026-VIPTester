@@ -590,10 +590,15 @@ class MainWindow(QMainWindow):
         on the existing triangulation — re-rolling the point cloud would
         destroy the user's placed lattice — so it is applied with
         ``regenerate=False``. Every other parameter re-generates."""
+        # C and the bezier-strut options only affect derived geometry on
+        # the existing triangulation — re-rolling the point cloud would
+        # discard the user's placed lattice, so they apply without a
+        # regenerate (the command invalidates the export cache instead).
+        _no_regen = ("C", "bezier_enabled", "bezier_strength", "bezier_segments")
         cmd = ParameterChangeCommand(
             self.lattice, field, old_value, new_value,
             on_change=self._on_lattice_structurally_changed,
-            regenerate=(field != "C"),
+            regenerate=(field not in _no_regen),
         )
         self.undo_stack.push(cmd)
 

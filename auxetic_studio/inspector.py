@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QDoubleSpinBox,
     QComboBox,
+    QCheckBox,
     QLabel,
     QGroupBox,
     QVBoxLayout,
@@ -278,6 +279,46 @@ class InspectorPanel(QWidget):
         ov.addWidget(flip_row)
 
         outer.addWidget(orient_box)
+
+        # =================================================================
+        # Bezier edges section (task 1) — opt-in curved strut export.
+        # Applies to every mode (struts exist in all of them), so it has
+        # no conditional visibility. Emits the same parameterChanged
+        # signal as the other scalar params; MainWindow routes the three
+        # fields through ParameterChangeCommand with regenerate=False.
+        # =================================================================
+        bezier_box = QGroupBox("Bezier edges", self)
+        bez_form = QFormLayout(bezier_box)
+
+        self.bezier_enabled_check = QCheckBox("Curve strut edges", bezier_box)
+        self.bezier_enabled_check.setToolTip(
+            "Export struts as smooth Bezier curves instead of straight "
+            "segments. Off by default; geometry is unchanged when off.")
+        self.bezier_enabled_check.toggled.connect(self._on_bezier_enabled_toggled)
+
+        self.bezier_strength_spin = QDoubleSpinBox(bezier_box)
+        self.bezier_strength_spin.setRange(0.0, 2.0)
+        self.bezier_strength_spin.setSingleStep(0.05)
+        self.bezier_strength_spin.setDecimals(3)
+        self.bezier_strength_spin.setToolTip(
+            "Curve depth: perpendicular bow of each strut as a fraction "
+            "of its length. 0 = straight.")
+        self.bezier_strength_spin.editingFinished.connect(
+            self._on_bezier_strength_committed)
+
+        self.bezier_segments_spin = QSpinBox(bezier_box)
+        self.bezier_segments_spin.setRange(1, 64)
+        self.bezier_segments_spin.setToolTip(
+            "Number of straight segments each curved strut is tessellated "
+            "into. 1 = straight.")
+        self.bezier_segments_spin.valueChanged.connect(
+            self._on_bezier_segments_changed)
+
+        bez_form.addRow(self.bezier_enabled_check)
+        bez_form.addRow(QLabel("Strength"), self.bezier_strength_spin)
+        bez_form.addRow(QLabel("Segments"), self.bezier_segments_spin)
+
+        outer.addWidget(bezier_box)
         outer.addStretch(1)
 
         self.refresh_from_lattice()
@@ -330,6 +371,14 @@ class InspectorPanel(QWidget):
             mp = getattr(self._lattice, "mesh_path", None)
             self.mesh_path_label.setText(
                 str(mp) if mp else "(no mesh loaded)")
+
+            # Bezier-edge widgets.
+            self.bezier_enabled_check.setChecked(
+                bool(getattr(self._lattice, "bezier_enabled", False)))
+            self.bezier_strength_spin.setValue(
+                float(getattr(self._lattice, "bezier_strength", 0.25)))
+            self.bezier_segments_spin.setValue(
+                int(getattr(self._lattice, "bezier_segments", 12)))
 
             self._update_visibility()
             self._sync_orientation_widgets()
@@ -482,6 +531,23 @@ class InspectorPanel(QWidget):
 
     def _on_nz_layers_changed(self, value):
         self._emit_param("nz_layers", int(self._lattice.nz_layers), int(value))
+
+    # ---- bezier-edge handlers (task 1) -----------------------------------
+
+    def _on_bezier_enabled_toggled(self, checked):
+        old = bool(getattr(self._lattice, "bezier_enabled", False))
+        self._emit_param("bezier_enabled", old, bool(checked))
+
+    def _on_bezier_strength_committed(self):
+        if self._suspend:
+            return
+        new = float(self.bezier_strength_spin.value())
+        old = float(getattr(self._lattice, "bezier_strength", 0.25))
+        self._emit_param("bezier_strength", old, new)
+
+    def _on_bezier_segments_changed(self, value):
+        old = int(getattr(self._lattice, "bezier_segments", 12))
+        self._emit_param("bezier_segments", old, int(value))
 
     # ---- density gradient handlers ---------------------------------------
 
