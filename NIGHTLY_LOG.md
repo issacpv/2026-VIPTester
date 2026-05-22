@@ -15,8 +15,8 @@ This file is the cross-iteration state. Read it FIRST every iteration.
 | 3 | Zoom-to-cursor in the 3D view | DONE (13fd991) |
 | 2 | SCAD intact — integration test guarding to_scad | DONE (7b00de6) |
 | 1 | Bezier-curve edges before export | DONE (8a8c282, aedd64a, ccd873c) |
-| 5 | Tessellation generator | IN PROGRESS (next) |
-| 4 | Generalized Poisson's ratio on triangle edge vectors | PENDING |
+| 5 | Tessellation generator | DONE (876d5e8) |
+| 4 | Generalized Poisson's ratio on triangle edge vectors | IN PROGRESS (next) |
 
 Working order: 3 → 2 → 1 → 5 → 4 (risk-managed, per prompt).
 
@@ -170,8 +170,55 @@ Working order: 3 → 2 → 1 → 5 → 4 (risk-managed, per prompt).
     polygon), interior near-equilaterality (interior triangles' angles within
     tolerance of 60°), boundary closure (no gaps; union of triangles ≈ polygon
     area within tolerance).
-- **Next step:** write `auxetic/tessellation.py` + `tests/test_tessellation.py`;
-  then wire a Lattice entry point; keep numpy/scipy only.
+- **Next step (was):** write tessellation + Lattice entry point. (DONE.)
+
+### Iteration 6 (2026-05-22) — Task 5 tessellation (COMPLETE, 876d5e8)
+- `auxetic/tessellation.py`: `generate_tessellation(boundary, target_edge |
+  n_triangles)` -> `TessellationResult(points, simplices, boundary, n_boundary)`
+  with `interior_triangle_mask()`. Equilateral grid + margin-clip interior +
+  resampled boundary + Delaunay + centroid-in-polygon clip (carves concavities).
+  Helpers: polygon_area, points_in_polygon, distance_to_polygon, resample_polygon,
+  equilateral_grid, triangle_angles, equilateral_deviation, edge_from_triangle_count.
+- `Lattice.from_tessellation(boundary, target_edge|n_triangles, mode=1, ...)`:
+  uniform-normalizes to unit square (`_normalize_to_unit_square`), installs the
+  clipped triangulation via `_geom._FlippedTri` (correct for concave; re-Delaunays
+  on edit/reset — documented). Verified it drives kirigami (67 tiles), bipartite
+  mode 11 (120 polys), STL/OBJ/SCAD. 25 tests. Interior tiles exactly equilateral
+  (dev 0.000), concave coverage exact (L area 3.0 not hull 3.5).
+
+### Iteration 7 (2026-05-22) — Task 4 generalized Poisson (STARTING)
+- **Existing baseline:** `simulation.py::Simulator.poissons_ratio` (SPEC §7.4)
+  uses bbox lateral/axial strain. Task 4 is the EDGE-VECTOR alternative — keep
+  both; do NOT modify the bbox one.
+- **Math (worked out):** For one triangle (corners P_0..2, centroid M, hinges
+  `T_c = P_c + t(M-P_c)`, `t=1/(1+C)`), actuation rotates each corner kite rigidly
+  about its hinge: `Q_c(θ) = R(θ)(P_c - T_c) + T_c`. The CORNER triangle
+  Q_0,Q_1,Q_2 deforms with θ. Build the (exact, 3-point) affine deformation
+  gradient `A` mapping rest edges [P1-P0 | P2-P0] -> deformed [Q1-Q0 | Q2-Q0]:
+  `A = E_def @ inv(E_rest)`. Small-strain `ε = (A+Aᵀ)/2 - I`. Generalized
+  Poisson: principal (eigen) strains ε1,ε2 (|ε1|>=|ε2|) -> `ν = -ε2/ε1`; OR a
+  directional version `ν(axis) = -ε_perp/ε_axial`. Equilateral+symmetric C is
+  isotropic => ε1==ε2 => ν=-1 (known test case). θ=0 => ε=0 => return nan/0
+  (guard 0/0).
+- **Plan:**
+  - New `auxetic/edge_poisson.py` (numpy only): `triangle_strain_tensor(tri, C,
+    theta)`, `generalized_poisson_ratio(tri, C, theta, axis=None)`,
+    `sweep_poisson(triangles, C_values, theta)` -> (nT, nC) array, plus shape
+    helpers `apex_triangle(apex_x, apex_y)` and `morph_triangle(s)`
+    (equilateral s=0 -> scalene s=1). Reuse hinge math from bipartite (t=1/(1+C));
+    keep it self-contained / import the t formula.
+  - Tests `tests/test_edge_poisson.py`: equilateral -> ν≈-1 across C and θ;
+    θ=0 -> nan/guard; strain tensor symmetric; isotropic dilation -> ν=-1;
+    a uniaxial/known case -> expected sign; sweep returns right shape and
+    equilateral column ≈ -1; degenerate triangle guarded.
+  - Predictor panel: surface ν as a read-only computed metric IF low-risk
+    (read predictor_panel.py first; GUI tests are fragile — prefer a pure
+    metric method on Lattice/sim that the panel can call, tested without GUI,
+    and only a tiny display hook). If risky, compute+expose via a Lattice
+    method and note panel wiring as optional.
+- **Next step:** read `auxetic_studio/predictor_panel.py`; implement
+  `auxetic/edge_poisson.py` + tests; then a minimal panel surface; full-suite
+  verification pass; write final summary.
 
 ---
 
