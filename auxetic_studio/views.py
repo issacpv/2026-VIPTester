@@ -1332,8 +1332,9 @@ class View3D(QWidget):
 
     def _update_anchor_outline(self, verts3d, mesh=None) -> None:
         """Draw (or clear) the gold ring marking the anchored polygon.
-        Lifted just above the rendered solids so it reads from the
-        top-down view the user works in."""
+        Lifted just above the rendered solids and forced to render on-top
+        (depth-independent) so it's equally visible from top, bottom, and
+        iso — the opaque mesh no longer occludes it when viewed from below."""
         if self.interactor is None:
             return
         if self._anchor_actor is not None:
@@ -1358,6 +1359,7 @@ class View3D(QWidget):
                 poly, color="#ffae00", line_width=6, pickable=False,
                 render_lines_as_tubes=True,
             )
+            _force_actor_on_top(self._anchor_actor)
         except Exception:
             self._anchor_actor = None
 
@@ -1775,3 +1777,28 @@ def _triangles_to_polydata(triangles):
     faces[2::4] = indices[:, 1]
     faces[3::4] = indices[:, 2]
     return pv.PolyData(points, faces)
+
+
+def _force_actor_on_top(actor) -> bool:
+    """Make an overlay actor render over the solid mesh from *any* viewing
+    angle by pushing its rasterized depth toward the near plane via large
+    negative coincident-topology offsets.
+
+    The anchor-polygon ring is lifted just above the structure, so from the
+    top it sits over the mesh — but from below the opaque mesh would occlude
+    it. Forcing the ring on-top keeps it equally visible top / bottom / iso
+    without changing the top-down look. Returns ``True`` if the offset was
+    applied (the actor exposed a VTK mapper), ``False`` otherwise.
+    """
+    get_mapper = getattr(actor, "GetMapper", None)
+    mapper = get_mapper() if callable(get_mapper) else getattr(actor, "mapper", None)
+    if mapper is None:
+        return False
+    try:
+        mapper.SetResolveCoincidentTopologyToPolygonOffset()
+        mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(0.0, -66000.0)
+        mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0.0, -66000.0)
+        mapper.SetRelativeCoincidentTopologyPointOffsetParameter(-66000.0)
+    except Exception:
+        return False
+    return True
