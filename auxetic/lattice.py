@@ -63,6 +63,23 @@ _BIPARTITE_MODES = (11,)               # modes built via auxetic.bipartite
 _CENTROID = np.array([0.5, 0.5, 0.5])
 
 
+def _normalize_to_unit_square(pts: np.ndarray) -> np.ndarray:
+    """Uniformly scale + centre an (N, 2) point set into the unit square
+    [0, 1]². Uniform (single-factor) scaling preserves triangle shape so
+    a tessellation's equilateral interior stays equilateral in lattice
+    space. A degenerate (zero-extent) input is returned unchanged."""
+    pts = np.asarray(pts, dtype=float)
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    span = float((mx - mn).max())
+    if span <= 0.0:
+        return pts.copy()
+    scaled = (pts - mn) / span
+    # Centre the shorter axis within [0, 1].
+    scaled += (1.0 - scaled.max(axis=0)) / 2.0
+    return scaled
+
+
 class Lattice:
     def __init__(self, mode=1, n_points=5, ratio=0.35, nz_layers=2, seed=None,
                  ngon_thickness: float | None = None,
@@ -260,6 +277,56 @@ class Lattice:
             mesh_vertices=norm,
             unit_scale_cm=unit_scale_cm,
         )
+
+    # ==================================================================
+    # Construction from a region tessellation (task 5)
+    # ==================================================================
+
+    @classmethod
+    def from_tessellation(cls, boundary, *,
+                          target_edge: float | None = None,
+                          n_triangles: int | None = None,
+                          mode: int = 1,
+                          ratio: float = 0.35,
+                          normalize: bool = True,
+                          preserve_triangulation: bool = True,
+                          **kwargs) -> "Lattice":
+        """Build a 2D Lattice from an equilateral-fill tessellation of the
+        region bounded by ``boundary`` (see
+        :func:`auxetic.tessellation.generate_tessellation`).
+
+        Density is set by ``target_edge`` or ``n_triangles`` (exactly
+        one). ``mode`` must be a 2D mode (1/2/4/5/11). With
+        ``normalize`` (default), points are uniformly scaled+centred into
+        the unit square so the lattice keeps its [0, 1] convention while
+        preserving triangle shape.
+
+        With ``preserve_triangulation`` (default) the tessellation's
+        clipped triangulation is installed verbatim — important for
+        concave regions, where a plain Delaunay would fill the
+        concavities. Note: a subsequent point edit or reset re-Delaunays
+        (the standard 2D edit path), which only matches the original for
+        convex regions.
+        """
+        from . import tessellation as _tess
+
+        if mode in _3D_MODES:
+            raise ValueError(
+                f"from_tessellation is 2D-only; mode {mode} is a 3D mode")
+
+        result = _tess.generate_tessellation(
+            boundary, target_edge, n_triangles=n_triangles)
+        pts = np.asarray(result.points, dtype=float)
+        if normalize:
+            pts = _normalize_to_unit_square(pts)
+
+        lat = cls(mode=mode, n_points=len(pts), ratio=ratio, **kwargs)
+        if preserve_triangulation:
+            lat._set_points_and_tri(pts, _geom._FlippedTri(result.simplices))
+        else:
+            lat.regenerate_from_points(pts)
+        lat.points_original = pts.copy()
+        return lat
 
     # ==================================================================
     # view_state — SPEC §5.1's serializable view block, derived from
