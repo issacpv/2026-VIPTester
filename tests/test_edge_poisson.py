@@ -249,3 +249,58 @@ def test_lattice_eqhex_full_structure_is_minus_one():
     lat = Lattice(mode=11, n_points=7, ratio=0.35)
     lat.regenerate_from_points(eqhex)
     assert lat.edge_vector_poisson_ratio() == pytest.approx(-1.0, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Per-triangle pick: Lattice.poisson_ratio_at_point (task 6c)
+# ---------------------------------------------------------------------------
+
+def test_poisson_ratio_at_point_picks_containing_triangle():
+    """A lattice-space point maps to its Delaunay triangle, and the returned
+    ν matches that triangle's direct generalized_poisson_ratio."""
+    lat = Lattice(mode=1, n_points=8, seed=2)
+    simplices = np.asarray(lat.tri.simplices)
+    pts = np.asarray(lat.points)
+    tri0 = pts[simplices[0]]
+    idx, nu = lat.poisson_ratio_at_point(tri0.mean(axis=0), world=False)
+    assert idx == 0
+    expected = generalized_poisson_ratio(tri0, float(lat.C), 0.1)
+    np.testing.assert_allclose(nu, expected, equal_nan=True)
+
+
+def test_poisson_ratio_at_point_equilateral_is_minus_one():
+    lat = Lattice(mode=1, n_points=3, seed=1)
+    lat.regenerate_from_points(equilateral_triangle())
+    pts = np.asarray(lat.points)
+    idx, nu = lat.poisson_ratio_at_point(pts.mean(axis=0), world=False)
+    assert idx is not None
+    assert nu == pytest.approx(-1.0, abs=1e-6)
+
+
+def test_poisson_ratio_at_point_world_identity_matches_lattice():
+    """With the default identity orientation, a world-frame point maps to
+    the same triangle as the equivalent lattice-space point."""
+    lat = Lattice(mode=1, n_points=8, seed=2)
+    pts = np.asarray(lat.points)
+    centroid = pts[np.asarray(lat.tri.simplices)[1]].mean(axis=0)
+    idx_local, nu_local = lat.poisson_ratio_at_point(centroid, world=False)
+    idx_world, nu_world = lat.poisson_ratio_at_point(
+        np.array([centroid[0], centroid[1], 0.0]), world=True)
+    assert idx_world == idx_local
+    np.testing.assert_allclose(nu_world, nu_local, equal_nan=True)
+
+
+def test_poisson_ratio_at_point_3d_is_none():
+    lat = Lattice(mode=6, n_points=8)
+    idx, nu = lat.poisson_ratio_at_point(np.array([0.5, 0.5, 0.5]), world=True)
+    assert idx is None
+    assert math.isnan(nu)
+
+
+def test_poisson_ratio_at_point_outside_hull_falls_back():
+    """A point well outside the convex hull still resolves to the nearest
+    triangle rather than failing."""
+    lat = Lattice(mode=1, n_points=8, seed=2)
+    idx, nu = lat.poisson_ratio_at_point(np.array([99.0, 99.0]), world=False)
+    assert idx is not None
+    assert 0 <= idx < len(np.asarray(lat.tri.simplices))

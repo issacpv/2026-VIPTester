@@ -97,6 +97,10 @@ class MainWindow(QMainWindow):
         # constructed later in __init__ than the views.
         self.view_2d.edgeFlipStatus.connect(
             lambda msg: self.statusBar().showMessage(msg))
+        # Ctrl-click a triangle in the 3D view → show that triangle's
+        # generalized Poisson ratio in the status bar (task 6c).
+        self.view_3d.trianglePoissonPicked.connect(
+            self._on_triangle_poisson_picked)
 
         self.stack = QStackedWidget(self)
         self.stack.addWidget(self.view_2d)   # index VIEW_2D
@@ -599,6 +603,28 @@ class MainWindow(QMainWindow):
             on_change=self._on_lattice_structurally_changed,
         )
         self.undo_stack.push(cmd)
+
+    def _on_triangle_poisson_picked(self, point):
+        """Ctrl-click in the 3D view → show the picked triangle's generalized
+        Poisson ratio in the status bar (task 6c). Geometry + ν come from
+        ``Lattice.poisson_ratio_at_point``; this only formats and displays."""
+        if point is None:
+            return
+        try:
+            idx, nu = self.lattice.poisson_ratio_at_point(point, world=True)
+        except Exception:
+            return
+        if idx is None:
+            self.statusBar().showMessage(
+                "Per-triangle ν: unavailable (3D mode / no 2D triangulation)",
+                6000)
+        elif isinstance(nu, float) and nu != nu:        # NaN
+            self.statusBar().showMessage(
+                f"Triangle {idx}: ν unavailable (degenerate)", 6000)
+        else:
+            self.statusBar().showMessage(
+                f"Triangle {idx}: generalized Poisson's ratio ν = {nu:+.4f}",
+                8000)
 
     def _on_reset_to_original(self):
         cmd = ResetToOriginalCommand(

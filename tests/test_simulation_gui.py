@@ -107,6 +107,26 @@ def test_run_simulation_populates_poisson_tracking(main_window):
 
 
 # ---------------------------------------------------------------------------
+# 1c. Ctrl-click a triangle in 3D shows its ν in the status bar (task 6c)
+# ---------------------------------------------------------------------------
+
+def test_ctrl_click_triangle_shows_poisson_in_statusbar(main_window):
+    """Task 6c: feeding a world point to the triangle-pick handler shows
+    that triangle's ν in the status bar. The real Ctrl+click goes through a
+    VTK pick (not assertable headlessly); here we drive the handler directly
+    to lock the point -> triangle -> ν -> display path."""
+    win = main_window
+    pts = np.asarray(win.lattice.points)
+    centroid = pts.mean(axis=0)
+    win._on_triangle_poisson_picked(np.array([centroid[0], centroid[1], 0.0]))
+    msg = win.statusBar().currentMessage()
+    assert "Triangle" in msg and "ν" in msg
+
+    # A None pick (missed geometry) leaves the status bar unchanged / safe.
+    win._on_triangle_poisson_picked(None)   # must not raise
+
+
+# ---------------------------------------------------------------------------
 # 2. Slider drives View3D.show_pose when a fresh result is present
 # ---------------------------------------------------------------------------
 

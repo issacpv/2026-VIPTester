@@ -695,6 +695,58 @@ class Lattice:
                 vals.append(float(nu))
         return float(np.mean(vals)) if vals else float("nan")
 
+    def poisson_ratio_at_point(self, point, theta: float = 0.1,
+                               *, world: bool = True) -> tuple[int | None, float]:
+        """Generalized (edge-vector) Poisson's ratio of the single lattice
+        triangle at ``point`` — backs the GUI's Ctrl-click-a-triangle
+        readout (task 6c), the per-triangle counterpart of the
+        full-structure :meth:`edge_vector_poisson_ratio`.
+
+        ``point`` is a world-frame ``(x, y[, z])`` when ``world=True`` (the
+        default; mapped back to lattice space via the inverse
+        ``world_transform``), else it is already in lattice space. The
+        containing Delaunay triangle is found with ``tri.find_simplex``; a
+        point outside the convex hull falls back to the nearest triangle by
+        centroid.
+
+        Returns ``(triangle_index, nu)`` — ``(None, nan)`` for 3D modes or a
+        lattice with no 2D triangulation; ``nu`` is ``nan`` for a degenerate
+        triangle or ``theta == 0``. Selection + ν live here, not the GUI."""
+        from . import edge_poisson as _ep
+
+        if self.mode in _3D_MODES or self.tri is None:
+            return None, float("nan")
+        pts = np.asarray(self.points, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            return None, float("nan")
+        simplices = np.asarray(self.tri.simplices)
+        if simplices.ndim != 2 or simplices.shape[1] != 3:
+            return None, float("nan")
+
+        p = np.asarray(point, dtype=float).ravel()
+        if world:
+            try:
+                M_inv = np.linalg.inv(self.world_transform())
+            except np.linalg.LinAlgError:
+                return None, float("nan")
+            h = np.array([p[0], p[1], p[2] if p.size > 2 else 0.0, 1.0])
+            xy = (M_inv @ h)[:2]
+        else:
+            xy = p[:2]
+
+        idx = int(self.tri.find_simplex(xy))
+        if idx < 0:
+            # Outside the hull — nearest triangle by centroid.
+            centroids = pts[simplices].mean(axis=1)
+            idx = int(np.argmin(np.linalg.norm(centroids - xy, axis=1)))
+        tri = pts[simplices[idx]]
+        try:
+            nu = float(_ep.generalized_poisson_ratio(
+                tri, float(self.C), float(theta)))
+        except ValueError:
+            nu = float("nan")
+        return idx, nu
+
     def _bipartite_theta(self) -> float:
         """Actuation angle for *static* mode-11 rendering — always 0
         (rest).

@@ -872,6 +872,12 @@ class View3D(QWidget):
     # to drive the "anchor view to a polygon" feature.
     surfacePointPicked = pyqtSignal(object)
 
+    # Emitted on a **Ctrl**+left-click on a rendered surface (task 6c).
+    # Carries the picked world-space point (length-3 ndarray) or ``None`` on
+    # a miss. MainWindow maps it to the lattice triangle and shows that
+    # triangle's generalized Poisson ratio.
+    trianglePoissonPicked = pyqtSignal(object)
+
     def __init__(self, parent=None, *, force_placeholder: bool = False):
         super().__init__(parent)
         layout = QVBoxLayout(self)
@@ -964,19 +970,26 @@ class View3D(QWidget):
             pass
 
     def _on_surface_pick(self, *args) -> None:
-        """Picking callback. PyVista passes the picked point (and possibly
-        the picker); we forward a clean length-3 point, or ``None`` when
-        the click missed all geometry."""
+        """Picking callback. PyVista passes the picked point; we forward a
+        clean length-3 point (or ``None`` on a miss). A plain left-click
+        drives the anchor feature (``surfacePointPicked``); a Ctrl+left-click
+        instead requests the per-triangle Poisson readout
+        (``trianglePoissonPicked``, task 6c). The held modifier is read from
+        ``QApplication`` at pick time since the VTK callback doesn't carry it."""
         try:
+            from PyQt6.QtWidgets import QApplication
             point = args[0] if args else None
-            if point is None:
-                self.surfacePointPicked.emit(None)
-                return
-            arr = np.asarray(point, dtype=float).ravel()
-            if arr.size >= 3 and bool(np.all(np.isfinite(arr[:3]))):
-                self.surfacePointPicked.emit(arr[:3].copy())
+            pt = None
+            if point is not None:
+                arr = np.asarray(point, dtype=float).ravel()
+                if arr.size >= 3 and bool(np.all(np.isfinite(arr[:3]))):
+                    pt = arr[:3].copy()
+            ctrl = bool(QApplication.keyboardModifiers()
+                        & Qt.KeyboardModifier.ControlModifier)
+            if ctrl:
+                self.trianglePoissonPicked.emit(pt)
             else:
-                self.surfacePointPicked.emit(None)
+                self.surfacePointPicked.emit(pt)
         except Exception:
             pass
 
