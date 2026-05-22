@@ -294,3 +294,198 @@ Key decisions & caveats (details inline above):
 
 Regression (`tests/test_regression.py`) stayed green throughout; goldens and the
 load-bearing GUI STL-diff test were never modified.
+
+---
+---
+
+# Batch 2 — 2026-05-22 (user-reported bugs + features)
+
+**Branch:** `nightly/auto-2026-05-22` (CONTINUE — do not cut a new branch).
+**Run via:** `/loop /nightly`. Read this whole file first every iteration.
+**Repro fixtures (untracked scratch presets in repo root):** `presetEqTri.json`,
+`presetEqHex.json`, `presetEqRho.json`, `preset4x1.json`. Use them to reproduce; do
+not commit them unless a task needs one as a test fixture.
+
+## Task checklist (Batch 2)
+
+| # | Task | Status |
+|---|------|--------|
+| 1 | Bezier strut curving is wrong — fix curve direction/shape to match intent | TODO |
+| 2 | Kinematic sim playback flickers / mesh disappears mid-motion | TODO |
+| 3 | Reference-polygon highlight only visible from top, not bottom | TODO |
+| 4 | Desktop-shortcut launch is slow — speed up cold start | TODO |
+| 5 | Kinematic sim is slow and freezes the whole app (UI blocks) | TODO |
+| 6 | Poisson viz + ctrl-click triangle ν + tessellation GUI + remove view buttons | 6e DONE (583231d); 6a–6d TODO |
+
+**Working order (risk-managed, isolated/cheap first → big features last):**
+6e (remove buttons — trivial) → 3 (small render fix) → 2 (render fix, same redraw path)
+→ 1 (geometry; regression-sensitive) → 4 (import chain) → 5 (threading) → 6a–6d (largest).
+Task 6 is split: pull **6e** forward; do **6a–6d** last.
+
+## Confirm-before-guessing (open questions)
+- **T1 bezier direction.** The intended look is the user's hand drawing (struts curve
+  *inward* / re-entrant, concave), vs. current behavior bowing *outward*. If the exact
+  intended direction/magnitude is ambiguous from the drawing, flag it in the log rather
+  than guessing a convention.
+- **T6e.** Remove ONLY Top/Bottom/Front/Back/Side. Keep **Iso** and **Fit** (the XYZ
+  gizmo doesn't provide those). Default assumption: keep them.
+- **T6d.** Density control: expose `target_edge` AND/OR `n_triangles`; pick the clearer UX.
+
+---
+
+## Task specs (Batch 2)
+
+### Task 1 — Fix bezier strut curving (geometry)
+- **Symptom.** With "Curve strut edges" ON, EqTri struts bow the wrong way/shape. User
+  screenshots: (a) normal = straight triangular frame; (b) current bezier = struts bow
+  **outward** into convex arcs (rounded-triangle / trefoil); (c) hand drawing = struts
+  curve **inward / re-entrant** (concave) — the intended auxetic look.
+- **Anchors.** `auxetic/geometry.py::bezier_polyline` (pure quadratic Bézier; OFF returns
+  exact `[p0,p1]`). `auxetic/export.py::collect_export_geometry` threads `bezier_*`; per
+  the Batch-1 log it "bows struts **away from the lattice centroid**" (see export.py ~L40
+  "A bezier strut is an N-point polyline"). GUI "Bezier edges" group in
+  `auxetic_studio/inspector.py` (checkbox + strength + segments; commit `ccd873c`).
+  **Live viewport uses the same geometry path** — `views.py` builds
+  `strut_curves, solid_triangles, joint_positions = ...` (~L1713-1750); views.py has no
+  bezier code of its own, so curves appear live AND in STL/OBJ/SCAD via the Lattice/export
+  path. They must stay consistent.
+- **Likely fix.** The radial "away-from-global-centroid" offset distorts non-radial struts.
+  Reconsider the control-point placement in `bezier_polyline` / the offset sign+axis in
+  `collect_export_geometry` — probably the per-strut control offset should be perpendicular
+  to the strut toward the correct (concave) side, not radial from the global centroid.
+  Keep OFF **byte-identical** (regression). The Batch-1 scope decision stands: bezier =
+  strut edges, not tile-face polygon outlines.
+- **Acceptance.** `presetEqTri.json` + Curve strut edges ON ≈ the drawing; OFF byte-identical;
+  viewport == export; `test_regression.py` + `tests/test_bezier_edges.py` +
+  `tests/test_scad_export.py` green.
+
+### Task 2 — Kinematic sim playback flicker / disappearance
+- **Symptom.** Lattice flashes / vanishes intermittently while moving during playback.
+- **Root cause (confirmed pattern).** Each redraw does `views.py:1240`
+  `remove_actor(self._mesh_actor)` then `views.py:1246` `add_mesh(...)` — a window with no
+  mesh actor; a render landing in that gap flickers. A second mesh-actor pair sits at
+  `views.py:1342/1347`. Playback ticks from `simulation_panel.py:1473 _on_play_tick`
+  (`_play_timer` 30 fps, connected at `simulation_panel.py:197`).
+- **Likely fix.** Update the existing actor's mesh **in place** (swap points / mapper input)
+  instead of remove+add; or do the swap with `render=False` and a single render at the end
+  so no frame is drawn between remove and add. Read the redraw path ~L1230-1350.
+- **Acceptance.** Full bistable sweep on presetEqTri & presetEqHex shows no flicker. Add a
+  headless smoke test that stepping the pose keeps exactly one mesh actor (no mid-frame drop).
+- **Note.** Coherent with Task 5 (don't reintroduce blocking).
+
+### Task 3 — Reference-polygon highlight invisible from bottom
+- **Symptom.** Highlight outline around the reference polygon shows from Top but not (clearly)
+  from Bottom.
+- **Anchor.** `views.py` `self._anchor_actor` — `views.py:1386` `remove_actor(self._anchor_actor)`
+  / `views.py:1402` `add_mesh(...)`. Read ~L1380-1420 for its styling.
+- **Likely cause.** Depth bias / render-on-top that only wins from one side, a z/polygon
+  offset toward +Z, or backface culling on a one-sided outline → occluded from below.
+- **Likely fix.** Make the highlight depth-independent from both sides (disable depth test
+  for the anchor actor / resolve coincident topology), or draw it as a true 3D ring/tube
+  that isn't occluded — without changing the Top-view look.
+- **Acceptance.** Highlight equally visible Top / Bottom / Iso on presetEqHex (the reference
+  triangle inside the hex).
+
+### Task 4 — Slow desktop-shortcut launch
+- **Symptom.** Launching via the Windows desktop shortcut is slow (cold start).
+- **Investigate.** The `.lnk` lives on the Windows Desktop (outside the repo — repo glob
+  found none). Inspect its target/args (likely `pythonw -m auxetic_studio`, possibly with a
+  venv/conda activation). Read `auxetic_studio/__main__.py` + `auxetic_studio/__init__.py`
+  import chain. Prime suspects: eager `pyvista`/`vtk` (heavy, needed for 3D), `scipy`,
+  `numpy-stl`, and **especially whether `auxetic_ml` / torch is imported at startup**
+  (`predictor_panel.py:54` has a training worker — check it doesn't import torch eagerly).
+- **Likely fix.** Lazy-import heavy/optional deps (torch/ML on first use; possibly defer
+  pyvista until the 3D view first shows), trim top-level import side effects, optional splash
+  for perceived speed. If the shortcut re-activates an env each launch, advise a direct
+  interpreter path / `pythonw`.
+- **Acceptance.** Report measured cold start before/after; no functional regression;
+  `tests/test_app.py` green.
+- **Caveat (state honestly).** Part of this is OS-shortcut config, not code. Optimize the
+  import chain regardless; advise on the `.lnk` separately.
+
+### Task 5 — Kinematic sim slow + UI freeze
+- **Symptom.** Running the kinematic sim is slow and the entire app stops responding.
+- **Cause.** The solver runs synchronously on the UI thread, blocking the Qt event loop.
+  Solver: `auxetic/simulation.py::Simulator` (null-space mode id, projection, sweep —
+  SPEC §7), invoked from `auxetic_studio/simulation_panel.py`.
+- **Likely fix.** Run the solve in a `QThread`/`QRunnable` worker; emit progress + result
+  signals to the UI; **keep all numerics in `auxetic/`** (worker only calls `Lattice`/
+  `Simulator` methods). Add a cancel path. Mirror the existing background-worker pattern at
+  `predictor_panel.py:54` ("keeps the GUI responsive"). Separately, profile for cheap wins
+  (vectorize; cache/reuse the Jacobian factorization across the sweep; sane default sweep
+  resolution) — **no new native deps**.
+- **Acceptance.** UI stays responsive (movable / cancelable) during a sim; worker results
+  numerically identical to the synchronous path (lock with a test: worker output ==
+  `Simulator` direct output); sim faster or at least non-blocking. Coherent with Task 2.
+
+### Task 6 — Poisson viz + ctrl-click ν + tessellation GUI + remove view buttons
+Split into 6a–6e. Pull **6e** forward (trivial); do 6a–6d last.
+
+- **6a — Tracked-points + bbox visual.** Visualize the points the Poisson calc tracks:
+  INITIAL points in **magenta / yellow / teal**; FINAL (compressed) points in **darker**
+  magenta/yellow/teal; animate them as they move with the sim. Draw two bounding boxes —
+  original dimensions and compressed dimensions. Source the tracked points + bbox corners
+  from a Lattice/Simulator method (`simulation.py::poissons_ratio`, bbox-based, SPEC §7.4 —
+  the bbox corners are implicit there; expose them). Render in `views.py` as point + box
+  actors. Selection/geometry of tracked points must come from `auxetic/`, not the GUI.
+- **6b — Full-structure ν.** Show the whole-structure Poisson (e.g. full EqHex), not just one
+  triangle. `Lattice.edge_vector_poisson_ratio` (mean over 2D triangles) and the bbox
+  `poissons_ratio` are already whole-structure — surface a clear "full-structure ν" readout
+  that works on `presetEqHex.json`.
+- **6c — Ctrl-click a triangle (3D) → its ν.** Add 3D cell picking in `views.py` (VTK cell
+  picker). On **Ctrl + left-click in 3D mode**, identify the picked triangle/tile and display
+  its generalized Poisson via `auxetic/edge_poisson.py::generalized_poisson_ratio` (wrap in a
+  `Lattice` method mapping picked cell → triangle → ν). 2D picking already exists
+  (`views.py` DraggablePointsItem); 3D picking is new. Detect the Ctrl modifier.
+- **6d — Tessellation in the GUI.** `auxetic/tessellation.py::generate_tessellation` +
+  `Lattice.from_tessellation` exist with **no GUI entry point** yet. Add inspector controls
+  to tessellate with a **user-specified density** ("more points / more triangles"): expose
+  `target_edge` and/or `n_triangles` (spinbox), plus the boundary source. Wire through
+  `Lattice.from_tessellation` (no geometry in GUI). If it changes persisted lattice state,
+  bump the preset version + add a migration.
+- **6e — Remove Top/Bottom/Front/Back/Side buttons.** Remove the five camera QActions in
+  `auxetic_studio/main_window.py`: `cam_top_act` (L261), `cam_bottom_act` (L267),
+  `cam_front_act` (L273), `cam_back_act` (L279), `cam_side_act` (L285) — plus their
+  toolbar/menu placement and signal connections. **KEEP** `cam_iso_act` (L291) and
+  `cam_fit_act` (L297). **DO NOT touch** the Inspector's "Top/Front/Side/Reset"
+  *orientation-preset* rotation buttons (`inspector.py:259`, presets at `inspector.py:96-98`)
+  — those are a different feature (rigid lattice orientation), explicitly distinguished at
+  `main_window.py:256`. The View3D camera-preset methods (`views.py` ~L1139+) may stay
+  (harmless) or drop the now-unused ones.
+- **Acceptance.** 6a/6b/6c demoable on `presetEqHex.json`; tessellation reachable from the
+  GUI with a working density control; the five view buttons gone with Iso/Fit + the XYZ
+  gizmo + the Inspector orientation presets all intact; full suite green.
+
+---
+
+## Decisions & assumptions (Batch 2)
+- **T6e — also removed the dead View3D methods.** Spec said the
+  `camera_top/bottom/front/back/side` View3D methods "may stay (harmless) or
+  drop." Grep confirmed they were referenced ONLY by the five toolbar actions
+  being removed (+ the nav test), so I deleted them too — no dead code left.
+  `camera_isometric` / `camera_fit` stay (Iso/Fit buttons + gizmo). Did NOT
+  touch the Inspector's Top/Front/Side/Reset *orientation* buttons (those
+  rotate the lattice; different feature).
+- **GUI-test composition preserved.** `tests/test_view3d_navigation.py` is the
+  flaky 6-test GUI file (Win+PyQt6+pyvistaqt teardown race). I trimmed the
+  removed actions/methods out of three tests but kept ALL SIX test functions
+  so the file's known-stable composition is unchanged. Full-suite count stayed
+  529 passed / 1 skipped — proof no test function was lost.
+
+## Per-iteration notes (Batch 2)
+
+### Iteration 1 (2026-05-22) — Task 6e remove view buttons (COMPLETE, 583231d)
+- Removed the five camera-preset toolbar QActions (`cam_top/bottom/front/back/
+  side_act`) from `main_window.py::_build_toolbar`, keeping `cam_iso_act` /
+  `cam_fit_act`. Removed the five now-orphaned `View3D.camera_*` methods from
+  `views.py` and updated the section header comment to "Iso / Fit".
+- Trimmed `test_view3d_navigation.py` (`_CAM_ACTION_NAMES` + the click-dispatch
+  and headless-no-op tests) to iso/fit; kept all 6 test functions intact.
+- Verified via the FULL suite (GUI tests must run in company, never alone):
+  **529 passed, 1 skipped, 0 failures** (6m37s). Regression untouched (didn't
+  touch `auxetic/`). The lone warning (degenerate kirigami mode in
+  `test_cuboid_kirigami`) is pre-existing, not mine.
+- **Next step:** Task 3 — reference-polygon highlight invisible from bottom
+  (`views.py` `self._anchor_actor`, ~L1380-1420). Small render fix; next in the
+  risk-managed working order (6e → **3** → 2 → 1 → 4 → 5 → 6a–6d).
+
