@@ -896,7 +896,7 @@ points). These three tasks refine that overlay.
 |---|------|--------|
 | 1 | Add a full-EXPANSION bounds box (max axial extent), alongside rest + compressed | DONE (a6feada) |
 | 2 | Draw the bounds in the reference-polygon (anchored) frame, not the absolute frame | DONE (80fcef5) |
-| 3 | GUI toggles to show/hide each bounds box individually in the kinematic sim | TODO |
+| 3 | GUI toggles to show/hide each bounds box individually in the kinematic sim | DONE (53a7d61) |
 
 **Working order (risk-managed):** 1 (additive box) → 2 (frame correctness for all
 boxes) → 3 (GUI toggles, last). One commit per task.
@@ -979,6 +979,14 @@ boxes) → 3 (GUI toggles, last). One commit per task.
   identical in anchored and absolute frames. The regression-discriminating test
   assertion therefore targets the COMPRESSED (actuated) pose, where relativization
   genuinely transforms the bbox (verified Qt-free on the fixture lattice).
+- **T3 a hidden box is OMITTED from the recorded tap, not just undrawn.** Acceptance
+  said "a disabled box is omitted from the drawn/recorded set," so when a `show_*`
+  flag is False, `show_poisson_tracking` records `None` for that box's corners +
+  extremes (and stores the three `show_*` booleans) — the headless tap reflects
+  exactly what's on screen, which is also how the test asserts visibility without a
+  real interactor. Default all-ON keeps every key an array, so the Batch-1 6a tap
+  test is unaffected. The `show_*` params are keyword-only to keep the positional
+  geometry signature stable.
 
 ## Per-iteration notes (Batch 3)
 
@@ -1059,4 +1067,67 @@ boxes) → 3 (GUI toggles, last). One commit per task.
   it updates live. Headless test: the visibility flags reach `show_poisson_tracking`
   (via the tap) and a disabled box is omitted from the recorded set. Then Batch 3
   COMPLETE → full-suite verify → final summary → STOP. Working order: 1 → 2 → **3**.
+
+### Iteration 3 (2026-05-22) — Task 3 per-bound GUI toggles (COMPLETE, 53a7d61)
+- **Shipped.** A "Poisson bounds" `QGroupBox` in the Simulation panel
+  (`_build_poisson_bounds_box`, added to `__init__`'s build sequence after the joint
+  slider) with three checkboxes — Initial / Compressed / Expansion, default ON. Each
+  `toggled` connects to `_update_poisson_tracking`, so flipping a box re-renders the
+  overlay live. `_update_poisson_tracking` reads the three `isChecked()` states and
+  passes them as keyword-only `show_initial/show_compressed/show_expansion` to
+  `View3D.show_poisson_tracking`. Added the `QCheckBox` import.
+- **views.py.** `show_poisson_tracking` gained keyword-only `show_*` flags. A
+  disabled box is neither drawn (gated `_add_bbox_wireframe`/`_add_extreme_points`)
+  nor recorded — its `last_poisson_tracking` corners + extremes are `None` (via a
+  small `_vis(arr, show)` helper), and the three `show_*` booleans are recorded too,
+  so the headless tap mirrors exactly what's on screen.
+- **Pure GUI / geometry untouched.** No `auxetic/` change; the Simulator still
+  computes the same three poses' geometry — the toggles only gate visibility.
+- **Test.** `tests/test_simulation_gui.py::test_poisson_bound_toggles_hide_
+  individual_boxes`: default → all three boxes present + flags True; unchecking
+  "Compressed" (which fires `toggled` → live re-render) sets `final_corners` /
+  `final_extremes` to None and `show_compressed` False while initial + expansion stay
+  arrays; re-checking restores the compressed box. Files byte-compiled clean first.
+- **HONEST CAVEAT.** The headless test proves the visibility state reaches the view
+  and a disabled box is omitted from the recorded set; the actual on-screen show/hide
+  (and live update on click) needs a real interactor — a human should eyeball it on
+  presetEqHex.
+- Full suite **559 passed, 1 skipped** (+1 GUI test), 0 failures, EXIT 0 (5m18s).
+  GUI tests verified in company (teardown-race rule). Pre-existing degenerate-mode
+  warning is not mine.
+
+---
+
+## Final summary (Batch 3)
+
+**Status: COMPLETE. All 3 Batch-3 tasks meet their acceptance criteria; full suite
+green — 559 passed, 1 skipped [openscad CLI absent], 0 failures, EXIT 0.** Branch
+`nightly/auto-2026-05-22`, 6 commits on top of Batch 2 (3 `Task` + 3 `Log`).
+
+What shipped (working order 1 → 2 → 3):
+- **Task 1 — full-expansion bounds box (a6feada).** A third Poisson bounds box at the
+  most axially-EXPANDED sweep pose (`argmax(bbox_extents[:, axial])`), the counterpart
+  to the existing most-COMPRESSED (`argmin`) box. `show_poisson_tracking` gained
+  optional expansion corners + extremes (green/cyan family); `_update_poisson_tracking`
+  computes the expanded pose. Geometry stays in the Simulator. +1 pure test.
+- **Task 2 — bounds in the anchored reference frame (80fcef5).** When a polygon is
+  anchored, `_update_poisson_tracking` now relativizes all three poses with
+  `Simulator.relativize_pose` (the same transform the display uses) before computing
+  bbox geometry, so the boxes enclose the on-screen structure. No anchor → absolute,
+  unchanged. +1 GUI test (discriminates on the compressed pose, since rest is the
+  identity under relativize).
+- **Task 3 — per-bound GUI toggles (53a7d61).** Three Simulation-panel checkboxes
+  (Initial / Compressed / Expansion, default ON) gate each box live via keyword-only
+  `show_*` flags; a hidden box is neither drawn nor recorded (tap geometry None).
+  Pure GUI visibility. +1 GUI test.
+
+**Caveats requiring a human (visual / interaction — not headlessly verifiable, flagged
+inline above):** the expansion box looking right on presetEqHex (T1); the anchored
+boxes hugging the relativized structure when anchored to polygon #6 (T2); the live
+show/hide on checkbox click (T3). All geometry/numerics are tested purely (in
+`auxetic/` or via the headless `last_poisson_tracking` tap); `auxetic/` was untouched
+this batch, so `test_regression.py` and the load-bearing `test_app.py` STL-diff test
+stayed green and were never modified.
+
+**STOP.** All Batch-3 tasks DONE, full suite green. No new work invented.
 
