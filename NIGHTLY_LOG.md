@@ -895,7 +895,7 @@ points). These three tasks refine that overlay.
 | # | Task | Status |
 |---|------|--------|
 | 1 | Add a full-EXPANSION bounds box (max axial extent), alongside rest + compressed | DONE (a6feada) |
-| 2 | Draw the bounds in the reference-polygon (anchored) frame, not the absolute frame | TODO |
+| 2 | Draw the bounds in the reference-polygon (anchored) frame, not the absolute frame | DONE (80fcef5) |
 | 3 | GUI toggles to show/hide each bounds box individually in the kinematic sim | TODO |
 
 **Working order (risk-managed):** 1 (additive box) → 2 (frame correctness for all
@@ -966,6 +966,19 @@ boxes) → 3 (GUI toggles, last). One commit per task.
   whole distinct family over a third brightness level of the same hues because
   three shades of magenta are hard to tell apart; the spec explicitly suggested
   green/cyan.
+- **T2 pose-selection stays in the ABSOLUTE frame; only the FRAME is relativized.**
+  `_update_poisson_tracking` still picks the compressed/expanded sweep indices from
+  the absolute `result.bbox_extents` (argmin/argmax), then relativizes those chosen
+  poses for display. Relativization is a global rigid transform — which physical
+  pose is "most compressed/expanded" is a property of the mechanism, not the viewing
+  frame — so re-picking indices off relativized extents would be wrong. The spec
+  asked only to relativize the poses before `bbox_corners` / `bbox_extreme_vertices`;
+  that's exactly what shipped.
+- **T2 rest pose is the identity under relativize.** The rest pose is the zero DOF
+  vector, so `relativize_pose(rest, anchor)` returns it unchanged → the rest box is
+  identical in anchored and absolute frames. The regression-discriminating test
+  assertion therefore targets the COMPRESSED (actuated) pose, where relativization
+  genuinely transforms the bbox (verified Qt-free on the fixture lattice).
 
 ## Per-iteration notes (Batch 3)
 
@@ -1009,4 +1022,41 @@ boxes) → 3 (GUI toggles, last). One commit per task.
   absolute (unchanged). Headless test: with an anchor set, the tracking corners
   equal the AABB of the *relativized* poses, not the absolute ones. Working order:
   1 → **2** → 3.
+
+### Iteration 2 (2026-05-22) — Task 2 bounds in the anchored frame (COMPLETE, 80fcef5)
+- **Root cause.** With a polygon anchored, `_drive_pose_from_slider` draws every
+  frame relativized to that polygon (`Simulator.relativize_pose`), but
+  `_update_poisson_tracking` built the bbox geometry from ABSOLUTE poses → the three
+  bounds boxes didn't enclose the on-screen (relativized) structure (the Batch-2 6a
+  caveat, now user-reported).
+- **Fix.** In `_update_poisson_tracking`, when `self._anchor_tile is not None`,
+  relativize `rest`, `final_pose` (compressed) and `expansion_pose` with
+  `sim.relativize_pose(pose, anchor)` BEFORE `bbox_corners` / `bbox_extreme_vertices`
+  — the SAME transform the display uses. No anchor → absolute (unchanged). Mirrors the
+  display path at `simulation_panel.py:1363`. Geometry stays in the Simulator
+  (`auxetic/`); the panel only selects the pose + frame, the view only renders.
+- **Tests.** `tests/test_simulation_gui.py::test_anchored_poisson_bounds_use_
+  relativized_poses`: with anchor=0, the tracking corners equal the AABB of the
+  RELATIVIZED rest + compressed poses, and (when relativization changes that pose's
+  bbox) differ from the absolute-pose corners — the assertion that regresses if the
+  relativize step is dropped. Confirmed Qt-free first that on the fixture lattice
+  (`mode=1, n_points=5, ratio=0.35, seed=42`) the compressed pose (sweep idx 0,
+  θ=-π/2) is genuinely transformed by `relativize_pose(·, 0)` and its bbox changes,
+  so the guard is real, not a tautology.
+- **HONEST CAVEAT.** The headless test pins that the panel hands the view the
+  relativized AABBs; the actual on-screen alignment (boxes hugging the anchored
+  structure on presetEqHex anchored to polygon #6) needs a real interactor — a human
+  should eyeball it.
+- Full suite **558 passed, 1 skipped** (+1 GUI test), 0 failures, EXIT 0 (5m57s).
+  GUI test verified in company (teardown-race rule). `auxetic/` untouched; regression
+  green within the suite. Pre-existing degenerate-mode warning is not mine.
+- **Next step (LAST Batch-3 task):** Task 3 — per-bound GUI toggles. Add three
+  checkboxes (Initial / Compressed / Expansion, default ON) to the Simulation panel;
+  thread their state through `_update_poisson_tracking` →
+  `View3D.show_poisson_tracking(..., show_initial=, show_compressed=,
+  show_expansion=)` so each box (+ its extreme points) draws only when enabled. Pure
+  GUI visibility; geometry unchanged. Re-call `_update_poisson_tracking` on toggle so
+  it updates live. Headless test: the visibility flags reach `show_poisson_tracking`
+  (via the tap) and a disabled box is omitted from the recorded set. Then Batch 3
+  COMPLETE → full-suite verify → final summary → STOP. Working order: 1 → 2 → **3**.
 
