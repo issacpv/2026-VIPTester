@@ -175,4 +175,7 @@ def test_save_load_roundtrip_dynamics_config_overrides(tmp_path):
 
 
 def test_save_writes_version_4():
-    assert PRESET_VERSION == 4
+    # v4 is no longer the latest schema (v5 added mode-11 ``C``), but it
+    # must remain a supported floor. The exact-version pin now lives in
+    # test_preset_v5.py::test_preset_version_is_5.
+    assert PRESET_VERSION >= 4

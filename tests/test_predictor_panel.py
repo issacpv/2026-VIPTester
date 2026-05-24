@@ -58,6 +58,27 @@ def test_save_disabled_when_no_model_loaded(main_window):
 
 
 # ---------------------------------------------------------------------------
+# Edge-vector Poisson metric (task 4)
+# ---------------------------------------------------------------------------
+
+def test_panel_shows_edge_poisson_metric(main_window):
+    p = main_window.predictor_panel
+    assert hasattr(p, "edge_poisson_label")
+    # Default lattice is 2D mode 1 -> a finite metric is displayed.
+    expected = f"{main_window.lattice.edge_vector_poisson_ratio():+.3f}"
+    assert expected in p.edge_poisson_label.text()
+
+
+def test_edge_poisson_metric_matches_lattice_method(main_window):
+    import math
+    p = main_window.predictor_panel
+    p.refresh_metrics()
+    val = main_window.lattice.edge_vector_poisson_ratio()
+    assert math.isfinite(val)
+    assert f"{val:+.3f}" in p.edge_poisson_label.text()
+
+
+# ---------------------------------------------------------------------------
 # Inject a tiny trained model and exercise predict + apply
 # ---------------------------------------------------------------------------
 

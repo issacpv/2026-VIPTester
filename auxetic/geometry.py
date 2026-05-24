@@ -316,6 +316,40 @@ def flippable_edges(tri, points):
     return out
 
 
+def edge_flip_apexes(tri, edge):
+    """Return the two apex vertices ``(c, d)`` of the quad whose diagonal
+    is ``edge`` — the pair a diagonal flip of ``edge`` would connect.
+
+    ``edge`` is an ``(i, j)`` tuple of vertex indices. The apexes are the
+    third vertices of the two triangles sharing ``edge``. Returns a
+    sorted ``(c, d)`` tuple, or ``None`` when ``edge`` is not a shared
+    interior edge of exactly two triangles in ``tri`` (boundary edges,
+    edges absent from the triangulation, or 3D triangulations).
+
+    Used by the GUI's edge-flip interaction: once the user selects an
+    edge, these two corners are highlighted as the Ctrl-click targets
+    that confirm the flip.
+    """
+    simplices = np.asarray(tri.simplices)
+    if simplices.size == 0 or simplices.ndim != 2 or simplices.shape[1] != 3:
+        return None
+    a, b = int(edge[0]), int(edge[1])
+    if a > b:
+        a, b = b, a
+    opps: list[int] = []
+    for simplex in simplices:
+        verts = [int(v) for v in simplex]
+        if a in verts and b in verts:
+            for v in verts:
+                if v != a and v != b:
+                    opps.append(v)
+                    break
+    if len(opps) != 2:
+        return None
+    c, d = sorted(opps)
+    return (c, d)
+
+
 def apply_edge_flips(tri, points, flips):
     """Apply ``flips`` (an iterable of ``(i, j)`` edges) to ``tri``.
 
@@ -659,19 +693,119 @@ def build_3d_groups(pts_norm, tri, ratio):
     return groups
 
 
+def bezier_polyline(p0, p1, *,
+                    strength: float = 0.0,
+                    segments: int = 1,
+                    bow_dir=None) -> np.ndarray:
+    """Tessellate a quadratic-Bézier arc from ``p0`` to ``p1`` into a
+    dense polyline.
+
+    A straight strut is the degenerate Bézier whose control point sits on
+    the segment. ``strength`` lifts a single control point off the
+    midpoint, perpendicular to the segment, by ``strength * |p1 - p0|``;
+    the curve is then sampled at ``segments + 1`` evenly-spaced parameter
+    values. The endpoints are exact (``out[0] == p0``, ``out[-1] == p1``).
+
+    Behaviour-preserving guarantee: when ``strength == 0``, ``segments
+    <= 1``, or the segment is degenerate, the function returns exactly
+    ``np.array([p0, p1])`` — the same 2-point array the straight-strut
+    path emits — so geometry with curves OFF is byte-for-byte identical.
+
+    ``bow_dir`` is an optional hint for which way the arc bows; only its
+    component perpendicular to the segment is used, so the endpoints are
+    never disturbed. When it is ``None``, parallel to the segment, or
+    zero, a deterministic perpendicular is chosen (cross with world +Z,
+    falling back to world +Y for vertical segments) so the bow direction
+    is stable and reproducible.
+
+    Points are treated as 3-vectors (struts are always emitted in 3D).
+    """
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    seg = int(segments)
+    d = p1 - p0
+    length = float(np.linalg.norm(d))
+    if float(strength) == 0.0 or seg <= 1 or length < 1e-12:
+        return np.array([p0, p1])
+
+    dh = d / length
+    perp = None
+    if bow_dir is not None:
+        bd = np.asarray(bow_dir, dtype=float)
+        bd_perp = bd - np.dot(bd, dh) * dh
+        n = float(np.linalg.norm(bd_perp))
+        if n > 1e-9:
+            perp = bd_perp / n
+    if perp is None:
+        perp = np.cross(dh, np.array([0.0, 0.0, 1.0]))
+        if float(np.linalg.norm(perp)) < 1e-6:
+            perp = np.cross(dh, np.array([0.0, 1.0, 0.0]))
+        perp = perp / float(np.linalg.norm(perp))
+
+    mid = 0.5 * (p0 + p1)
+    ctrl = mid + float(strength) * length * perp
+
+    t = np.linspace(0.0, 1.0, seg + 1)[:, None]
+    out = (1.0 - t) ** 2 * p0 + 2.0 * (1.0 - t) * t * ctrl + t ** 2 * p1
+    # Pin the endpoints to the exact inputs (guard against float drift in
+    # the polynomial evaluation at t=0 / t=1).
+    out[0] = p0
+    out[-1] = p1
+    return out
+
+
 def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
                               cuboid_tiles=None,
-                              cuboid_constraints=None):
-    """Build the strut curves, solid triangles, and joint positions for STL/OBJ/SCAD output."""
+                              cuboid_constraints=None,
+                              bipartite_C=1.0,
+                              bipartite_theta=0.0,
+                              bezier_enabled: bool = False,
+                              bezier_strength: float = 0.0,
+                              bezier_segments: int = 1):
+    """Build the strut curves, solid triangles, and joint positions for STL/OBJ/SCAD output.
+
+    When ``bezier_enabled`` is set (and ``bezier_strength`` is non-zero
+    and ``bezier_segments > 1``), each strut is emitted as a tessellated
+    quadratic-Bézier polyline (see :func:`bezier_polyline`) instead of a
+    straight 2-point segment. With it off — the default — struts are the
+    same 2-point arrays as before, so STL/OBJ/SCAD output is unchanged.
+    The arcs bow *toward* the lattice centroid, so each strut curves inward
+    (concave / re-entrant — the intended auxetic look) coherently rather
+    than each picking an arbitrary normal."""
     strut_curves  = []
     all_triangles = []
     joint_positions = set()
+
+    _bez_on = bool(bezier_enabled) and float(bezier_strength) != 0.0 and int(bezier_segments) > 1
+    # Centroid of the export geometry, used as the bow reference so struts
+    # curve inward (concave / re-entrant) coherently. Computed lazily from
+    # the point cloud (lifted to 3D for 2D modes); falls back to None
+    # (deterministic perpendicular) when unavailable.
+    _bow_center = None
+    if _bez_on:
+        try:
+            pc = np.asarray(points_nd, dtype=float)
+            if pc.ndim == 2 and pc.shape[0] > 0:
+                c = pc.mean(axis=0)
+                _bow_center = c if c.shape[0] == 3 else np.array([c[0], c[1], 0.0])
+        except (ValueError, TypeError):
+            _bow_center = None
 
     def add_strut(p0, p1):
         p0 = np.asarray(p0, float)
         p1 = np.asarray(p1, float)
         if np.linalg.norm(p1 - p0) > 1e-9:
-            strut_curves.append(np.array([p0, p1]))
+            if _bez_on:
+                bow = None
+                if _bow_center is not None:
+                    # Toward the centroid -> concave / re-entrant arc (inward),
+                    # not away (which bulged the struts outward — the bug).
+                    bow = _bow_center - 0.5 * (p0 + p1)
+                strut_curves.append(bezier_polyline(
+                    p0, p1, strength=float(bezier_strength),
+                    segments=int(bezier_segments), bow_dir=bow))
+            else:
+                strut_curves.append(np.array([p0, p1]))
 
     def register_joint(pt):
         key = tuple(np.round(pt, 8))
@@ -701,6 +835,28 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
             except (IndexError, TypeError):
                 continue
             add_strut(p_a, p_b)
+        return strut_curves, all_triangles, joint_positions
+
+    # Mode-11 bipartite auxetic: extrude each kite / central polygon into
+    # a flat slab and connect adjacent kites with bond struts. Geometry
+    # comes from the rotating-units network at the current actuation
+    # angle (``bipartite_theta``), so a posed lattice exports posed.
+    if mode == 11:
+        from . import bipartite as _bip
+        net = _bip.build_bipartite_network(
+            points_nd, np.asarray(tri.simplices),
+            C=bipartite_C, theta=bipartite_theta)
+        for poly in net.polygons:
+            v2d = np.asarray(poly.vertices, float)
+            if len(v2d) < 3:
+                continue
+            face3 = np.hstack([v2d, np.zeros((len(v2d), 1))])
+            all_triangles.extend(extrude_polygon_solid(face3))
+            for pt in face3:
+                register_joint(pt)
+        for bond in net.bonds:
+            b = np.asarray(bond, float)
+            add_strut([b[0, 0], b[0, 1], 0.0], [b[1, 0], b[1, 1], 0.0])
         return strut_curves, all_triangles, joint_positions
 
     if mode in [3, 6, 9]:
@@ -870,6 +1026,11 @@ def collect_export_geometry_from_posed_tiles(
             all_triangles.extend(triangles_for_solid_tetrahedron(verts3d))
         elif type_ == 'hub_polyhedron':
             all_triangles.extend(triangles_for_convex_solid(verts3d))
+        elif type_ == 'bond':
+            # Mode-11 bond bar: a 2-vertex rigid link rendered as a
+            # strut tube between its (pose-transformed) endpoints.
+            if len(verts3d) >= 2 and np.linalg.norm(verts3d[1] - verts3d[0]) > 1e-9:
+                strut_curves.append(np.array([verts3d[0], verts3d[1]]))
 
         for v in verts3d:
             joint_positions.add(tuple(np.round(v, 8)))

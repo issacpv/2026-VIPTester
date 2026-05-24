@@ -36,7 +36,7 @@ from auxetic_studio.simulation_panel import (
     slider_to_simulator_theta,
     simulator_theta_to_slider,
 )
-from auxetic_studio.views import View3D, _apply_tile_pose
+from auxetic_studio.views import View3D, _apply_tile_pose, POISSON_BOX_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +74,146 @@ def test_simulation_panel_run_button_populates_results(main_window):
     assert panel._locking_info is not None
     text = panel.readout.text()
     assert "Poisson's ratio" in text
+    # Task 6b: the whole-structure edge-vector ν is surfaced in the readout.
+    assert "Full-structure" in text
+
+
+# ---------------------------------------------------------------------------
+# 1b. Poisson-tracking overlay geometry is handed to the 3D view (task 6a)
+# ---------------------------------------------------------------------------
+
+def test_run_simulation_populates_poisson_tracking(main_window):
+    """After a sim, the panel feeds View3D the Poisson-bounds geometry for all
+    seven extremal-pose boxes (rest, the two ±θ compressions, and the four
+    ±X / ±Y farthest-reach poses) — each a bbox corner set + per-axis extreme
+    vertices, all sourced from the Simulator. The overlay actors need a real
+    interactor, but the geometry hand-off is recorded headlessly via
+    ``view_3d.last_poisson_tracking`` and asserted here."""
+    win = main_window
+    panel = win.simulation_panel
+    assert win.view_3d.last_poisson_tracking is None
+    panel.run_simulation()
+
+    tracking = win.view_3d.last_poisson_tracking
+    assert tracking is not None
+    dim = panel._tile_system.dimension
+    # Every box present, and by default visible with a bbox corner set.
+    assert set(tracking) == set(POISSON_BOX_KEYS)
+    for key in POISSON_BOX_KEYS:
+        entry = tracking[key]
+        assert entry["visible"] is True
+        assert entry["corners"].shape == (2 ** dim, dim)
+    # Pose-based boxes carry per-axis extreme vertices; the synthetic overall
+    # footprint box is an envelope (not a single pose), so it has none.
+    for key in POISSON_BOX_KEYS:
+        if key == "footprint":
+            assert tracking[key]["extremes"] is None
+        else:
+            assert tracking[key]["extremes"].shape == (dim, 2, dim)
+
+    # Outdating the sim (e.g. a lattice change) clears the overlay.
+    panel.mark_outdated()
+    assert win.view_3d.last_poisson_tracking is None
+
+
+def test_anchored_poisson_bounds_use_relativized_poses(main_window):
+    """With a polygon anchored, the displayed structure is drawn in that
+    polygon's frame (relativize_pose), so the Poisson bounds must be computed
+    from the SAME relativized poses — not the absolute ones — to enclose
+    what's on screen. The *choice* of which sample is extremal stays absolute
+    (``Simulator.extremal_pose_indices``); only the drawn box is relativized."""
+    win = main_window
+    panel = win.simulation_panel
+    panel.run_simulation()
+    sim = panel._simulator
+    result = panel._sim_result
+    if sim is None or result is None or sim.n_tiles == 0:
+        pytest.skip("no kinematic result with tiles to anchor")
+
+    anchor = 0
+    panel._anchor_tile = anchor
+    panel._update_poisson_tracking()
+    tracking = win.view_3d.last_poisson_tracking
+    assert tracking is not None
+
+    # Anchored ⇒ the panel selects extremes in the anchor frame too, so
+    # predict with the same anchor.
+    indices = sim.extremal_pose_indices(result, anchor=anchor)
+
+    # Rest box: corners match the AABB of the RELATIVIZED rest pose.
+    # (At rest the pose is the zero vector, so relativize is the identity —
+    # this equality also holds for the absolute path; the discriminating
+    # check below uses a compressed pose, which actually moves.)
+    rel_rest = sim.relativize_pose(result.poses[indices["initial"]], anchor)
+    np.testing.assert_allclose(
+        tracking["initial"]["corners"], sim.bbox_corners(rel_rest))
+    # Compressed +θ box (Simulator selects argmin axial extent on the θ>0
+    # half) — an actuated pose, so relativization genuinely transforms it.
+    comp_idx = indices["compressed_pos"]
+    abs_comp = sim.bbox_corners(result.poses[comp_idx])
+    rel_comp = sim.bbox_corners(sim.relativize_pose(result.poses[comp_idx], anchor))
+    np.testing.assert_allclose(tracking["compressed_pos"]["corners"], rel_comp)
+    # And whenever relativization changes that pose's bbox, the anchored
+    # corners differ from the ABSOLUTE-pose corners — proving the anchor
+    # frame is actually applied (this is what would regress if the
+    # relativize step were dropped).
+    if not np.allclose(rel_comp, abs_comp):
+        assert not np.allclose(tracking["compressed_pos"]["corners"], abs_comp)
+
+
+def test_poisson_bound_toggles_hide_individual_boxes(main_window):
+    """The seven Poisson-bound checkboxes each gate one box. Unchecking one
+    omits its geometry from the recorded overlay (None) and flips its
+    visibility flag — and toggling re-renders live; re-checking restores it.
+    The other six boxes are unaffected."""
+    win = main_window
+    panel = win.simulation_panel
+    panel.run_simulation()
+    tr = win.view_3d.last_poisson_tracking
+    assert tr is not None
+    dim = panel._tile_system.dimension
+    # Default: every box present and flagged visible.
+    for key in POISSON_BOX_KEYS:
+        assert tr[key]["visible"] is True
+        assert tr[key]["corners"].shape == (2 ** dim, dim)
+
+    # Unchecking "Comp +θ" re-renders live (toggled → _update_poisson_
+    # tracking) and omits ONLY that box's geometry; the others are intact.
+    panel._poisson_bound_cbs["compressed_pos"].setChecked(False)
+    tr = win.view_3d.last_poisson_tracking
+    assert tr["compressed_pos"]["visible"] is False
+    assert tr["compressed_pos"]["corners"] is None
+    assert tr["compressed_pos"]["extremes"] is None
+    for key in POISSON_BOX_KEYS:
+        if key == "compressed_pos":
+            continue
+        assert tr[key]["corners"].shape == (2 ** dim, dim)
+
+    # Re-checking restores it.
+    panel._poisson_bound_cbs["compressed_pos"].setChecked(True)
+    tr = win.view_3d.last_poisson_tracking
+    assert tr["compressed_pos"]["visible"] is True
+    assert tr["compressed_pos"]["corners"].shape == (2 ** dim, dim)
+
+
+# ---------------------------------------------------------------------------
+# 1c. Ctrl-click a triangle in 3D shows its ν in the status bar (task 6c)
+# ---------------------------------------------------------------------------
+
+def test_ctrl_click_triangle_shows_poisson_in_statusbar(main_window):
+    """Task 6c: feeding a world point to the triangle-pick handler shows
+    that triangle's ν in the status bar. The real Ctrl+click goes through a
+    VTK pick (not assertable headlessly); here we drive the handler directly
+    to lock the point -> triangle -> ν -> display path."""
+    win = main_window
+    pts = np.asarray(win.lattice.points)
+    centroid = pts.mean(axis=0)
+    win._on_triangle_poisson_picked(np.array([centroid[0], centroid[1], 0.0]))
+    msg = win.statusBar().currentMessage()
+    assert "Triangle" in msg and "ν" in msg
+
+    # A None pick (missed geometry) leaves the status bar unchanged / safe.
+    win._on_triangle_poisson_picked(None)   # must not raise
 
 
 # ---------------------------------------------------------------------------

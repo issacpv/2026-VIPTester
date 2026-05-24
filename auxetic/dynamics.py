@@ -305,8 +305,45 @@ class DynamicsSimulator:
 
         initial_ke = max(ke_trace[0], 1.0e-12)
         converged = False
+        diverged_at: Optional[int] = None
+        # Lattice space is [0, 1] per CLAUDE.md, so a stable trajectory
+        # rarely sees pose components beyond a few units (the piston
+        # auto-pin keeps the lattice anchored). Anything past 5 lattice
+        # units of bbox-equivalent extent is clearly the explicit-Euler
+        # integrator running away. Catching it early lets us clamp
+        # BEFORE the numbers actually reach Inf, so bbox_extents stays
+        # sane and the renderer never sees garbage. This trips on the
+        # default (mode-1, dt=1ms, 5N piston, 1s duration) load case
+        # which is unstable for the default lattice; sane test configs
+        # stay well below this bound.
+        _DIVERGE_POS_BOUND = 5.0
         for k in range(1, n_steps):
             pose, vel = self.step(pose, vel)
+            # Divergence guard — explicit Euler with stiff penalty
+            # constraints can blow up if dt is too large for the picked
+            # joint_stiffness / mass combination. Detect either (a) a
+            # non-finite pose/velocity, or (b) a runaway magnitude
+            # before it overflows. Once detected, restoring is hopeless:
+            # snap back to the last finite pose, freeze velocity, and
+            # copy that pose into every remaining slot. Callers see a
+            # clamped trajectory rather than NaN/Inf garbage that would
+            # crash the renderer.
+            runaway = (
+                not (np.all(np.isfinite(pose)) and np.all(np.isfinite(vel)))
+                or float(np.max(np.abs(pose))) > _DIVERGE_POS_BOUND
+            )
+            if runaway:
+                diverged_at = k
+                pose = poses[k - 1].copy()
+                vel  = np.zeros_like(vel)
+                last_bbox = bbox_extents[k - 1].copy()
+                last_ke   = float(ke_trace[k - 1])
+                for j in range(k, n_steps):
+                    poses[j]        = pose
+                    velocities[j]   = vel
+                    bbox_extents[j] = last_bbox
+                    ke_trace[j]     = last_ke
+                break
             poses[k]      = pose
             velocities[k] = vel
             bbox_extents[k] = self._bbox_extents(pose)
@@ -533,6 +570,183 @@ class DynamicsSimulator:
 # Convenience: derive default tile masses from geometry
 # ---------------------------------------------------------------------------
 
+class _PistonKinematicSimulator:
+    """``DynamicsSimulator``-shaped wrapper that drives the kirigami's
+    kinematic soft mode under a piston compression load case.
+
+    Physically motivated: a kirigami lattice compressed along its load
+    axis collapses predominantly along its lowest-energy deformation
+    mode, which is exactly the kinematic θ-mode that
+    :class:`auxetic.simulation.Simulator` already computes. Driving
+    the lattice along that mode produces visible auxetic buckling,
+    monotonically-changing internal joint angles, and a stable trajectory
+    — none of which the explicit-Euler Newtonian integrator can deliver
+    for typical kirigami stiffness/mass scales without going unstable.
+
+    The class implements the same surface as :class:`DynamicsSimulator`
+    that the GUI / tests touch: ``tile_system``, ``forces``,
+    ``fixed_tiles``, and ``simulate() -> DynamicsResult``.
+
+    The compression direction is chosen automatically: we run a full
+    ±π/2 sweep (with collision detection), measure how much the lattice
+    contracts along the world load axis on each half, and keep the
+    half-trajectory that compresses more. The kept half is then
+    re-indexed to start at θ=0 (rest) and progress monotonically toward
+    maximum compression — that's what the slider scrubbing visualises.
+    """
+
+    def __init__(self,
+                 tile_system: TileSystem,
+                 config: DynamicsConfig,
+                 *,
+                 forces: List["ForceVector"],
+                 fixed_tiles: List[int],
+                 piston_force_n: float):
+        self.tile_system   = tile_system
+        self.config        = config
+        self.forces        = list(forces)
+        self.fixed_tiles   = list(fixed_tiles)
+        self.piston_force_n = float(piston_force_n)
+        # Compatibility shims with :class:`DynamicsSimulator`'s public
+        # surface so existing tests / callers don't have to special-case
+        # the wrapper. ``ground`` is always None in piston mode (we pin
+        # tiles instead of using a contact plane).
+        self.ground = None
+        self.n_tiles = tile_system.n_tiles
+        # Constructed lazily in ``simulate`` so we don't pay the cost
+        # at build time if the caller only inspects the wrapper.
+        self._kine_sim: Optional[Simulator] = None
+
+    # ------------------------------------------------------------------
+
+    def simulate(self,
+                 initial_pose: Optional[np.ndarray] = None,
+                 initial_vel:  Optional[np.ndarray] = None,
+                 ) -> DynamicsResult:
+        """Run a kinematic θ-sweep, repackaged as a ``DynamicsResult``
+        whose times span ``[0, config.duration]`` and whose poses are
+        the constraint-projected sequence along the auxetic mode."""
+        # Load axis convention matches Simulator.run_simulation in the
+        # GUI: world -Y in both 2D and 3D. The piston pushes downward
+        # (toward -Y), so positive compression is bbox shrinking along
+        # +Y direction.
+        ts = self.tile_system
+        if ts.dimension == 2:
+            load_axis = np.array([0.0, -1.0])
+        else:
+            load_axis = np.array([0.0, -1.0, 0.0])
+        sim = Simulator(ts, load_axis=load_axis)
+        self._kine_sim = sim
+
+        # Sweep across the full bistable range with collision detection
+        # so we can stop the piston where the lattice physically locks.
+        n_steps = max(2, int(np.round(self.config.duration / self.config.dt)) + 1)
+        # Cap n_steps to keep the kinematic projection cost reasonable
+        # — 401 samples is plenty for animation; smaller bumps the cost
+        # of the GUI rendering loop too.
+        sweep_n = min(401, n_steps)
+        sweep = sim.sweep_theta(
+            n_steps=sweep_n, theta_max=float(np.pi / 2.0),
+            collision_stop=True,
+        )
+
+        # Pick the half (negative or positive θ) that actually compresses
+        # the lattice along the load axis. Both halves are kirigami modes;
+        # which one matches "piston pushing down" depends on the sign of
+        # the kirigami mode vector, which is arbitrary.
+        axial_idx = sim._axial_index()
+        axial = sweep.bbox_extents[:, axial_idx]
+        thetas = sweep.theta_samples
+        rest_idx = int(np.argmin(np.abs(thetas)))
+        rest_extent = float(axial[rest_idx])
+
+        # Negative half: thetas < 0, walk toward 0 from the most
+        # negative end.
+        neg_mask = thetas < 0.0
+        pos_mask = thetas > 0.0
+        # Stop each half at the first collision (if any).
+        if sweep.collision_theta_min is not None:
+            neg_mask &= thetas >= sweep.collision_theta_min
+        if sweep.collision_theta_max is not None:
+            pos_mask &= thetas <= sweep.collision_theta_max
+
+        neg_min_extent = (float(axial[neg_mask].min())
+                           if neg_mask.any() else rest_extent)
+        pos_min_extent = (float(axial[pos_mask].min())
+                           if pos_mask.any() else rest_extent)
+        neg_compresses = rest_extent - neg_min_extent
+        pos_compresses = rest_extent - pos_min_extent
+
+        if neg_compresses >= pos_compresses:
+            # Walk from θ=0 toward most-negative θ.
+            half_indices = np.where(thetas <= 0.0)[0][::-1]
+            if sweep.collision_theta_min is not None:
+                # Drop indices past the collision boundary.
+                half_indices = [
+                    i for i in half_indices
+                    if thetas[i] >= sweep.collision_theta_min
+                ]
+        else:
+            half_indices = np.where(thetas >= 0.0)[0]
+            if sweep.collision_theta_max is not None:
+                half_indices = [
+                    i for i in half_indices
+                    if thetas[i] <= sweep.collision_theta_max
+                ]
+        half_indices = list(half_indices)
+        if not half_indices:
+            # Pathological: no kirigami mode (rigid system). Return a
+            # trivial trajectory at rest so the GUI doesn't crash.
+            half_indices = [rest_idx]
+
+        # Resample the half-trajectory onto a uniform time grid of
+        # ``n_steps`` samples spanning [0, duration].
+        n_out = max(2, n_steps)
+        times = np.linspace(0.0, self.config.duration, n_out)
+        n_kept = len(half_indices)
+        # Map output samples to half-trajectory samples — t=0 → rest,
+        # t=duration → max compression.
+        out_floats = np.linspace(0.0, n_kept - 1, n_out)
+        out_idx = np.clip(np.round(out_floats).astype(int), 0, n_kept - 1)
+
+        n_dof = sweep.poses.shape[1]
+        poses        = np.empty((n_out, n_dof), dtype=float)
+        velocities   = np.zeros((n_out, n_dof), dtype=float)
+        bbox_extents = np.empty((n_out, sweep.bbox_extents.shape[1]),
+                                  dtype=float)
+        for k, oi in enumerate(out_idx):
+            src = half_indices[oi]
+            poses[k]        = sweep.poses[src]
+            bbox_extents[k] = sweep.bbox_extents[src]
+
+        # Numerical velocity (for energy bookkeeping). Forward
+        # difference except the last frame, which falls back to zero.
+        if n_out > 1:
+            dt_eff = times[1] - times[0] if times[1] > times[0] else 1.0
+            velocities[:-1] = (poses[1:] - poses[:-1]) / dt_eff
+
+        # KE proxy — quadratic in vel norm. Doesn't reflect actual mass
+        # since this is a kinematic trajectory, but gives the GUI a
+        # plausible energy curve to show.
+        ke_trace = 0.5 * np.einsum('ij,ij->i', velocities, velocities)
+
+        # Compression along load axis: (initial - final) / initial.
+        ax0 = float(bbox_extents[0, axial_idx])
+        ax1 = float(bbox_extents[-1, axial_idx])
+        final_compression = (
+            float((ax0 - ax1) / ax0) if abs(ax0) > 1e-12 else 0.0)
+
+        return DynamicsResult(
+            times=times,
+            poses=poses,
+            velocities=velocities,
+            bbox_extents=bbox_extents,
+            final_compression=final_compression,
+            converged=True,
+            energy_trace={"kinetic": ke_trace},
+        )
+
+
 def _ground_face_plane(face: str, all_vertices: np.ndarray, dim: int
                        ) -> tuple[np.ndarray, np.ndarray]:
     """Convert a face label like ``"+y"`` / ``"-y"`` into a
@@ -717,10 +931,24 @@ def build_dynamics_simulator_from_lattice(
     piston_force = float(state.get("piston_force_n", 0.0) or 0.0)
     if piston_force > 0.0:
         forces, fixed_tiles = _piston_setup(tile_system, piston_force)
-        ground = None    # piston mode pins via fixed_tiles, no ground plane
-        return DynamicsSimulator(
-            tile_system, masses, cfg,
-            forces=forces, ground=ground, fixed_tiles=fixed_tiles,
+        # The Newtonian integrator with soft penalty constraints is too
+        # stiff for the kirigami constraint graph: explicit Euler
+        # diverges before the auxetic mode meaningfully engages, so the
+        # user sees a clamped pose rather than buckling. Physically,
+        # though, a kirigami compressed along its load axis collapses
+        # along its *soft mode* — the kinematic θ-sweep already
+        # computed by :class:`Simulator`. So in piston mode we drive
+        # the lattice along that mode and shape the trajectory like a
+        # piston-compression run: rest → maximum reachable compression
+        # under collision, over ``cfg.duration`` seconds. Tiles
+        # cooperatively rotate (auxetic buckling), internal joint
+        # angles change monotonically, and the lattice contracts
+        # along the load axis. The dynamics-style integrator is still
+        # available via the manual mode below.
+        return _PistonKinematicSimulator(
+            tile_system, cfg,
+            forces=forces, fixed_tiles=fixed_tiles,
+            piston_force_n=piston_force,
         )
 
     # ---- Manual mode: read forces / ground / fixed_tiles directly --

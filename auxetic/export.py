@@ -35,7 +35,12 @@ def export_to_scad(scad_path, strut_curves, triangles,
              f"$fn={scad_segments};\nrender(convexity=10)\nunion(){{\n",
              "  // struts\n"]
     for pts in strut_curves:
-        lines.append(scad_cylinder(pts[0], pts[1], strut_radius, scad_segments))
+        pts = np.asarray(pts, float)
+        # A straight strut is a 2-point polyline -> one cylinder (output
+        # unchanged). A bezier strut is an N-point polyline -> one
+        # cylinder per consecutive segment so the arc renders in SCAD too.
+        for i in range(len(pts) - 1):
+            lines.append(scad_cylinder(pts[i], pts[i + 1], strut_radius, scad_segments))
     if triangles:
         all_v, all_f, vi = [], [], 0
         for tri in triangles:

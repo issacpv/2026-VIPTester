@@ -23,6 +23,7 @@ from .inspector import InspectorPanel
 from .preset import save_preset, load_preset
 from .simulation_panel import SimulationPanel
 from .predictor_panel import PredictorPanel
+from .coordinates_panel import CoordinatesPanel
 from .commands import (
     MovePointCommand,
     ParameterChangeCommand,
@@ -45,13 +46,15 @@ VIEW_3D = 1
 # Modes 7 and 8 are 2D / 2.5D mesh-import — they share the editor surface
 # with the random/grid 2D modes since their points live in 2-vector
 # canonical form too.
-_EDITABLE_MODES = (1, 2, 4, 5, 7, 8)
+_EDITABLE_MODES = (1, 2, 4, 5, 7, 8, 11)
 # Modes for which the per-edge Delaunay flip GUI is meaningful (M1).
 # Grid modes (4, 5) have flippable diagonals too, but their canonical
 # triangulation is constructed deterministically and the user usually
 # wants those preserved — flipping is still allowed but starts from
-# the canonical state.
-_EDGE_FLIP_MODES = (1, 2, 4, 5, 7, 8)
+# the canonical state. Mode 11 (bipartite auxetic) is 2D Delaunay, so
+# an edge flip simply picks the other diagonal — exactly the tool for
+# choosing which way a placed rhombus splits into two tiles.
+_EDGE_FLIP_MODES = (1, 2, 4, 5, 7, 8, 11)
 _EDIT_DISABLED_TOOLTIP = (
     "3D editing is not supported in this version. "
     "Switch to a 2D mode to edit points."
@@ -61,7 +64,8 @@ _EDGE_DISABLED_TOOLTIP = (
     "Per-edge Delaunay flips are 2D-only in M1. Switch to a 2D / 2.5D mode."
 )
 _EDGE_ENABLED_TOOLTIP = (
-    "Toggle edge mode (click a triangulation edge to flip its diagonal)"
+    "Toggle edge mode — click an edge to select it, then Ctrl+click "
+    "its two corners to flip the diagonal"
 )
 
 
@@ -88,6 +92,15 @@ class MainWindow(QMainWindow):
 
         self.view_2d.pointMoveCompleted.connect(self._on_point_move_completed)
         self.view_2d.edgeFlipRequested.connect(self._on_edge_flip_requested)
+        # Edge-flip gesture guidance → status bar. Lambda defers the
+        # ``statusBar()`` lookup to emit-time, since the status bar is
+        # constructed later in __init__ than the views.
+        self.view_2d.edgeFlipStatus.connect(
+            lambda msg: self.statusBar().showMessage(msg))
+        # Ctrl-click a triangle in the 3D view → show that triangle's
+        # generalized Poisson ratio in the status bar (task 6c).
+        self.view_3d.trianglePoissonPicked.connect(
+            self._on_triangle_poisson_picked)
 
         self.stack = QStackedWidget(self)
         self.stack.addWidget(self.view_2d)   # index VIEW_2D
@@ -100,6 +113,7 @@ class MainWindow(QMainWindow):
         self.inspector.rotationChangeRequested.connect(self._on_rotation_change_requested)
         self.inspector.flipChangeRequested.connect(self._on_flip_change_requested)
         self.inspector.meshImportRequested.connect(self._on_mesh_import_requested)
+        self.inspector.tessellateRequested.connect(self._on_tessellate_requested)
 
         dock = QDockWidget("Inspector", self)
         dock.setAllowedAreas(
@@ -123,6 +137,12 @@ class MainWindow(QMainWindow):
         self.simulation_panel.forcesChangeRequested.connect(
             self._on_forces_change_requested
         )
+        # Same handler the Inspector's orientation widgets use — the
+        # dynamics pane's orientation sliders are a second entry point
+        # to the same lattice field, not a parallel state.
+        self.simulation_panel.rotationChangeRequested.connect(
+            self._on_rotation_change_requested
+        )
         self.addDockWidget(
             Qt.DockWidgetArea.RightDockWidgetArea, self.simulation_panel
         )
@@ -143,6 +163,22 @@ class MainWindow(QMainWindow):
         # Keep Simulation as the visible tab on first launch.
         self.simulation_panel.raise_()
         self._predictor_dock = self.predictor_panel
+
+        # ---- coordinates panel dock (tabular point editor) ---------------
+        # A keyboard alternative to the viewport's drag-to-move editing:
+        # lists every point with editable X / Y cells. Tabified with the
+        # Inspector since both are lattice-geometry panels.
+        self.coordinates_panel = CoordinatesPanel(self.lattice, parent=self)
+        self.coordinates_panel.pointMoveRequested.connect(
+            self._on_coordinate_edit_requested
+        )
+        self.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, self.coordinates_panel
+        )
+        self.tabifyDockWidget(self._inspector_dock, self.coordinates_panel)
+        # Keep the Inspector as the visible tab on first launch.
+        self._inspector_dock.raise_()
+        self._coordinates_dock = self.coordinates_panel
 
         # ---- left toolbar ------------------------------------------------
         self._build_toolbar()
@@ -227,36 +263,6 @@ class MainWindow(QMainWindow):
         # The clickable view cube in the View3D corner does the same
         # job — these buttons are a redundant-but-handy shortcut and
         # also work when the cube widget is unavailable (older PyVista).
-        self.cam_top_act = QAction("Top", self)
-        self.cam_top_act.setToolTip(
-            "Camera: top-down (+Z). Doesn't change the lattice.")
-        self.cam_top_act.triggered.connect(lambda: self.view_3d.camera_top())
-        tb.addAction(self.cam_top_act)
-
-        self.cam_bottom_act = QAction("Bottom", self)
-        self.cam_bottom_act.setToolTip(
-            "Camera: bottom-up (-Z). Doesn't change the lattice.")
-        self.cam_bottom_act.triggered.connect(lambda: self.view_3d.camera_bottom())
-        tb.addAction(self.cam_bottom_act)
-
-        self.cam_front_act = QAction("Front", self)
-        self.cam_front_act.setToolTip(
-            "Camera: front (+Y). Doesn't change the lattice.")
-        self.cam_front_act.triggered.connect(lambda: self.view_3d.camera_front())
-        tb.addAction(self.cam_front_act)
-
-        self.cam_back_act = QAction("Back", self)
-        self.cam_back_act.setToolTip(
-            "Camera: back (-Y). Doesn't change the lattice.")
-        self.cam_back_act.triggered.connect(lambda: self.view_3d.camera_back())
-        tb.addAction(self.cam_back_act)
-
-        self.cam_side_act = QAction("Side", self)
-        self.cam_side_act.setToolTip(
-            "Camera: right side (+X). Doesn't change the lattice.")
-        self.cam_side_act.triggered.connect(lambda: self.view_3d.camera_side())
-        tb.addAction(self.cam_side_act)
-
         self.cam_iso_act = QAction("Iso", self)
         self.cam_iso_act.setToolTip(
             "Camera: isometric 3/4 view. Doesn't change the lattice.")
@@ -364,6 +370,10 @@ class MainWindow(QMainWindow):
         toggle_sim.setText("Show Simulation Panel")
         view_menu.addAction(toggle_sim)
 
+        toggle_coords = self._coordinates_dock.toggleViewAction()
+        toggle_coords.setText("Show Coordinates")
+        view_menu.addAction(toggle_coords)
+
         # ---- Simulate (stubs) -------------------------------------------
         sim_menu = mb.addMenu("&Simulate")
         for label in ("Run Simulation", "Pause", "Reset"):
@@ -426,6 +436,8 @@ class MainWindow(QMainWindow):
         structure after letting go of the slider").
         """
         self.inspector.refresh_from_lattice()
+        self.coordinates_panel.refresh_from_lattice()
+        self.predictor_panel.refresh_metrics()
         self._update_edit_action_enabled()
         self._update_edge_action_enabled()
         self._refresh_views()
@@ -508,7 +520,8 @@ class MainWindow(QMainWindow):
         if on:
             self._set_view_mode(VIEW_2D)
             self.statusBar().showMessage(
-                "Edge mode ON — click a triangulation edge to flip its diagonal")
+                "Edge mode ON — click a blue/red edge to select it (turns "
+                "green), then Ctrl+click the two amber corners to flip it")
         else:
             self.statusBar().showMessage("Edge mode OFF")
 
@@ -547,15 +560,37 @@ class MainWindow(QMainWindow):
     def _on_inspector_parameter_changed(self, field, old_value, new_value):
         """Push a parameter change onto the undo stack rather than
         mutating the lattice directly. Per SPEC §4.2, parameter changes
-        are undoable."""
+        are undoable.
+
+        The mode-11 ``C`` (constant size ratio) only repositions hinges
+        on the existing triangulation — re-rolling the point cloud would
+        destroy the user's placed lattice — so it is applied with
+        ``regenerate=False``. Every other parameter re-generates."""
+        # C and the bezier-strut options only affect derived geometry on
+        # the existing triangulation — re-rolling the point cloud would
+        # discard the user's placed lattice, so they apply without a
+        # regenerate (the command invalidates the export cache instead).
+        _no_regen = ("C", "bezier_enabled", "bezier_strength", "bezier_segments")
         cmd = ParameterChangeCommand(
             self.lattice, field, old_value, new_value,
             on_change=self._on_lattice_structurally_changed,
+            regenerate=(field not in _no_regen),
         )
         self.undo_stack.push(cmd)
 
     def _on_point_move_completed(self, idx, old_pos, new_pos):
         """Drag-release in View2D: one undoable step per move (SPEC §4.2)."""
+        cmd = MovePointCommand(
+            self.lattice, idx, old_pos, new_pos,
+            on_change=self._on_lattice_structurally_changed,
+        )
+        self.undo_stack.push(cmd)
+
+    def _on_coordinate_edit_requested(self, idx, old_pos, new_pos):
+        """Cell commit in the Coordinates panel: same undoable
+        ``MovePointCommand`` path as a viewport drag-release, so typing
+        a coordinate and dragging a point are interchangeable and both
+        land on the undo stack."""
         cmd = MovePointCommand(
             self.lattice, idx, old_pos, new_pos,
             on_change=self._on_lattice_structurally_changed,
@@ -569,6 +604,28 @@ class MainWindow(QMainWindow):
             on_change=self._on_lattice_structurally_changed,
         )
         self.undo_stack.push(cmd)
+
+    def _on_triangle_poisson_picked(self, point):
+        """Ctrl-click in the 3D view → show the picked triangle's generalized
+        Poisson ratio in the status bar (task 6c). Geometry + ν come from
+        ``Lattice.poisson_ratio_at_point``; this only formats and displays."""
+        if point is None:
+            return
+        try:
+            idx, nu = self.lattice.poisson_ratio_at_point(point, world=True)
+        except Exception:
+            return
+        if idx is None:
+            self.statusBar().showMessage(
+                "Per-triangle ν: unavailable (3D mode / no 2D triangulation)",
+                6000)
+        elif isinstance(nu, float) and nu != nu:        # NaN
+            self.statusBar().showMessage(
+                f"Triangle {idx}: ν unavailable (degenerate)", 6000)
+        else:
+            self.statusBar().showMessage(
+                f"Triangle {idx}: generalized Poisson's ratio ν = {nu:+.4f}",
+                8000)
 
     def _on_reset_to_original(self):
         cmd = ResetToOriginalCommand(
@@ -653,6 +710,7 @@ class MainWindow(QMainWindow):
         self.inspector.set_lattice(self.lattice)
         self.simulation_panel.set_lattice(self.lattice)
         self.predictor_panel.set_lattice(self.lattice)
+        self.coordinates_panel.set_lattice(self.lattice)
         self.undo_stack.clear()
         self._current_path = None
         self.setWindowTitle("Auxetic Studio")
@@ -673,6 +731,7 @@ class MainWindow(QMainWindow):
         self.inspector.set_lattice(self.lattice)
         self.simulation_panel.set_lattice(self.lattice)
         self.predictor_panel.set_lattice(self.lattice)
+        self.coordinates_panel.set_lattice(self.lattice)
         self.undo_stack.clear()
         self._current_path = path
         self.setWindowTitle(f"Auxetic Studio — {os.path.basename(path)}")
@@ -700,10 +759,42 @@ class MainWindow(QMainWindow):
         self.inspector.set_lattice(self.lattice)
         self.simulation_panel.set_lattice(self.lattice)
         self.predictor_panel.set_lattice(self.lattice)
+        self.coordinates_panel.set_lattice(self.lattice)
         self.undo_stack.clear()
         self._current_path = None
         self.setWindowTitle(
             f"Auxetic Studio — {os.path.basename(path)} (mesh)")
+        self._refresh_state()
+
+    def _on_tessellate_requested(self, n_triangles):
+        """Replace ``self.lattice`` with an equilateral-fill tessellation of
+        a unit square at ~``n_triangles`` triangles (task 6d). Always a 2D
+        lattice; like mesh import / File→Open this is a major action that
+        clears the undo stack. The geometry is computed in ``auxetic``
+        (Lattice.from_tessellation); the GUI only drives it."""
+        from auxetic import Lattice
+        import numpy as np
+        boundary = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+        cur = int(getattr(self.lattice, "mode", 1))
+        mode = cur if cur in (1, 2, 4, 5, 11) else 1
+        try:
+            new_lattice = Lattice.from_tessellation(
+                boundary, n_triangles=int(n_triangles), mode=mode,
+                ratio=float(self.lattice.ratio))
+        except Exception as e:
+            QMessageBox.critical(self, "Tessellation failed", str(e))
+            return
+        self.lattice = new_lattice
+        self.inspector.set_lattice(self.lattice)
+        self.simulation_panel.set_lattice(self.lattice)
+        self.predictor_panel.set_lattice(self.lattice)
+        self.coordinates_panel.set_lattice(self.lattice)
+        self.undo_stack.clear()
+        self._current_path = None
+        self.setWindowTitle("Auxetic Studio — tessellation")
+        self.statusBar().showMessage(
+            f"Tessellated square (~{int(n_triangles)} triangles → "
+            f"{len(self.lattice.points)} points)")
         self._refresh_state()
 
     def _on_save(self):

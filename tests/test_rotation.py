@@ -264,10 +264,11 @@ def test_v2_preset_round_trips_rotation(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_rejects_future_preset_version(tmp_path):
-    """v4 became the supported schema in M2; this test now exercises the
-    "newer than supported" path with v5 — the next future version."""
+    """A preset one version newer than the app supports must be rejected.
+    Pinned to ``PRESET_VERSION + 1`` so it stays correct across schema
+    bumps (was hard-coded to 5 when v4 was current; v5 added mode-11 C)."""
     payload = {
-        "version":  5,
+        "version":  PRESET_VERSION + 1,
         "mode":     1,
         "n_points": 5,
         "ratio":    0.35,
@@ -279,7 +280,7 @@ def test_rejects_future_preset_version(tmp_path):
         "view_state":   {},
         "metadata":     {},
     }
-    path = str(tmp_path / "v5.auxlat")
+    path = str(tmp_path / "future.auxlat")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f)
 

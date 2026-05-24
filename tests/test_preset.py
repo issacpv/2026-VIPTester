@@ -223,7 +223,7 @@ def test_save_writes_v1_schema(tmp_path):
 
     expected_keys = {
         "version", "mode", "n_points", "ratio", "nz_layers",
-        "points", "shape_params", "generation", "dynamics",
+        "points", "shape_params", "generation", "dynamics", "bezier",
         "view_state", "metadata",
     }
     assert set(data.keys()) == expected_keys
@@ -243,6 +243,8 @@ def test_save_writes_v1_schema(tmp_path):
     assert set(data["generation"].keys()) == {
         "density_axis", "density_law", "density_strength",
         "edge_flips", "mesh_path", "mesh_vertices", "unit_scale_cm",
+        # v5 (mode 11): bipartite-auxetic constant size ratio.
+        "C",
     }
     # dynamics block (v4, M2) — Newtonian sim parameters.
     # M3-polish added ``piston_force_n`` for the piston compression

@@ -349,3 +349,154 @@ def test_warm_start_does_not_regress_sweep():
         f"warm-start regressed the sweep: cold={cold_t:.3f}s, "
         f"warm={warm_t:.3f}s (>30% slower)"
     )
+
+
+# ---------------------------------------------------------------------------
+# 11. extremal_pose_indices — the seven Poisson-overlay extremal poses
+# ---------------------------------------------------------------------------
+
+def _bbox_lo_hi(sim, poses):
+    """(los, his) arrays of per-sample AABB corners, shape (n, dim)."""
+    los = np.array([sim.bbox_bounds(p)[0] for p in poses])
+    his = np.array([sim.bbox_bounds(p)[1] for p in poses])
+    return los, his
+
+
+def test_extremal_pose_indices_selection_semantics():
+    """The seven keys resolve to: rest at θ≈0; the smallest load-axis extent
+    on each θ-half (compressed ±θ); and the farthest +x/−x/+y/−y reach over
+    the sweep (directional expansion). The rotating-squares cell is symmetric
+    about its centre, so rest is the global bbox maximum in every direction —
+    all four expansion picks coincide with the rest sample."""
+    sim = Simulator(make_rotating_squares_2d(), load_axis=np.array([0.0, -1.0]))
+    result = sim.sweep_theta(n_steps=181)
+    idx = sim.extremal_pose_indices(result)
+
+    assert set(idx) == {
+        "initial", "compressed_pos", "compressed_neg",
+        "expansion_pos_x", "expansion_neg_x",
+        "expansion_pos_y", "expansion_neg_y",
+    }
+
+    theta = result.theta_samples
+    axial = sim._axial_index()          # load axis −y → axial index 1
+    ext = result.bbox_extents[:, axial]
+
+    # Initial = sample nearest θ=0 (exact rest for the symmetric 181-grid).
+    assert theta[idx["initial"]] == pytest.approx(0.0, abs=1e-9)
+
+    # Compressed picks the min load-axis extent on its θ-half, and both are
+    # genuinely compressed relative to rest.
+    assert theta[idx["compressed_pos"]] > 0.0
+    assert theta[idx["compressed_neg"]] < 0.0
+    assert ext[idx["compressed_pos"]] == pytest.approx(ext[theta > 0.0].min())
+    assert ext[idx["compressed_neg"]] == pytest.approx(ext[theta < 0.0].min())
+    assert ext[idx["compressed_pos"]] < ext[idx["initial"]]
+    assert ext[idx["compressed_neg"]] < ext[idx["initial"]]
+
+    # Directional reach: each expansion pick is the sweep's extreme bbox face
+    # in that world direction (max +x/+y face, min −x/−y face). Note this is
+    # measured in the absolute world frame, so it follows any rigid drift the
+    # manifold projection introduces — the farthest-reach pose need NOT be the
+    # rest pose even for this symmetric cell (the anchor frame is what removes
+    # drift when the user wants it). The defining property is what we assert.
+    los, his = _bbox_lo_hi(sim, result.poses)
+    n = len(result.theta_samples)
+    for key in ("expansion_pos_x", "expansion_neg_x",
+                "expansion_pos_y", "expansion_neg_y"):
+        assert 0 <= idx[key] < n
+    assert his[idx["expansion_pos_x"], 0] == pytest.approx(his[:, 0].max())
+    assert los[idx["expansion_neg_x"], 0] == pytest.approx(los[:, 0].min())
+    assert his[idx["expansion_pos_y"], 1] == pytest.approx(his[:, 1].max())
+    assert los[idx["expansion_neg_y"], 1] == pytest.approx(los[:, 1].min())
+
+
+def test_extremal_pose_indices_ignores_collided_samples():
+    """Compressed picks must skip samples flagged collided (physically
+    unreachable past jamming), matching the compression-ratio metric. Flag the
+    sample the unfiltered picker would choose and confirm it moves to the next
+    reachable minimum on that θ-half."""
+    import dataclasses
+
+    sim = Simulator(make_rotating_squares_2d(), load_axis=np.array([0.0, -1.0]))
+    result = sim.sweep_theta(n_steps=61)
+    chosen = sim.extremal_pose_indices(result)["compressed_pos"]
+
+    flags = np.zeros(len(result.theta_samples), dtype=bool)
+    flags[chosen] = True
+    flagged_result = dataclasses.replace(result, collision_at_theta=flags)
+    rechosen = sim.extremal_pose_indices(flagged_result)["compressed_pos"]
+
+    assert rechosen != chosen
+    # The replacement is still on the +θ half and still reachable.
+    assert flagged_result.theta_samples[rechosen] > 0.0
+    assert not flags[rechosen]
+
+
+def test_expanded_footprint_encloses_directional_reach_boxes():
+    """The overall expanded-footprint box (``aabb_corners_enclosing`` of the
+    four directional reach boxes) has faces at the sweep's biggest +x / −x /
+    +y / −y reach, and tightly encloses each of the four directional boxes."""
+    sim = Simulator(make_rotating_squares_2d(), load_axis=np.array([0.0, -1.0]))
+    result = sim.sweep_theta(n_steps=181)
+    idx = sim.extremal_pose_indices(result)
+
+    dir_keys = ("expansion_pos_x", "expansion_neg_x",
+                "expansion_pos_y", "expansion_neg_y")
+    dir_corners = [sim.bbox_corners(result.poses[idx[k]]) for k in dir_keys]
+    fp = sim.aabb_corners_enclosing(dir_corners)
+    assert fp.shape == (2 ** sim.dimension, sim.dimension)
+    fp_lo = fp.min(axis=0)
+    fp_hi = fp.max(axis=0)
+
+    # Footprint faces == the biggest reach in each world direction.
+    los, his = _bbox_lo_hi(sim, result.poses)
+    assert fp_hi[0] == pytest.approx(his[:, 0].max())   # +x
+    assert fp_lo[0] == pytest.approx(los[:, 0].min())   # −x
+    assert fp_hi[1] == pytest.approx(his[:, 1].max())   # +y
+    assert fp_lo[1] == pytest.approx(los[:, 1].min())   # −y
+
+    # And it encloses every directional box (the envelope contains them all).
+    for c in dir_corners:
+        assert (c.min(axis=0) >= fp_lo - 1e-9).all()
+        assert (c.max(axis=0) <= fp_hi + 1e-9).all()
+
+
+def test_aabb_corners_enclosing_empty_is_degenerate():
+    """No corner sets (or all None) → a degenerate zero box, never a crash."""
+    sim = Simulator(make_rotating_squares_2d(), load_axis=np.array([0.0, -1.0]))
+    out = sim.aabb_corners_enclosing([None, None])
+    assert out.shape == (2 ** sim.dimension, sim.dimension)
+    np.testing.assert_allclose(out, 0.0)
+
+
+def test_anchored_footprint_encloses_every_relativized_pose():
+    """Regression for the "lattice pokes outside the box" bug. When a view is
+    anchored to a polygon, the structure is drawn relativized to it, so the
+    reach picks must be made in that same anchor frame (anchor=). Then the
+    expanded footprint — the envelope of the four directional reach boxes —
+    encloses the structure at EVERY reachable sweep sample as it is actually
+    drawn. (Selecting reach in the absolute frame and only relativizing for
+    display let some samples reach beyond the box.)"""
+    sim = Simulator(make_rotating_squares_2d(), load_axis=np.array([0.0, -1.0]))
+    result = sim.sweep_theta(n_steps=121)
+    anchor = 1
+
+    idx = sim.extremal_pose_indices(result, anchor=anchor)
+    dir_keys = ("expansion_pos_x", "expansion_neg_x",
+                "expansion_pos_y", "expansion_neg_y")
+    dir_corners = [
+        sim.bbox_corners(sim.relativize_pose(result.poses[idx[k]], anchor))
+        for k in dir_keys
+    ]
+    fp = sim.aabb_corners_enclosing(dir_corners)
+    fp_lo = fp.min(axis=0)
+    fp_hi = fp.max(axis=0)
+
+    reachable = ~np.asarray(result.collision_at_theta, dtype=bool)
+    for i in np.flatnonzero(reachable):
+        lo, hi = sim.bbox_bounds(sim.relativize_pose(result.poses[i], anchor))
+        assert (lo >= fp_lo - 1e-9).all(), (
+            f"sample {i} lo {lo} pokes below footprint {fp_lo}")
+        assert (hi <= fp_hi + 1e-9).all(), (
+            f"sample {i} hi {hi} pokes above footprint {fp_hi}")

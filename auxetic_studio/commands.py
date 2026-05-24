@@ -72,11 +72,23 @@ class ParameterChangeCommand(QUndoCommand):
     _ALLOWED = ("mode", "n_points", "ratio", "nz_layers",
                 # M1 additions — density gradient and physical scale.
                 "density_axis", "density_law", "density_strength",
-                "unit_scale_cm")
+                "unit_scale_cm",
+                # Mode-11 constant size ratio. Routed with
+                # regenerate=False (see below): C only repositions hinges
+                # on the existing triangulation, so re-rolling points
+                # would needlessly destroy the user's placed lattice.
+                "C",
+                # Task 1 bezier-strut options. Also regenerate=False —
+                # they only affect derived export/render geometry, never
+                # the point cloud — but they DO change the cached strut
+                # curves, so the non-regenerate branch invalidates the
+                # export-geometry cache below.
+                "bezier_enabled", "bezier_strength", "bezier_segments")
 
     def __init__(self, lattice: Lattice, field: str,
                  old_value: Any, new_value: Any,
-                 on_change: Callback = None):
+                 on_change: Callback = None,
+                 *, regenerate: bool = True):
         if field not in self._ALLOWED:
             raise ValueError(f"ParameterChangeCommand: unsupported field {field!r}")
         super().__init__(f"Change {field}")
@@ -85,10 +97,21 @@ class ParameterChangeCommand(QUndoCommand):
         self.old_value  = old_value
         self.new_value  = new_value
         self.on_change  = on_change
+        # When False, the attribute is set without re-rolling the point
+        # cloud. Used for parameters that only affect derived geometry
+        # (e.g. mode-11 ``C``), never the point generation itself.
+        self.regenerate = bool(regenerate)
 
     def _apply(self, value: Any) -> None:
         setattr(self.lattice, self.field, value)
-        self.lattice.regenerate()
+        if self.regenerate:
+            self.lattice.regenerate()
+        else:
+            # Non-regenerating params (C, bezier_*) leave the point cloud
+            # untouched but change derived export/render geometry — drop
+            # the cached strut/triangle/joint data so the next render or
+            # export rebuilds it with the new value.
+            self.lattice._clear_caches()
         if self.on_change is not None:
             self.on_change()
 

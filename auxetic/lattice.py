@@ -51,12 +51,33 @@ from . import export as _export
 # Modes 7, 8, 9 are mesh-import variants of 1, 2, 3 respectively.
 # Mode 10 is the rotating-cuboids 3D kirigami (sibling of mode 6 but
 # with cube tiles instead of tetrahedra).
+# Mode 11 is the bipartite-polygon auxetic (Acuna et al. 2022): a 2D
+# point cloud is Delaunay-triangulated and the corner/centroid
+# bipartition drives the polygon network (see ``auxetic.bipartite``).
 _3D_MODES = (3, 6, 9, 10)
-_DELAUNAY_MODES = (1, 2, 3, 7, 8, 9)  # modes that re-Delaunay on each retriangulation
+_DELAUNAY_MODES = (1, 2, 3, 7, 8, 9, 11)  # modes that re-Delaunay on each retriangulation
 _CUBOID_MODES = (10,)                  # modes that bypass Delaunay entirely
+_BIPARTITE_MODES = (11,)               # modes built via auxetic.bipartite
 
 # Lattice-space centroid that all rigid rotations / flips pivot around.
 _CENTROID = np.array([0.5, 0.5, 0.5])
+
+
+def _normalize_to_unit_square(pts: np.ndarray) -> np.ndarray:
+    """Uniformly scale + centre an (N, 2) point set into the unit square
+    [0, 1]². Uniform (single-factor) scaling preserves triangle shape so
+    a tessellation's equilateral interior stays equilateral in lattice
+    space. A degenerate (zero-extent) input is returned unchanged."""
+    pts = np.asarray(pts, dtype=float)
+    mn = pts.min(axis=0)
+    mx = pts.max(axis=0)
+    span = float((mx - mn).max())
+    if span <= 0.0:
+        return pts.copy()
+    scaled = (pts - mn) / span
+    # Centre the shorter axis within [0, 1].
+    scaled += (1.0 - scaled.max(axis=0)) / 2.0
+    return scaled
 
 
 class Lattice:
@@ -74,12 +95,34 @@ class Lattice:
                  edge_flips=None,
                  mesh_path: str | None = None,
                  mesh_vertices: np.ndarray | None = None,
-                 unit_scale_cm: float = 1.0):
+                 unit_scale_cm: float = 1.0,
+                 # Mode-11 bipartite auxetic: constant size ratio C =
+                 # b_ji / a_ij (Acuna et al. 2022, step 3). Ignored by
+                 # every other mode. C=1 is the symmetric midpoint case.
+                 C: float = 1.0,
+                 # Bezier-curved strut edges (opt-in). Default OFF so every
+                 # mode's export is byte-for-byte identical to before.
+                 # ``bezier_strength`` is the perpendicular control-point
+                 # offset as a fraction of strut length; ``bezier_segments``
+                 # is the polyline tessellation density (>=2 to curve).
+                 bezier_enabled: bool = False,
+                 bezier_strength: float = 0.25,
+                 bezier_segments: int = 12):
         self.mode      = mode
         self.n_points  = n_points
         self.ratio     = ratio
         self.nz_layers = nz_layers
         self.seed      = seed
+        self.C         = float(C)
+
+        # ---- Bezier-curved strut edges (opt-in, SPEC task 1) ------------
+        # When enabled, struts export as tessellated quadratic-Bezier
+        # polylines instead of straight 2-point segments. Default OFF =>
+        # byte-identical export. ``_clear_caches`` is triggered by
+        # :meth:`set_bezier` so a settings change re-runs the geometry.
+        self.bezier_enabled  = bool(bezier_enabled)
+        self.bezier_strength = float(bezier_strength)
+        self.bezier_segments = int(bezier_segments)
 
         # Shape parameters per SPEC §5.1's ``shape_params`` block.
         self.ngon_thickness      = (_geom.NGON_THICKNESS      if ngon_thickness      is None else float(ngon_thickness))
@@ -236,6 +279,56 @@ class Lattice:
         )
 
     # ==================================================================
+    # Construction from a region tessellation (task 5)
+    # ==================================================================
+
+    @classmethod
+    def from_tessellation(cls, boundary, *,
+                          target_edge: float | None = None,
+                          n_triangles: int | None = None,
+                          mode: int = 1,
+                          ratio: float = 0.35,
+                          normalize: bool = True,
+                          preserve_triangulation: bool = True,
+                          **kwargs) -> "Lattice":
+        """Build a 2D Lattice from an equilateral-fill tessellation of the
+        region bounded by ``boundary`` (see
+        :func:`auxetic.tessellation.generate_tessellation`).
+
+        Density is set by ``target_edge`` or ``n_triangles`` (exactly
+        one). ``mode`` must be a 2D mode (1/2/4/5/11). With
+        ``normalize`` (default), points are uniformly scaled+centred into
+        the unit square so the lattice keeps its [0, 1] convention while
+        preserving triangle shape.
+
+        With ``preserve_triangulation`` (default) the tessellation's
+        clipped triangulation is installed verbatim — important for
+        concave regions, where a plain Delaunay would fill the
+        concavities. Note: a subsequent point edit or reset re-Delaunays
+        (the standard 2D edit path), which only matches the original for
+        convex regions.
+        """
+        from . import tessellation as _tess
+
+        if mode in _3D_MODES:
+            raise ValueError(
+                f"from_tessellation is 2D-only; mode {mode} is a 3D mode")
+
+        result = _tess.generate_tessellation(
+            boundary, target_edge, n_triangles=n_triangles)
+        pts = np.asarray(result.points, dtype=float)
+        if normalize:
+            pts = _normalize_to_unit_square(pts)
+
+        lat = cls(mode=mode, n_points=len(pts), ratio=ratio, **kwargs)
+        if preserve_triangulation:
+            lat._set_points_and_tri(pts, _geom._FlippedTri(result.simplices))
+        else:
+            lat.regenerate_from_points(pts)
+        lat.points_original = pts.copy()
+        return lat
+
+    # ==================================================================
     # view_state — SPEC §5.1's serializable view block, derived from
     # the §6 fields. Implemented as a property so a Stage 4 caller
     # that does ``lat.view_state = {dict}`` still works (the setter
@@ -375,6 +468,29 @@ class Lattice:
         self._set_points_and_tri(original, new_tri)
 
     # ==================================================================
+    # Bezier-curved strut edges (SPEC task 1)
+    # ==================================================================
+
+    def set_bezier(self, *,
+                   enabled: bool | None = None,
+                   strength: float | None = None,
+                   segments: int | None = None) -> None:
+        """Update the Bezier-strut export options and invalidate the
+        cached export geometry so the next export/render re-runs with
+        the new settings. Only the provided fields change.
+
+        Curving is active only when ``enabled`` is true, ``strength`` is
+        non-zero, and ``segments >= 2``; otherwise struts export straight
+        (byte-for-byte identical to curves-off)."""
+        if enabled is not None:
+            self.bezier_enabled = bool(enabled)
+        if strength is not None:
+            self.bezier_strength = float(strength)
+        if segments is not None:
+            self.bezier_segments = int(segments)
+        self._clear_caches()
+
+    # ==================================================================
     # SPEC §6: world transform (rigid rotation + flip)
     # ==================================================================
 
@@ -453,6 +569,16 @@ class Lattice:
         canonical points (Nx2 or Nx3). Stored points unchanged."""
         return self._apply_matrix(self.world_transform(), self.points)
 
+    def transform_points(self, points: np.ndarray) -> np.ndarray:
+        """Apply the current ``world_transform`` to an arbitrary (N, D)
+        point array (D ∈ {2, 3}).
+
+        Lets a view render *derived* geometry — e.g. mode-11 bipartite
+        polygon vertices — in the same oriented frame as
+        ``transformed_points()`` without reaching into the private
+        matrix helper. Stored points are untouched."""
+        return self._apply_matrix(self.world_transform(), points)
+
     def _transform_collection(self, collection: Iterable, M: np.ndarray) -> list:
         """Map ``_apply_matrix`` over an iterable of point arrays
         (e.g. triangle list, strut curves, tile vertex arrays)."""
@@ -464,13 +590,29 @@ class Lattice:
     # ==================================================================
 
     def _ensure_export_geometry(self):
+        # Mode-11 geometry depends on the live joint angle (the kite
+        # rotation), which changes without a re-triangulation — so the
+        # cache would go stale. Rebuild it every call instead.
+        if self.mode in _BIPARTITE_MODES:
+            (self._strut_curves,
+             self._solid_triangles,
+             self._joint_positions) = _geom.collect_export_geometry(
+                self.points, self.tri, self.ratio, self.mode, self.nz_layers,
+                bipartite_C=self.C, bipartite_theta=self._bipartite_theta(),
+                bezier_enabled=self.bezier_enabled,
+                bezier_strength=self.bezier_strength,
+                bezier_segments=self.bezier_segments)
+            return
         if self._strut_curves is None:
             (self._strut_curves,
              self._solid_triangles,
              self._joint_positions) = _geom.collect_export_geometry(
                 self.points, self.tri, self.ratio, self.mode, self.nz_layers,
                 cuboid_tiles=self.cuboid_tiles,
-                cuboid_constraints=self.cuboid_constraints)
+                cuboid_constraints=self.cuboid_constraints,
+                bezier_enabled=self.bezier_enabled,
+                bezier_strength=self.bezier_strength,
+                bezier_segments=self.bezier_segments)
 
     def build_export_triangles(self, **kwargs):
         """Final triangle list including strut tubes + joint spheres."""
@@ -508,9 +650,145 @@ class Lattice:
                                ratio=self.ratio, verbose=verbose)
         return triangles
 
+    def bipartite_jamming_angle(self) -> float:
+        """The mechanism's jamming angle (radians) for the current
+        mode-11 lattice — the largest ``|theta|`` the kites can rotate
+        about their hinges before colliding with the central polygons.
+        Returns ``pi/2`` for non-bipartite modes."""
+        if self.mode not in _BIPARTITE_MODES or self.tri is None:
+            return float(math.pi / 2.0)
+        from . import bipartite as _bip
+        return _bip.jamming_angle(self.points,
+                                  np.asarray(self.tri.simplices), self.C)
+
+    def edge_vector_poisson_ratio(self, theta: float = 0.1) -> float:
+        """Lattice-level generalized Poisson's ratio from the edge-vector
+        metric (see :mod:`auxetic.edge_poisson`), averaged over the
+        lattice's triangles at a small probe actuation ``theta`` (radians).
+
+        Each triangle's bipartite rotating-units mechanism is actuated by
+        ``theta`` and its edge-connection-point deformation distilled into
+        a principal Poisson's ratio; the lattice value is the mean over
+        all (non-degenerate, finite) triangles. Uses the lattice's
+        ``C``. Returns ``nan`` for 3D modes, for a lattice with no 2D
+        triangulation, or when no triangle yields a finite ratio (e.g.
+        ``theta = 0``)."""
+        from . import edge_poisson as _ep
+
+        if self.mode in _3D_MODES or self.tri is None:
+            return float("nan")
+        pts = np.asarray(self.points, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            return float("nan")
+        simplices = np.asarray(self.tri.simplices)
+        if simplices.ndim != 2 or simplices.shape[1] != 3:
+            return float("nan")
+
+        vals: list[float] = []
+        for s in simplices:
+            tri = pts[s]
+            try:
+                nu = _ep.generalized_poisson_ratio(tri, float(self.C), float(theta))
+            except ValueError:
+                continue
+            if np.isfinite(nu):
+                vals.append(float(nu))
+        return float(np.mean(vals)) if vals else float("nan")
+
+    def poisson_ratio_at_point(self, point, theta: float = 0.1,
+                               *, world: bool = True) -> tuple[int | None, float]:
+        """Generalized (edge-vector) Poisson's ratio of the single lattice
+        triangle at ``point`` — backs the GUI's Ctrl-click-a-triangle
+        readout (task 6c), the per-triangle counterpart of the
+        full-structure :meth:`edge_vector_poisson_ratio`.
+
+        ``point`` is a world-frame ``(x, y[, z])`` when ``world=True`` (the
+        default; mapped back to lattice space via the inverse
+        ``world_transform``), else it is already in lattice space. The
+        containing Delaunay triangle is found with ``tri.find_simplex``; a
+        point outside the convex hull falls back to the nearest triangle by
+        centroid.
+
+        Returns ``(triangle_index, nu)`` — ``(None, nan)`` for 3D modes or a
+        lattice with no 2D triangulation; ``nu`` is ``nan`` for a degenerate
+        triangle or ``theta == 0``. Selection + ν live here, not the GUI."""
+        from . import edge_poisson as _ep
+
+        if self.mode in _3D_MODES or self.tri is None:
+            return None, float("nan")
+        pts = np.asarray(self.points, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            return None, float("nan")
+        simplices = np.asarray(self.tri.simplices)
+        if simplices.ndim != 2 or simplices.shape[1] != 3:
+            return None, float("nan")
+
+        p = np.asarray(point, dtype=float).ravel()
+        if world:
+            try:
+                M_inv = np.linalg.inv(self.world_transform())
+            except np.linalg.LinAlgError:
+                return None, float("nan")
+            h = np.array([p[0], p[1], p[2] if p.size > 2 else 0.0, 1.0])
+            xy = (M_inv @ h)[:2]
+        else:
+            xy = p[:2]
+
+        idx = int(self.tri.find_simplex(xy))
+        if idx < 0:
+            # Outside the hull — nearest triangle by centroid.
+            centroids = pts[simplices].mean(axis=1)
+            idx = int(np.argmin(np.linalg.norm(centroids - xy, axis=1)))
+        tri = pts[simplices[idx]]
+        try:
+            nu = float(_ep.generalized_poisson_ratio(
+                tri, float(self.C), float(theta)))
+        except ValueError:
+            nu = float("nan")
+        return idx, nu
+
+    def _bipartite_theta(self) -> float:
+        """Actuation angle for *static* mode-11 rendering — always 0
+        (rest).
+
+        The earlier deterministic per-kite spin (rotate each kite about
+        its hinge) pinwheeled because the kites weren't tied to each
+        other. It's been replaced by the coherent floppy-mode mechanism
+        the kirigami Simulator finds over the kite + central + bond tile
+        system. So the 2D/3D *design* views always show the rest tile;
+        the *deformation* is produced by the simulation (Run Simulation
+        → scrub), which keeps every hinge connected."""
+        return 0.0
+
+    def build_bipartite(self, theta: float | None = None):
+        """Build the bipartite polygon network for the current mode-11
+        lattice, actuated by the rotating-units mechanism.
+
+        Each corner kite is rotated about its hinge by ``theta`` (the
+        central polygons stay fixed). When ``theta`` is ``None`` the
+        lattice's ``joint_angle`` is used (clamped to the jamming angle),
+        so the simulation/kinematic angle slider drives the rotation.
+
+        Returns an :class:`auxetic.bipartite.BipartiteNetwork`. Polygons
+        are in **canonical** lattice space; pass each polygon's
+        ``vertices`` through :meth:`transform_points` to draw them in the
+        oriented world frame.
+
+        Raises ``RuntimeError`` for any non-bipartite mode."""
+        if self.mode not in _BIPARTITE_MODES:
+            raise RuntimeError(
+                f"build_bipartite() is only valid for bipartite modes "
+                f"{_BIPARTITE_MODES}; current mode is {self.mode}")
+        from . import bipartite as _bip
+        simplices = np.asarray(self.tri.simplices)
+        th = self._bipartite_theta() if theta is None else float(theta)
+        return _bip.build_bipartite_network(self.points, simplices,
+                                            self.C, theta=th)
+
     def collect_kirigami(self):
         tiles, source = _tiles.collect_kirigami_tiles(
-            self.points, self.tri, self.ratio, self.mode, self.nz_layers)
+            self.points, self.tri, self.ratio, self.mode, self.nz_layers,
+            bipartite_C=self.C, bipartite_theta=self._bipartite_theta())
         constraints = _tiles.build_kirigami_constraints(tiles, source)
         return tiles, source, constraints
 

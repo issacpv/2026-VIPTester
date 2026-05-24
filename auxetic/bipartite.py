@@ -1,0 +1,301 @@
+"""Bipartite-polygon auxetic tile construction.
+
+Inspired by the three-step recipe of *A three step recipe for designing
+auxetic materials on demand* (Acuna, Gutierrez, Silva, Palza, Nunez,
+During — Communications Physics **5**, 113, 2022,
+doi:10.1038/s42005-022-00876-5), specialised here to the unit-cell
+construction the studio uses: a 2D point cloud is triangulated, and
+**each triangle independently emits four rigid polygons** —
+
+- one **central** polygon (set B), the triangle of hinge points
+  ``T_i = P_i + t·(M - P_i)`` around the centroid ``M``; and
+- three **corner kites** (set A), one per corner ``P_i``, the quad
+  ``[P_i, E_ij, T_i, E_ik]`` where ``E_ij``/``E_ik`` are points on the
+  two triangle edges incident to ``P_i``.
+
+The central polygon is the big triangle scaled by ``(1 - t)`` about the
+centroid, so its faces are **parallel** to the big triangle's faces.
+
+The constant size ratio ``C`` sets ``t = 1/(1+C)`` (paper step 3):
+
+- ``t`` positions each centroid hinge along its ``corner -> centroid``
+  segment (``C = 1`` -> midpoint); and
+- each edge point ``E_ij`` is the **foot of the perpendicular dropped
+  from the hinge ``T_i`` onto the triangle edge ``(P_i, P_j)``**. The
+  kite's inner edge ``E_ij -> T_i`` is therefore perpendicular to that
+  edge — and, because the central triangle's faces are parallel to the
+  big triangle's, perpendicular to the corresponding central face too.
+  This makes every hole between tiles a parallelogram (a rectangle in
+  the symmetric case): the perfect-auxetic condition.
+
+This reproduces the user's hand-derived tile ``(T_0, P_001, P_0,
+P_002)``: ``P_0`` is the corner node, ``P_001``/``P_002`` the edge
+points, ``T_0`` the centroid hinge shared with the central polygon.
+
+Adjacent kites within a triangle are joined by **bonds** — the segments
+along each triangle edge between the two perpendicular feet placed there
+by the two corner kites (``BipartiteNetwork.bonds``). The central
+polygon already connects to all three kites at the hinge points; the
+bonds connect the kites to each other along the edges.
+
+Fusion across triangles: two triangles sharing an edge place their feet
+on that shared edge and share the corner nodes, so neighbouring tiles
+meet edge-on.
+
+``C`` semantics (matching the user's "C=1 mesh / C=0 solid" note):
+
+- ``C -> 0`` (``t -> 1``): hinges collapse onto the centroid, kites grow
+  to fill the whole triangle — a solid polygon.
+- larger ``C`` (smaller ``t``): kites shrink toward the corners, opening
+  up the holes between tiles — a mesh.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class BipartitePolygon:
+    """One rigid polygon in an auxetic tile.
+
+    ``node_xy`` is the polygon's anchor: the triangle centroid for a
+    set-B ``central`` polygon, or the corner node for a set-A ``corner``
+    kite. ``vertices`` are the polygon's corners in counter-clockwise
+    order. ``triangle_index`` is the index of the source triangle (so
+    callers can tell which tiles came from the same triangle); for a
+    corner kite, ``corner_point_index`` is the index (into the lattice
+    points) of the corner the kite is anchored at, else ``-1``.
+    """
+
+    node_xy: np.ndarray          # shape (2,)
+    set_label: str               # 'A' (corner kite) or 'B' (central)
+    vertices: np.ndarray         # shape (k, 2), CCW
+    triangle_index: int = -1
+    corner_point_index: int = -1
+    hinge_index: int = -1        # index into ``vertices`` of the centroid
+                                 # hinge T_i (kites only); -1 for central
+
+    @property
+    def degree(self) -> int:
+        return int(self.vertices.shape[0])
+
+    def inner_edges(self) -> list[np.ndarray]:
+        """For a corner kite, the two edges incident to the hinge — the
+        perpendicular inner edges that meet the central polygon. Each is
+        a ``(2, 2)`` array ``[hinge_neighbour, hinge]``. Empty for the
+        central polygon (no distinguished hinge)."""
+        if self.hinge_index < 0:
+            return []
+        n = self.degree
+        h = self.hinge_index
+        prev_v = self.vertices[(h - 1) % n]
+        next_v = self.vertices[(h + 1) % n]
+        hv = self.vertices[h]
+        return [np.array([prev_v, hv]), np.array([hv, next_v])]
+
+    @property
+    def kind(self) -> str:
+        return "central" if self.set_label == "B" else "corner"
+
+
+@dataclass(frozen=True)
+class BipartiteNetwork:
+    """All polygons of an auxetic tiling plus the ``C`` used to build it.
+
+    ``bonds`` are the inter-kite connecting segments — one per triangle
+    edge — each an ``(2, 2)`` array ``[[x0, y0], [x1, y1]]`` joining the
+    two perpendicular feet placed on that edge by the edge's two corner
+    kites.
+    """
+
+    polygons: tuple[BipartitePolygon, ...]
+    C: float
+    bonds: tuple[np.ndarray, ...] = ()
+
+    @property
+    def set_a(self) -> tuple[BipartitePolygon, ...]:
+        """The corner kites."""
+        return tuple(p for p in self.polygons if p.set_label == 'A')
+
+    @property
+    def set_b(self) -> tuple[BipartitePolygon, ...]:
+        """The central polygons."""
+        return tuple(p for p in self.polygons if p.set_label == 'B')
+
+    @property
+    def hinges(self) -> np.ndarray:
+        """The unique centroid-hinge points (the ``T_i``) — the vertices
+        of the central polygons, which are shared with the corner kites.
+        Returns an ``(H, 2)`` array (deduplicated to 1e-9)."""
+        if not self.set_b:
+            return np.empty((0, 2), dtype=float)
+        allv = np.vstack([p.vertices for p in self.set_b])
+        _, idx = np.unique(np.round(allv, 9), axis=0, return_index=True)
+        return allv[np.sort(idx)]
+
+
+def _perp_foot(T: np.ndarray, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """Foot of the perpendicular from point ``T`` onto the line through
+    ``A`` and ``B``. The segment ``foot -> T`` is perpendicular to
+    ``A -> B`` by construction."""
+    AB = B - A
+    denom = float(np.dot(AB, AB))
+    if denom < 1e-18:
+        return A.copy()
+    s = float(np.dot(T - A, AB)) / denom
+    return A + s * AB
+
+
+def _orient_ccw(verts: np.ndarray) -> np.ndarray:
+    """Return ``verts`` reversed if its signed (shoelace) area is
+    negative, so every polygon winds counter-clockwise."""
+    v = np.asarray(verts, dtype=float)
+    area = 0.5 * np.sum(v[:, 0] * np.roll(v[:, 1], -1)
+                        - np.roll(v[:, 0], -1) * v[:, 1])
+    return v if area >= 0.0 else v[::-1]
+
+
+def build_bipartite_network(
+    points: np.ndarray,
+    simplices: np.ndarray,
+    C: float = 1.0,
+    theta: float = 0.0,
+) -> BipartiteNetwork:
+    """Build the auxetic tile network for a 2D triangulation.
+
+    Parameters
+    ----------
+    points : (N, 2) array
+        Corner positions in lattice space.
+    simplices : (T, 3) int array
+        Triangle vertex indices into ``points``.
+    C : float, default 1.0
+        Constant size ratio (paper step 3); ``t = 1/(1+C)``. Must be > 0.
+    theta : float, default 0.0
+        Mechanism actuation angle (radians). Each corner kite rotates
+        **rigidly about its hinge** ``T_c`` by ``theta`` while the central
+        polygon — whose vertices *are* the hinges — stays fixed. This is
+        the rotating-units motion of the auxetic (notes p.2:
+        ``P_{a,j} = R(θ)[P_a - (T_a - M)] + (T_a - M)``, i.e. rotation of
+        ``P_a`` about ``T_a``). ``theta = 0`` is the rest tile.
+
+    Returns
+    -------
+    BipartiteNetwork
+        For each triangle, one central polygon (set B) followed by its
+        three corner kites (set A) — ``4·T`` polygons total.
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError(f"points must be (N, 2); got {pts.shape}")
+    simps = np.asarray(simplices, dtype=np.int64)
+    if simps.ndim != 2 or simps.shape[1] != 3:
+        raise ValueError(f"simplices must be (T, 3); got {simps.shape}")
+    if not (C > 0.0):
+        raise ValueError(f"C must be > 0; got {C}")
+
+    t = 1.0 / (1.0 + float(C))
+    cth, sth = np.cos(float(theta)), np.sin(float(theta))
+    R = np.array([[cth, -sth], [sth, cth]])
+    polygons: list[BipartitePolygon] = []
+    bonds: list[np.ndarray] = []
+
+    for tri_idx in range(simps.shape[0]):
+        idx = [int(v) for v in simps[tri_idx]]
+        P = [pts[i] for i in idx]
+        M = (P[0] + P[1] + P[2]) / 3.0
+        # Centroid hinges, shared between the central polygon and kites.
+        T = [P[c] + t * (M - P[c]) for c in range(3)]
+
+        # Rigid rotation of a point about hinge T[c] by theta. At
+        # theta = 0 this is the identity, so the rest tile is unchanged.
+        def about(p, c):
+            return R @ (np.asarray(p, dtype=float) - T[c]) + T[c]
+
+        # The central polygon is fixed (its vertices are the hinges).
+        polygons.append(BipartitePolygon(
+            node_xy=M.copy(),
+            set_label='B',
+            vertices=_orient_ccw(np.array(T)),
+            triangle_index=tri_idx,
+            corner_point_index=-1,
+        ))
+
+        # Perpendicular feet: foot[c][o] is the foot of the perpendicular
+        # from hinge T[c] onto the triangle edge (P[c], P[o]).
+        foot = [[None, None, None] for _ in range(3)]
+        for c in range(3):
+            for o in range(3):
+                if o != c:
+                    foot[c][o] = _perp_foot(T[c], P[c], P[o])
+
+        # One kite per corner, rotated rigidly about its hinge.
+        for c in range(3):
+            j, k = (c + 1) % 3, (c + 2) % 3
+            kite = _orient_ccw(np.array([
+                about(P[c], c), about(foot[c][j], c), T[c], about(foot[c][k], c)
+            ]))
+            hinge_index = int(np.argmin(
+                np.linalg.norm(kite - T[c], axis=1)))
+            polygons.append(BipartitePolygon(
+                node_xy=P[c].copy(),
+                set_label='A',
+                vertices=kite,
+                triangle_index=tri_idx,
+                corner_point_index=idx[c],
+                hinge_index=hinge_index,
+            ))
+
+        # One bond per triangle edge: the segment between the two feet
+        # (each carried along by its own kite's rotation).
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            bonds.append(np.array([about(foot[a][b], a), about(foot[b][a], b)]))
+
+    return BipartiteNetwork(polygons=tuple(polygons), C=float(C),
+                            bonds=tuple(bonds))
+
+
+def jamming_angle(
+    points: np.ndarray,
+    simplices: np.ndarray,
+    C: float = 1.0,
+) -> float:
+    """Largest ``|theta|`` a kite can rotate about its hinge before an
+    inner edge collides with the adjacent central-polygon face — the
+    notes' jamming angle (p.2).
+
+    For each corner ``c`` and each adjacent corner ``o`` the kite's inner
+    edge ``T_c -> foot[c][o]`` swings toward the central edge
+    ``T_c -> T_o``; the angle between them is how far it can turn before
+    contact. The whole tiling jams at the minimum such angle over every
+    corner, so that minimum (radians) is returned. Empty/degenerate input
+    yields ``pi/2``.
+    """
+    pts = np.asarray(points, dtype=float)
+    simps = np.asarray(simplices, dtype=np.int64)
+    if (pts.ndim != 2 or pts.shape[1] != 2
+            or simps.ndim != 2 or simps.shape[1] != 3 or not (C > 0.0)):
+        return float(np.pi / 2.0)
+
+    t = 1.0 / (1.0 + float(C))
+    min_ang = float(np.pi / 2.0)
+    for tri in simps:
+        P = [pts[int(v)] for v in tri]
+        M = (P[0] + P[1] + P[2]) / 3.0
+        T = [P[c] + t * (M - P[c]) for c in range(3)]
+        for c in range(3):
+            for o in range(3):
+                if o == c:
+                    continue
+                u = _perp_foot(T[c], P[c], P[o]) - T[c]
+                v = T[o] - T[c]
+                nu, nv = float(np.linalg.norm(u)), float(np.linalg.norm(v))
+                if nu < 1e-12 or nv < 1e-12:
+                    continue
+                ang = float(np.arccos(np.clip(np.dot(u, v) / (nu * nv),
+                                              -1.0, 1.0)))
+                min_ang = min(min_ang, ang)
+    return min_ang
