@@ -1,0 +1,79 @@
+{
+  "version": 4,
+  "mode": 1,
+  "n_points": 5,
+  "ratio": 0.35,
+  "nz_layers": 2,
+  "points": [
+    [
+      0.3745401188473625,
+      0.9507143064099162
+    ],
+    [
+      0.7319939418114051,
+      0.5986584841970366
+    ],
+    [
+      0.15601864044243652,
+      0.15599452033620265
+    ],
+    [
+      0.05808361216819946,
+      0.8661761457749352
+    ],
+    [
+      0.44897708172963285,
+      0.6407376543346248
+    ]
+  ],
+  "shape_params": {
+    "ngon_thickness": 0.03,
+    "hub_size_factor": 0.75,
+    "joint_sphere_radius": 0.015,
+    "strut_radius": 0.02
+  },
+  "generation": {
+    "density_axis": "none",
+    "density_law": "uniform",
+    "density_strength": 1.0,
+    "edge_flips": [],
+    "mesh_path": null,
+    "mesh_vertices": null,
+    "unit_scale_cm": 1.0
+  },
+  "dynamics": {
+    "forces": [],
+    "ground_face": null,
+    "pre_rotation_quat": null,
+    "pre_joint_angle_deg": null,
+    "fixed_tiles": [],
+    "config": {
+      "dt": 0.001,
+      "duration": 1.0,
+      "joint_stiffness": 100.0,
+      "joint_damping": 2.0,
+      "gravity_cm_per_s2": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "convergence_kinetic_thresh": 1e-05
+    }
+  },
+  "view_state": {
+    "rigid_rotation_quat": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "flipped": false,
+    "joint_angle_deg": 0.0
+  },
+  "metadata": {
+    "name": "",
+    "created": "2026-05-07T04:12:36.858582+00:00",
+    "modified": "2026-05-07T04:12:36.858934+00:00",
+    "notes": ""
+  }
+}
