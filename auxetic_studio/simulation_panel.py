@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QCheckBox,
     QLabel,
@@ -54,6 +55,7 @@ from scipy.spatial.transform import Rotation
 
 from auxetic import TileSystem, Simulator
 from auxetic.dynamics import build_dynamics_simulator_from_lattice
+from auxetic_studio.views import POISSON_BOXES
 
 
 # ---------------------------------------------------------------------------
@@ -518,24 +520,31 @@ class SimulationPanel(QDockWidget):
         outer.addWidget(box)
 
     def _build_poisson_bounds_box(self, outer):
-        """Per-bound visibility toggles for the Poisson-tracking overlay
-        (Batch 3 task 3). Pure GUI visibility state — toggling a box shows/
-        hides its wireframe + extreme points; the geometry is unchanged."""
+        """Per-bound visibility toggles for the Poisson-bounds overlay.
+        Eight checkboxes (default ON), one per extremal-pose box defined in
+        ``views.POISSON_BOXES``: Initial, the two most-compressed poses
+        (Comp ±θ), the overall expanded Footprint, and the four farthest-reach
+        poses (±X / ±Y). Each checkbox's text is coloured to match its box's
+        wireframe. Pure GUI visibility state — toggling a box re-renders the
+        overlay; the geometry is unchanged. Laid out 4-over-4 (summary boxes /
+        directional boxes)."""
         box = QGroupBox("Poisson bounds", self)
-        layout = QHBoxLayout(box); layout.setContentsMargins(8, 4, 8, 4)
-        self.show_initial_cb    = QCheckBox("Initial", box)
-        self.show_compressed_cb = QCheckBox("Compressed", box)
-        self.show_expansion_cb  = QCheckBox("Expansion", box)
-        for cb in (self.show_initial_cb, self.show_compressed_cb,
-                   self.show_expansion_cb):
+        grid = QGridLayout(box); grid.setContentsMargins(8, 4, 8, 4)
+        self._poisson_bound_cbs: dict[str, QCheckBox] = {}
+        for n, (key, label, color) in enumerate(POISSON_BOXES):
+            cb = QCheckBox(label, box)
             cb.setChecked(True)
+            cb.setStyleSheet(f"color: {color};")
             # Re-render the overlay live when a box is toggled.
             cb.toggled.connect(self._update_poisson_tracking)
-            layout.addWidget(cb)
-        layout.addStretch(1)
+            self._poisson_bound_cbs[key] = cb
+            # Row 0: the four "summary" boxes (rest, the two compressions, and
+            # the overall footprint). Row 1: the four directional reach boxes.
+            grid.addWidget(cb, 0 if n < 4 else 1, n % 4)
         box.setToolTip(
-            "Show/hide the rest, most-compressed and most-expanded "
-            "bounding boxes of the kinematic sweep.")
+            "Show/hide the extremal kinematic bounding boxes: the rest pose, "
+            "the most-compressed pose on each rotation direction (±θ), and "
+            "the farthest-reach pose in each of ±X / ±Y.")
         outer.addWidget(box)
 
     def _build_plot(self, outer):
@@ -857,15 +866,23 @@ class SimulationPanel(QDockWidget):
         self._update_poisson_tracking()
 
     def _update_poisson_tracking(self) -> None:
-        """Refresh the 3D Poisson-tracking overlay (task 6a): the rest, the
-        most axially-compressed, and the most axially-expanded sweep poses —
-        three bounding boxes and the per-axis extreme points the Poisson
-        calc tracks. When a polygon is anchored, the bounds are computed in
-        that polygon's frame so they enclose the on-screen (relativized)
-        structure. The three "Poisson bounds" checkboxes gate which boxes
-        draw (pure visibility; geometry unchanged). Clears the overlay when
-        there's no fresh kinematic result. No-op without a 3D view. All
-        geometry comes from the Simulator (auxetic/), not here."""
+        """Refresh the 3D Poisson-bounds overlay: eight bounding boxes — the
+        rest pose, the two most axially-compressed poses on the +θ and −θ
+        halves of the sweep, the four farthest-reach poses in +X / −X / +Y /
+        −Y (each with the per-axis extreme points that define it), and the
+        overall expanded **footprint** that encloses those four directional
+        boxes. Pose selection lives in the Simulator
+        (:meth:`Simulator.extremal_pose_indices`). When a polygon is anchored
+        the selection is done in that polygon's frame (``anchor=`` passed
+        through) AND the chosen poses are relativized to it for drawing — so
+        the reach/extent picks describe the structure as it's actually shown
+        and the boxes (and footprint) genuinely enclose the on-screen lattice
+        at every θ. The footprint is built from the four directional boxes'
+        (already-relativized) corners, so it stays correct in either frame.
+        Each box's checkbox gates its visibility (pure visibility; geometry
+        unchanged). Clears the overlay when there's no fresh kinematic result.
+        No-op without a 3D view. All geometry comes from the Simulator
+        (auxetic/), not here."""
         view = self._view_3d
         if view is None:
             return
@@ -875,36 +892,42 @@ class SimulationPanel(QDockWidget):
             view.clear_poisson_tracking()
             return
         try:
-            rest = sim.rest_pose()
-            extents = np.asarray(result.bbox_extents, dtype=float)
-            axial = sim._axial_index()
-            # Most axially-compressed (argmin) and most axially-expanded
-            # (argmax) sweep poses → the clearest contrast against rest for
-            # the bounding-box visual.
-            comp_idx = int(np.argmin(extents[:, axial])) if extents.size else 0
-            exp_idx = int(np.argmax(extents[:, axial])) if extents.size else 0
-            final_pose = result.poses[comp_idx]
-            expansion_pose = result.poses[exp_idx]
             # When a polygon is anchored, _drive_pose_from_slider draws every
-            # frame relativized to that polygon (relativize_pose); compute the
-            # bounds from the SAME relativized poses so the boxes enclose
-            # what's actually on screen. No anchor → absolute (unchanged).
+            # frame relativized to that polygon (relativize_pose). Select the
+            # extremal poses in that SAME frame (anchor=) and draw the chosen
+            # poses relativized too, so the boxes enclose what's on screen at
+            # every θ. No anchor → absolute selection + absolute draw.
             anchor = self._anchor_tile
-            if anchor is not None:
-                rest = sim.relativize_pose(rest, anchor)
-                final_pose = sim.relativize_pose(final_pose, anchor)
-                expansion_pose = sim.relativize_pose(expansion_pose, anchor)
-            view.show_poisson_tracking(
-                sim.bbox_corners(rest),
-                sim.bbox_corners(final_pose),
-                sim.bbox_extreme_vertices(rest),
-                sim.bbox_extreme_vertices(final_pose),
-                sim.bbox_corners(expansion_pose),
-                sim.bbox_extreme_vertices(expansion_pose),
-                show_initial=self.show_initial_cb.isChecked(),
-                show_compressed=self.show_compressed_cb.isChecked(),
-                show_expansion=self.show_expansion_cb.isChecked(),
+            indices = sim.extremal_pose_indices(result, anchor=anchor)
+
+            def _visible(key: str) -> bool:
+                cb = self._poisson_bound_cbs.get(key)
+                return cb.isChecked() if cb is not None else True
+
+            boxes: dict[str, tuple] = {}
+            for key, idx in indices.items():
+                pose = result.poses[idx]
+                if anchor is not None:
+                    pose = sim.relativize_pose(pose, anchor)
+                boxes[key] = (
+                    sim.bbox_corners(pose),
+                    sim.bbox_extreme_vertices(pose),
+                    _visible(key),
+                )
+            # Overall expanded footprint: the envelope of the four directional
+            # reach boxes (their biggest +x/−x/+y/−y). Built from the corners
+            # already computed above, so it inherits whatever frame they're in
+            # (absolute or anchor-relativized) for free. No per-axis extreme
+            # points — it's a synthetic envelope, not a single pose.
+            directional = [boxes[k][0] for k in (
+                "expansion_pos_x", "expansion_neg_x",
+                "expansion_pos_y", "expansion_neg_y")]
+            boxes["footprint"] = (
+                sim.aabb_corners_enclosing(directional),
+                None,
+                _visible("footprint"),
             )
+            view.show_poisson_tracking(boxes)
         except Exception:
             view.clear_poisson_tracking()
 

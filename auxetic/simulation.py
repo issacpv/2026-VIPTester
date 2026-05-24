@@ -843,16 +843,41 @@ class Simulator:
             return z, z.copy()
         return verts.min(axis=0), verts.max(axis=0)
 
-    def bbox_corners(self, pose: np.ndarray) -> np.ndarray:
-        """Corner points of the axis-aligned bounding box under ``pose``:
-        4 corners in 2D, 8 in 3D, shape ``(2**dimension, dimension)``.
-        Lets the GUI draw the box as a wireframe."""
-        lo, hi = self.bbox_bounds(pose)
+    def _corners_from_bounds(self, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+        """Enumerate the ``2**dimension`` corners of the axis-aligned box
+        spanned by ``(lo, hi)``, shape ``(2**dimension, dimension)``."""
         return np.array(
             [[(hi[d] if bit else lo[d]) for d, bit in enumerate(combo)]
              for combo in itertools.product((0, 1), repeat=self.dimension)],
             dtype=float,
         )
+
+    def bbox_corners(self, pose: np.ndarray) -> np.ndarray:
+        """Corner points of the axis-aligned bounding box under ``pose``:
+        4 corners in 2D, 8 in 3D, shape ``(2**dimension, dimension)``.
+        Lets the GUI draw the box as a wireframe."""
+        lo, hi = self.bbox_bounds(pose)
+        return self._corners_from_bounds(lo, hi)
+
+    def aabb_corners_enclosing(self, corner_sets) -> np.ndarray:
+        """Corners of the axis-aligned box that encloses every corner array in
+        ``corner_sets`` (each shape ``(k, dimension)``); shape
+        ``(2**dimension, dimension)``.
+
+        Used to build the overall **expanded-footprint** box from the four
+        directional farthest-reach boxes — its faces are the biggest
+        +x / −x / +y / −y of those boxes. Operating on the already-built (and,
+        when anchored, already-relativized) corner arrays keeps the footprint
+        correct in whatever frame those boxes were drawn, and avoids
+        re-selecting / re-projecting the sweep. An empty / all-``None`` input
+        returns a degenerate zero box."""
+        pts = [np.asarray(c, dtype=float) for c in corner_sets
+               if c is not None and np.asarray(c).size]
+        if not pts:
+            z = np.zeros(self.dimension)
+            return self._corners_from_bounds(z, z.copy())
+        allpts = np.concatenate(pts, axis=0)
+        return self._corners_from_bounds(allpts.min(axis=0), allpts.max(axis=0))
 
     def bbox_extreme_vertices(self, pose: np.ndarray) -> np.ndarray:
         """For each spatial axis, the two tile vertices at the min and max
@@ -886,6 +911,107 @@ class Simulator:
         """Spatial-dimension index whose unit vector best aligns with
         ``load_axis``."""
         return int(np.argmax(np.abs(self.load_axis)))
+
+    def extremal_pose_indices(self, result: "SimResult", *,
+                              anchor: int | None = None) -> dict[str, int]:
+        """Indices into ``result.poses`` for the extremal kinematic states
+        the Poisson-bounds overlay draws (SPEC §7.4 visualisation).
+
+        Returns a dict — every key always present — each value an int index:
+
+        - ``"initial"``         — sample with θ closest to 0 (the rest pose).
+        - ``"compressed_pos"``  — smallest load-axis bbox extent among
+          *reachable* samples with θ > 0 (most compressed rotating +θ).
+        - ``"compressed_neg"``  — same among reachable samples with θ < 0.
+        - ``"expansion_pos_x"`` / ``"expansion_neg_x"`` — the sample whose
+          bbox reaches farthest in +x / −x (max ``hi_x`` / min ``lo_x``).
+        - ``"expansion_pos_y"`` / ``"expansion_neg_y"`` — farthest in +y / −y.
+
+        Selection frame: with ``anchor=None`` (default) the bounding boxes are
+        measured in the simulator's **absolute world frame**. Pass ``anchor``
+        (a tile index) to measure them in that polygon's frame instead —
+        :meth:`relativize_pose` is applied to every sample before its bbox is
+        taken. The GUI passes the active anchor while a view is locked to a
+        polygon, so the extent/reach picks describe the structure *as drawn*
+        and the resulting footprint actually encloses it. (Selecting in the
+        absolute frame and then relativising only for display lets the
+        on-screen lattice poke outside the boxes, because per-pose
+        relativisation isn't a single shared transform.) ``initial`` is
+        unaffected — rest is rest in either frame; only the extent/reach picks
+        shift. An out-of-range ``anchor`` is treated as ``None``.
+
+        "Reachable" excludes samples flagged in ``collision_at_theta`` (tiles
+        overlapping past the jamming boundary), matching the compression-ratio
+        metric in :meth:`sweep_theta`. Directional "expansion" is the
+        structure's farthest reach in each axis direction (in the selection
+        frame) over the whole sweep, so a rigidly rotated / off-centre /
+        asymmetric lattice — or an anchored view — yields four distinct boxes;
+        a symmetric centred one may pick the same sample for +x and −x (and
+        +y / −y).
+
+        A degenerate sweep (no samples, or every sample on one half collided)
+        falls back to the initial index for the affected keys, so callers can
+        index ``result.poses`` unconditionally."""
+        keys = ("initial", "compressed_pos", "compressed_neg",
+                "expansion_pos_x", "expansion_neg_x",
+                "expansion_pos_y", "expansion_neg_y")
+        poses = np.asarray(result.poses, dtype=float)
+        n = poses.shape[0]
+        if n == 0:
+            return {k: 0 for k in keys}
+
+        theta = np.asarray(result.theta_samples, dtype=float).ravel()
+        if theta.shape[0] != n:
+            theta = np.zeros(n, dtype=float)
+        collided = np.asarray(result.collision_at_theta, dtype=bool).ravel()
+        if collided.shape[0] != n:
+            collided = np.zeros(n, dtype=bool)
+        reachable = ~collided
+        if not reachable.any():
+            # Whole sweep collided — don't filter to nothing; rank them all.
+            reachable = np.ones(n, dtype=bool)
+
+        # Per-sample axis-aligned bbox lo/hi face positions. The sweep stored
+        # extents (widths) but not the face positions directional reach needs,
+        # so recompute here (cheap relative to the sweep itself). When anchored
+        # we relativise each sample to the anchor polygon FIRST, so the picks
+        # describe the structure in the same frame the GUI draws it.
+        use_anchor = anchor is not None and 0 <= int(anchor) < self.n_tiles
+        los = np.empty((n, self.dimension), dtype=float)
+        his = np.empty((n, self.dimension), dtype=float)
+        for i in range(n):
+            p = (self.relativize_pose(poses[i], int(anchor))
+                 if use_anchor else poses[i])
+            lo, hi = self.bbox_bounds(p)
+            los[i] = lo
+            his[i] = hi
+        extents = his - los
+        axial = self._axial_index()
+
+        initial = int(np.argmin(np.abs(theta)))
+
+        def _argmin_axial_extent(half_mask: np.ndarray) -> int:
+            m = half_mask & reachable
+            if not m.any():
+                return initial
+            idxs = np.flatnonzero(m)
+            return int(idxs[int(np.argmin(extents[idxs, axial]))])
+
+        def _reach(values: np.ndarray, want_max: bool) -> int:
+            idxs = np.flatnonzero(reachable)
+            sub = values[idxs]
+            pick = int(np.argmax(sub)) if want_max else int(np.argmin(sub))
+            return int(idxs[pick])
+
+        return {
+            "initial":         initial,
+            "compressed_pos":  _argmin_axial_extent(theta > 0.0),
+            "compressed_neg":  _argmin_axial_extent(theta < 0.0),
+            "expansion_pos_x": _reach(his[:, 0], True),
+            "expansion_neg_x": _reach(los[:, 0], False),
+            "expansion_pos_y": _reach(his[:, 1], True),
+            "expansion_neg_y": _reach(los[:, 1], False),
+        }
 
     # ==================================================================
     # SPEC §7.3 step 5-6: θ-sweep

@@ -38,6 +38,32 @@ except Exception:  # pragma: no cover - import-time platform issues
     _PYVISTAQT_AVAILABLE = False
 
 
+# ---------------------------------------------------------------------------
+# Poisson-bounds overlay: the seven extremal-pose boxes (SPEC §7.4 viz).
+# Single source of truth shared with the Simulation panel, which colours the
+# matching show/hide checkboxes to each box's wireframe. Each entry is
+# ``(key, short label, wireframe + point colour)``; the tuple order is both
+# the draw order and the checkbox order. Keys match
+# ``Simulator.extremal_pose_indices``.
+# ---------------------------------------------------------------------------
+POISSON_BOXES: tuple[tuple[str, str, str], ...] = (
+    ("initial",         "Initial",   "#8a8a8a"),
+    ("compressed_pos",  "Comp +θ",   "#ff4d4d"),
+    ("compressed_neg",  "Comp −θ",   "#ff9a3d"),
+    # The overall expanded footprint: a single envelope enclosing the four
+    # directional reach boxes below (biggest +x/−x/+y/−y of the sweep). Bold
+    # black so the outer frame reads against the (light) viewport + panel —
+    # white washed out on both.
+    ("footprint",       "Footprint", "#000000"),
+    ("expansion_pos_x", "+X",        "#33dd55"),
+    ("expansion_neg_x", "−X",        "#00bcd4"),
+    ("expansion_pos_y", "+Y",        "#4d79ff"),
+    ("expansion_neg_y", "−Y",        "#c04dff"),
+)
+POISSON_BOX_COLORS: dict[str, str] = {k: c for k, _lbl, c in POISSON_BOXES}
+POISSON_BOX_KEYS: tuple[str, ...] = tuple(k for k, _lbl, _c in POISSON_BOXES)
+
+
 # Edit-mode visual styling.
 _NORMAL_SIZE   = 10.0
 _HOVER_SIZE    = 13.0
@@ -1398,60 +1424,62 @@ class View3D(QWidget):
     # Poisson-tracking overlay (task 6a)
     # ------------------------------------------------------------------
 
-    def show_poisson_tracking(self, initial_corners, final_corners,
-                              initial_extremes, final_extremes,
-                              expansion_corners=None,
-                              expansion_extremes=None,
-                              *, show_initial=True, show_compressed=True,
-                              show_expansion=True) -> None:
-        """Draw the Poisson-tracking overlay: the rest ("initial"),
-        compressed ("final") and — when supplied — fully-expanded
-        ("expansion") axis-aligned bounding boxes as wireframes (initial
-        grey, final white, expansion green), plus the per-axis extreme
-        vertices that define them (initial X magenta / Y yellow / Z teal;
-        final the same hues darker; expansion a distinct green/cyan family).
-        The ``show_*`` flags gate each box (+ its extreme points)
-        individually — a disabled box is neither drawn nor recorded (its
-        ``last_poisson_tracking`` geometry is ``None``). All geometry is
-        computed in ``auxetic`` (Simulator) and passed in — this method only
-        renders. Headless-safe (records ``last_poisson_tracking`` then
-        no-ops without an interactor)."""
-        def _vis(arr, show):
-            return None if (arr is None or not show) else np.asarray(arr, float)
+    def show_poisson_tracking(self, boxes) -> None:
+        """Draw the Poisson-bounds overlay — up to seven extremal-pose
+        axis-aligned bounding boxes: the rest ("initial"), the two most
+        axially-compressed poses on the +θ and −θ halves of the sweep, and
+        the four farthest-reach poses in +x / −x / +y / −y. Each box is a
+        wireframe plus the per-axis extreme vertices that define it, drawn in
+        the box's own colour (see :data:`POISSON_BOXES`).
 
-        self.last_poisson_tracking = {
-            "initial_corners":  _vis(initial_corners,  show_initial),
-            "final_corners":    _vis(final_corners,    show_compressed),
-            "initial_extremes": _vis(initial_extremes, show_initial),
-            "final_extremes":   _vis(final_extremes,   show_compressed),
-            "expansion_corners":  _vis(expansion_corners,  show_expansion),
-            "expansion_extremes": _vis(expansion_extremes, show_expansion),
-            "show_initial":    bool(show_initial),
-            "show_compressed": bool(show_compressed),
-            "show_expansion":  bool(show_expansion),
-        }
+        ``boxes`` maps a box key to a ``(corners, extremes, visible)`` triple:
+          - ``corners``  — ``(2**dim, dim)`` bbox corner array, or ``None``
+          - ``extremes`` — ``(dim, 2, dim)`` per-axis min/max vertices, or ``None``
+          - ``visible``  — bool. A hidden box is neither drawn nor recorded
+            (its ``last_poisson_tracking`` geometry is ``None`` — the
+            headless-tap convention).
+
+        ``last_poisson_tracking`` is recorded as ``{key: {"corners", "extremes",
+        "visible"}}`` for every known key (geometry ``None`` when hidden or
+        absent). All geometry is computed in ``auxetic`` (Simulator) and passed
+        in — this method only renders. Headless-safe (records the tap then
+        no-ops without an interactor). Unknown / missing keys are ignored."""
+        rec: dict[str, dict] = {}
+        for key, _label, _color in POISSON_BOXES:
+            spec = boxes.get(key) if boxes else None
+            if spec is None:
+                corners, extremes, visible = None, None, False
+            else:
+                corners, extremes, visible = spec
+                visible = bool(visible)
+            show = visible and corners is not None
+            rec[key] = {
+                "corners":  np.asarray(corners, float) if show else None,
+                "extremes": (np.asarray(extremes, float)
+                             if (show and extremes is not None) else None),
+                "visible":  visible,
+            }
+        self.last_poisson_tracking = rec
         if self.interactor is None:
             return
         self._clear_poisson_actors(render=False)
         try:
-            # X magenta, Y yellow, Z teal; final poses use darker shades.
-            init_colors  = ("#ff00ff", "#ffd400", "#17becf")
-            final_colors = ("#800080", "#8a7400", "#0a6b75")
-            if show_initial:
-                self._add_bbox_wireframe(initial_corners, color="#8a8a8a", width=2)
-                self._add_extreme_points(initial_extremes, init_colors, size=11)
-            if show_compressed:
-                self._add_bbox_wireframe(final_corners, color="#f0f0f0", width=3)
-                self._add_extreme_points(final_extremes, final_colors, size=15)
-            # Expansion box (max axial extent): a distinct green/cyan family
-            # so it reads apart from the grey/white compression pair.
-            if show_expansion and expansion_corners is not None:
-                self._add_bbox_wireframe(
-                    expansion_corners, color="#33dd55", width=3)
-            if show_expansion and expansion_extremes is not None:
-                exp_colors = ("#39ff14", "#00e5ff", "#1de9b6")
-                self._add_extreme_points(
-                    expansion_extremes, exp_colors, size=15)
+            for key, _label, color in POISSON_BOXES:
+                entry = rec[key]
+                if entry["corners"] is None:
+                    continue
+                # Initial is a thin grey reference frame; the actuated /
+                # reach boxes draw thicker so they read on top of it; the
+                # overall footprint envelope is boldest of all.
+                if key == "initial":
+                    width, psize = 2, 11
+                elif key == "footprint":
+                    width, psize = 4, 13
+                else:
+                    width, psize = 3, 13
+                self._add_bbox_wireframe(entry["corners"], color=color, width=width)
+                if entry["extremes"] is not None:
+                    self._add_extreme_points(entry["extremes"], (color,), size=psize)
         except Exception:
             pass
         try:
