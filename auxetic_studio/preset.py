@@ -56,11 +56,12 @@ from auxetic import Lattice
 from auxetic import geometry as _geom
 
 
-PRESET_VERSION = 6  # Task 1 — adds the opt-in "bezier" block (curved
-                     # strut edges). v5 → v6 migration fills it with
-                     # curving OFF, so every pre-v6 preset loads with
-                     # byte-for-byte identical export geometry. (v5 added
-                     # the mode-11 constant size ratio "C" to generation.)
+PRESET_VERSION = 7  # Tile Library — adds the "compose" block (a
+                     # user-authored explicit triangulation that must not
+                     # be re-Delaunayed). v6 → v7 migration fills it with
+                     # preserve_triangulation=False, so every pre-v7 preset
+                     # loads exactly as before. (v6 added the opt-in
+                     # "bezier" block; v5 added the mode-11 size ratio "C".)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,16 @@ def _stub_generation() -> Dict[str, Any]:
         # Mode-11 constant size ratio (v5). 1.0 = symmetric / midpoint
         # hinges, the behaviour-preserving default for every other mode.
         "C":                1.0,
+    }
+
+
+def _stub_compose() -> Dict[str, Any]:
+    """v7 ``compose`` block defaults — not a composition. A non-composed
+    lattice derives its triangulation from its points (Delaunay/grid), so
+    no explicit ``simplices`` are stored."""
+    return {
+        "preserve_triangulation": False,
+        "simplices":              None,
     }
 
 
@@ -254,6 +265,18 @@ def save_preset(
             "strength": float(getattr(lattice, "bezier_strength", 0.25)),
             "segments": int(getattr(lattice, "bezier_segments", 12)),
         },
+        # Tile-Library composition (v7): when the lattice holds a
+        # user-authored triangulation, persist the explicit simplices so
+        # loading reinstalls them verbatim instead of re-Delaunaying.
+        "compose": {
+            "preserve_triangulation": bool(
+                getattr(lattice, "preserve_triangulation", False)),
+            "simplices": (
+                np.asarray(lattice.tri.simplices).tolist()
+                if (getattr(lattice, "preserve_triangulation", False)
+                    and lattice.tri is not None)
+                else None),
+        },
         "view_state": dict(lattice.view_state) if lattice.view_state else _stub_view_state(),
         "metadata":   md,
     }
@@ -317,6 +340,9 @@ def load_preset(path: str) -> Lattice:
     if int(data.get("version", PRESET_VERSION)) == 5:
         data = _migrate_v5_to_v6(data)
 
+    if int(data.get("version", PRESET_VERSION)) == 6:
+        data = _migrate_v6_to_v7(data)
+
     # ---- M1 generation block (v3) ---------------------------------------
     # Pull these out first so they can be passed to the Lattice
     # constructor. Mesh-import modes (7, 8, 9) need ``mesh_vertices``
@@ -351,11 +377,24 @@ def load_preset(path: str) -> Lattice:
         bezier_segments  = int(bez.get("segments", 12)),
     )
 
+    # ---- compose block (v7): a user-authored triangulation? -------------
+    compose = dict(data.get("compose") or _stub_compose())
+    compose_simplices = compose.get("simplices")
+    is_composed = (bool(compose.get("preserve_triangulation", False))
+                   and compose_simplices is not None)
+
     # ---- install saved points (and freeze them as the new "original") --
     saved_points = data.get("points") or []
     if saved_points:
         pts = np.asarray(saved_points, dtype=float)
-        lattice.regenerate_from_points(pts)
+        if is_composed:
+            # Reinstall the authored mesh verbatim — never re-Delaunay
+            # (that would discard the composition and fill concavities).
+            simp = np.asarray(compose_simplices, dtype=np.int64).reshape(-1, 3)
+            lattice.preserve_triangulation = True
+            lattice._set_points_and_tri(pts, _geom._FlippedTri(simp))
+        else:
+            lattice.regenerate_from_points(pts)
         # SPEC §5.1 doesn't store points_original; the as-loaded points
         # ARE the new original, so Reset → returns to load state.
         lattice.points_original = lattice.points.copy()
@@ -501,4 +540,17 @@ def _migrate_v5_to_v6(data: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in _stub_bezier().items():
         bez.setdefault(key, value)
     out["bezier"] = bez
+    return out
+
+
+def _migrate_v6_to_v7(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote a v6 preset to v7: adds the ``compose`` block marked
+    not-composed. Pre-v7 presets were never tile-composed, so they load
+    exactly as before — their triangulation is derived from the points."""
+    out = dict(data)
+    out["version"] = 7
+    compose = dict(out.get("compose") or {})
+    for key, value in _stub_compose().items():
+        compose.setdefault(key, value)
+    out["compose"] = compose
     return out

@@ -54,10 +54,15 @@ from . import export as _export
 # Mode 11 is the bipartite-polygon auxetic (Acuna et al. 2022): a 2D
 # point cloud is Delaunay-triangulated and the corner/centroid
 # bipartition drives the polygon network (see ``auxetic.bipartite``).
-_3D_MODES = (3, 6, 9, 10)
-_DELAUNAY_MODES = (1, 2, 3, 7, 8, 9, 11)  # modes that re-Delaunay on each retriangulation
+# Mode 12 is the 3D tetrahedral auxetic — the volumetric analogue of
+# mode 11: a 3D point cloud is Delaunay-tetrahedralised and each tetra
+# emits an internal tetra + four corner polyhedra (see
+# ``auxetic.tetrahedral``).
+_3D_MODES = (3, 6, 9, 10, 12)
+_DELAUNAY_MODES = (1, 2, 3, 7, 8, 9, 11, 12)  # modes that re-Delaunay on each retriangulation
 _CUBOID_MODES = (10,)                  # modes that bypass Delaunay entirely
 _BIPARTITE_MODES = (11,)               # modes built via auxetic.bipartite
+_TETRAHEDRAL_MODES = (12,)             # modes built via auxetic.tetrahedral
 
 # Lattice-space centroid that all rigid rotations / flips pivot around.
 _CENTROID = np.array([0.5, 0.5, 0.5])
@@ -209,6 +214,13 @@ class Lattice:
             "modified": "",
             "notes":    "",
         }
+
+        # Tile-Library compose state: when True, ``points``/``tri`` hold a
+        # user-authored explicit triangulation that must survive point
+        # edits (never re-Delaunayed). Set by ``compose_add_tile`` and by
+        # the preset v7 loader; cleared by ``regenerate`` (a re-roll exits
+        # compose). ``_triangulate`` short-circuits on it.
+        self.preserve_triangulation: bool = False
 
         self.points: np.ndarray | None = None
         self.tri = None
@@ -377,6 +389,16 @@ class Lattice:
         self._clear_caches()
 
     def _triangulate(self, points: np.ndarray):
+        # A Tile-Library composition carries an explicit, user-authored
+        # triangulation. A point move (same count) must keep that exact
+        # connectivity — re-Delaunaying would discard the composed mesh
+        # and fill any concavities. So short-circuit before the Delaunay
+        # path. (Tile adds / welds change the count and go through
+        # ``compose_add_tile`` → ``_set_points_and_tri`` directly, not here.)
+        if (self.preserve_triangulation and self.tri is not None
+                and self.points is not None
+                and len(points) == len(self.points)):
+            return self.tri
         if self.mode in _DELAUNAY_MODES:
             tri = Delaunay(points)
         elif self.tri is not None and self.points is not None and len(points) == len(self.points):
@@ -395,6 +417,9 @@ class Lattice:
     # ==================================================================
 
     def regenerate(self):
+        # A re-roll generates a fresh point cloud, so it exits any
+        # Tile-Library composition (the authored triangulation is gone).
+        self.preserve_triangulation = False
         if self.seed is not None:
             np.random.seed(self.seed)
         if self.mode in _CUBOID_MODES:
@@ -466,6 +491,116 @@ class Lattice:
         original = self.points_original.copy()
         new_tri = self._triangulate(original)
         self._set_points_and_tri(original, new_tri)
+
+    # ==================================================================
+    # Tile-Library composition (compose-from-tiles workflow)
+    # ==================================================================
+
+    def compose_add_tile(self, tile_points, tile_simplices, *,
+                         offset=(0.0, 0.0),
+                         weld_tol: float | None = None,
+                         snap_radius: float | None = None):
+        """Drop a library tile onto the composed mesh, welding any tile
+        vertex that lands within ``weld_tol`` (lattice space) of an
+        existing vertex.
+
+        The first call — when the lattice is not yet composing — seeds a
+        fresh composition with just this tile; later calls add to it. The
+        method switches the lattice to mode 11 (the 2D bipartite auxetic)
+        and sets ``preserve_triangulation`` so the authored mesh survives
+        subsequent point edits and renders fused (shared edges → one
+        auxetic shape). Returns the new ``(points, simplices)``.
+
+        The placement geometry is the pure :mod:`auxetic.composition`
+        ``add_tile`` (templates are centred, so ``offset`` is where the
+        tile centre lands)."""
+        from . import composition as _composition
+
+        tol = (_composition.DEFAULT_WELD_TOL if weld_tol is None
+               else float(weld_tol))
+        snap = (_composition.SNAP_RADIUS if snap_radius is None
+                else float(snap_radius))
+        if (self.preserve_triangulation and self.points is not None
+                and self.tri is not None):
+            base_pts = np.asarray(self.points, dtype=float).reshape(-1, 2)
+            base_simp = np.asarray(self.tri.simplices,
+                                   dtype=np.int64).reshape(-1, 3)
+        else:
+            base_pts = np.zeros((0, 2), dtype=float)
+            base_simp = np.zeros((0, 3), dtype=np.int64)
+
+        # Snap the drop so the tile's nearest vertex lands exactly on the
+        # nearest existing vertex — a roughly-aimed drop then locks into
+        # alignment (shared edge coincides) instead of skewing off one
+        # approximate weld. No-op for the first (seed) tile.
+        offset = _composition.snap_tile_offset(
+            base_pts, tile_points, offset, snap)
+
+        new_pts, new_simp = _composition.add_tile(
+            base_pts, base_simp, tile_points, tile_simplices,
+            offset=offset, weld_tol=tol)
+
+        self.mode = 11
+        self.preserve_triangulation = True
+        self._set_points_and_tri(new_pts, _geom._FlippedTri(new_simp))
+        self.points_original = new_pts.copy()
+        return self.points, np.asarray(self.tri.simplices)
+
+    def scale_points(self, factor: float) -> None:
+        """Uniformly scale the lattice's points about their centroid by
+        ``factor`` (so the structure keeps its position but grows /
+        shrinks). Enlarges the model's footprint in the unit cell and its
+        exported STL/OBJ size — handy for pushing a small composed
+        structure up to a usable / printable scale.
+
+        Uniform scaling about the centroid leaves the triangulation
+        topology unchanged, so a composed (``preserve_triangulation``)
+        mesh keeps its authored simplices and a Delaunay lattice keeps its
+        (scale-invariant) triangulation — only the coordinates move. The
+        on-screen 2D view auto-fits, so this changes the structure's
+        relative footprint and its export size rather than its apparent
+        size in the viewport."""
+        if self.points is None or self.points.shape[0] == 0:
+            return
+        f = float(factor)
+        pts = np.asarray(self.points, dtype=float)
+        centroid = pts.mean(axis=0)
+        scaled = centroid + (pts - centroid) * f
+        # ``_triangulate`` is preserve-aware: it keeps the explicit
+        # composed simplices (same count) and re-Delaunays otherwise (a
+        # uniform scale is Delaunay-invariant, so the topology is stable).
+        self._set_points_and_tri(scaled, self._triangulate(scaled))
+
+    def flip_composed_edge(self, edge) -> bool:
+        """Swap the diagonal of the quad whose current diagonal is
+        ``edge``, in a composed (``preserve_triangulation``) mesh.
+
+        The Delaunay-mode edge flip records the flip in ``edge_flips`` and
+        re-applies it after every re-triangulation — but a composed mesh
+        has no canonical Delaunay to toggle against (its triangulation IS
+        the authored design, and ``_triangulate`` deliberately never
+        re-Delaunays it). So here the flip is a **direct, in-place edit**
+        of the stored simplices; undo restores the prior simplices via the
+        command. Returns True iff the flip applied (the edge was a
+        flippable, strictly-convex interior diagonal); a boundary or
+        non-convex edge leaves the mesh unchanged and returns False.
+
+        To flip back, flip the *new* diagonal — it swaps to the original."""
+        if self.points is None or self.tri is None:
+            return False
+        a, b = sorted((int(edge[0]), int(edge[1])))
+        new_tri = _geom.apply_edge_flips(self.tri, self.points, {(a, b)})
+        after: set[tuple[int, int]] = set()
+        for s in np.asarray(new_tri.simplices):
+            verts = [int(v) for v in s]
+            for i in range(3):
+                x, y = verts[i], verts[(i + 1) % 3]
+                after.add((x, y) if x < y else (y, x))
+        if (a, b) in after:
+            return False   # boundary / non-convex — nothing changed
+        self._set_points_and_tri(
+            np.asarray(self.points, dtype=float), new_tri)
+        return True
 
     # ==================================================================
     # Bezier-curved strut edges (SPEC task 1)
@@ -599,6 +734,19 @@ class Lattice:
              self._joint_positions) = _geom.collect_export_geometry(
                 self.points, self.tri, self.ratio, self.mode, self.nz_layers,
                 bipartite_C=self.C, bipartite_theta=self._bipartite_theta(),
+                bezier_enabled=self.bezier_enabled,
+                bezier_strength=self.bezier_strength,
+                bezier_segments=self.bezier_segments)
+            return
+        # Mode-12 geometry depends on the live ``C`` (the internal-tetra
+        # contraction), which changes without a re-triangulation — so,
+        # like mode 11, rebuild it every call instead of caching.
+        if self.mode in _TETRAHEDRAL_MODES:
+            (self._strut_curves,
+             self._solid_triangles,
+             self._joint_positions) = _geom.collect_export_geometry(
+                self.points, self.tri, self.ratio, self.mode, self.nz_layers,
+                tetra_C=self.C,
                 bezier_enabled=self.bezier_enabled,
                 bezier_strength=self.bezier_strength,
                 bezier_segments=self.bezier_segments)

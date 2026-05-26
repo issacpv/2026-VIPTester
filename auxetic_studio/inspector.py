@@ -50,7 +50,7 @@ from scipy.spatial.transform import Rotation
 # mesh-import variants (dim 2D / 2.5D / 3D respectively).
 DIM_LABELS      = ["2D", "2.5D", "3D"]
 STRATEGY_LABELS = ["Random", "Grid", "Mesh import", "Cuboid grid",
-                   "Bipartite auxetic"]
+                   "Bipartite auxetic", "Tetrahedral auxetic"]
 
 # (dim, strategy) tuple → mode integer.
 # "Cuboid grid" is 3D-only and "Bipartite auxetic" is 2D-only — picking
@@ -68,6 +68,7 @@ _DIM_STRAT_TO_MODE: dict[tuple[str, str], int] = {
     ("3D",   "Mesh import"):       9,
     ("3D",   "Cuboid grid"):       10,
     ("2D",   "Bipartite auxetic"): 11,
+    ("3D",   "Tetrahedral auxetic"): 12,
 }
 # Inverse for refresh_from_lattice — only canonical (dim, strategy)
 # pairs map back. Mode 10 → ("3D", "Cuboid grid"); 11 → ("2D",
@@ -81,8 +82,9 @@ _GRID_MODES      = (4, 5, 6)
 _MESH_MODES      = (7, 8, 9)
 _CUBOID_MODES    = (10,)
 _BIPARTITE_MODES = (11,)
+_TETRAHEDRAL_MODES = (12,)
 _2D_MODES        = (1, 2, 4, 5, 7, 8, 11)   # 2D and 2.5D
-_3D_MODES        = (3, 6, 9, 10)
+_3D_MODES        = (3, 6, 9, 10, 12)
 
 # Vertex-count threshold above which mesh import prompts for decimation.
 _MESH_DECIMATE_PROMPT_THRESHOLD = 500
@@ -380,6 +382,10 @@ class InspectorPanel(QWidget):
 
             self.n_points_spin.setValue(int(self._lattice.n_points))
             self.ratio_spin.setValue(float(self._lattice.ratio))
+            # Range/label must match the mode BEFORE the value is set,
+            # else a value outside the stale range would be silently
+            # clamped (e.g. a mode-11 C=15 landing in mode 12's [0, 1]).
+            self._configure_c_spin(mode)
             self.c_ratio_spin.setValue(float(getattr(self._lattice, "C", 1.0)))
             self.nz_layers_spin.setValue(int(self._lattice.nz_layers))
 
@@ -517,6 +523,31 @@ class InspectorPanel(QWidget):
                     self._last_valid_dim_idx = di_2d
                 finally:
                     self._suspend = False
+        # Tetrahedral auxetic is 3D-only — auto-flip the dim combo to 3D
+        # so ``_DIM_STRAT_TO_MODE`` resolves to mode 12 (mirrors the
+        # Cuboid-grid → 3D switch above).
+        if new_strat == "Tetrahedral auxetic":
+            di_3d = self.dim_combo.findData("3D")
+            if di_3d >= 0 and self.dim_combo.currentIndex() != di_3d:
+                self._suspend = True
+                try:
+                    self.dim_combo.setCurrentIndex(di_3d)
+                    self._last_valid_dim_idx = di_3d
+                finally:
+                    self._suspend = False
+            self._last_valid_strategy_idx = self.strategy_combo.currentIndex()
+            # Apply the mode change FIRST so the refresh it triggers
+            # settles the combos on mode 12. Then seed an illustrative
+            # contraction (mode 12's C lives in [0, 1] — a stale mode-11 C
+            # up to 20 would collapse the internal tetra or clamp to the
+            # open-mesh extreme). Seeding *before* the mode emit would fire
+            # a C command whose own refresh resets the combos back to the
+            # old mode, swallowing the mode change.
+            self._emit_mode_from_combos()
+            cur_C = float(getattr(self._lattice, "C", 1.0))
+            if not (0.0 < cur_C < 1.0):
+                self.c_ratio_spin.setValue(0.5)
+            return
         if new_strat == "Mesh import":
             # Mesh strategy needs a file. Open the chooser; revert combo
             # if the user cancels.
@@ -661,6 +692,33 @@ class InspectorPanel(QWidget):
     # orientation handlers (SPEC §6)
     # =====================================================================
 
+    def _configure_c_spin(self, mode: int) -> None:
+        """Point the shared C spinbox at the right convention for ``mode``.
+
+        Mode 11 (bipartite) uses the Acuna size ratio C = b/a (range up
+        to 20); mode 12 (tetrahedral) uses the contraction
+        ``t = C·S + (1-C)·P`` with C ∈ [0, 1]. ``blockSignals`` guards the
+        implicit value-clamp a range change can trigger from emitting a
+        spurious ``C`` parameter change."""
+        self.c_ratio_spin.blockSignals(True)
+        try:
+            if mode in _TETRAHEDRAL_MODES:
+                self._c_ratio_label.setText("C contraction")
+                self.c_ratio_spin.setRange(0.0, 1.0)
+                self.c_ratio_spin.setToolTip(
+                    "Internal-tetra contraction C  (t = C·S + (1-C)·P). "
+                    "C→0 is a solid tetra; C→1 opens the mesh toward the "
+                    "centroid.")
+            else:
+                self._c_ratio_label.setText("C ratio")
+                self.c_ratio_spin.setRange(0.05, 20.0)
+                self.c_ratio_spin.setToolTip(
+                    "Constant size ratio C = b/a (Acuna et al. 2022). C=1 "
+                    "puts each hinge at the midpoint of its corner→centroid "
+                    "segment; larger C pushes hinges toward the corners.")
+        finally:
+            self.c_ratio_spin.blockSignals(False)
+
     def _update_visibility(self) -> None:
         """Show/hide the conditional rows based on the current dim and
         strategy. Called from ``refresh_from_lattice`` and after every
@@ -683,18 +741,23 @@ class InspectorPanel(QWidget):
         # Mesh row only meaningful for mesh modes.
         self._mesh_row.setVisible(is_mesh)
 
-        # Mode 11 (bipartite auxetic) is driven by C, not the
-        # shrink-toward-centroid Ratio, and has no z-extrusion — so swap
-        # the Ratio row for the C-ratio row and hide Nz layers. Every
-        # other mode keeps the legacy layout (Ratio shown, C hidden);
-        # Nz layers stays visible there for backwards compatibility (no
-        # existing test expects it hidden).
-        self._ratio_label.setVisible(not is_bipartite)
-        self.ratio_spin.setVisible(not is_bipartite)
-        self._c_ratio_label.setVisible(is_bipartite)
-        self.c_ratio_spin.setVisible(is_bipartite)
-        self._nz_layers_label.setVisible(not is_bipartite)
-        self.nz_layers_spin.setVisible(not is_bipartite)
+        # Modes 11 (bipartite) and 12 (tetrahedral) are driven by C, not
+        # the shrink-toward-centroid Ratio, and have no z-extrusion — so
+        # swap the Ratio row for the C row and hide Nz layers. Every other
+        # mode keeps the legacy layout (Ratio shown, C hidden); Nz layers
+        # stays visible there for backwards compatibility (no existing
+        # test expects it hidden).
+        is_tetrahedral = mode in _TETRAHEDRAL_MODES
+        uses_c = is_bipartite or is_tetrahedral
+        self._ratio_label.setVisible(not uses_c)
+        self.ratio_spin.setVisible(not uses_c)
+        self._c_ratio_label.setVisible(uses_c)
+        self.c_ratio_spin.setVisible(uses_c)
+        self._nz_layers_label.setVisible(not uses_c)
+        self.nz_layers_spin.setVisible(not uses_c)
+        # The shared C spinbox carries two conventions (mode 11 vs 12) —
+        # point it at the right one.
+        self._configure_c_spin(mode)
 
     # Back-compat alias for the original method name. test_rotation.py
     # and other internal call-sites used the orientation-only name.

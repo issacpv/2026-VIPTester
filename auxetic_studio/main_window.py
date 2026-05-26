@@ -24,6 +24,7 @@ from .preset import save_preset, load_preset
 from .simulation_panel import SimulationPanel
 from .predictor_panel import PredictorPanel
 from .coordinates_panel import CoordinatesPanel
+from .library_panel import LibraryPanel
 from .commands import (
     MovePointCommand,
     ParameterChangeCommand,
@@ -35,6 +36,8 @@ from .commands import (
     ForceListChangeCommand,
     JointAngleChangeCommand,
     RecommendationApplyCommand,
+    AddTileCommand,
+    ScalePointsCommand,
 )
 
 
@@ -159,9 +162,6 @@ class MainWindow(QMainWindow):
         self.addDockWidget(
             Qt.DockWidgetArea.RightDockWidgetArea, self.predictor_panel
         )
-        self.tabifyDockWidget(self.simulation_panel, self.predictor_panel)
-        # Keep Simulation as the visible tab on first launch.
-        self.simulation_panel.raise_()
         self._predictor_dock = self.predictor_panel
 
         # ---- coordinates panel dock (tabular point editor) ---------------
@@ -175,10 +175,33 @@ class MainWindow(QMainWindow):
         self.addDockWidget(
             Qt.DockWidgetArea.RightDockWidgetArea, self.coordinates_panel
         )
-        self.tabifyDockWidget(self._inspector_dock, self.coordinates_panel)
-        # Keep the Inspector as the visible tab on first launch.
-        self._inspector_dock.raise_()
         self._coordinates_dock = self.coordinates_panel
+
+        # ---- tile library dock (compose-from-tiles) ---------------------
+        # A palette of draggable 2D tiles; dropping one on the 2D canvas
+        # composes it into the lattice (welding near-coincident vertices).
+        # Tabified with the Inspector — it's a lattice-authoring tool.
+        self.library_panel = LibraryPanel(parent=self)
+        self.addDockWidget(
+            Qt.DockWidgetArea.RightDockWidgetArea, self.library_panel
+        )
+        self._library_dock = self.library_panel
+        # Drop on the 2D canvas → undoable compose command.
+        self.view_2d.tileDropRequested.connect(self._on_tile_dropped)
+        # "Scale model" → undoable scale of the whole composition.
+        self.library_panel.scaleModelRequested.connect(
+            self._on_scale_model_requested)
+
+        # ---- consolidate every right-side panel into one tab strip ------
+        # Inspector | Coordinates | Tile Library | Simulation | Predictor,
+        # so the user switches between all of them from one place. The
+        # tabify calls are chained so the tab order matches that sequence.
+        self.tabifyDockWidget(self._inspector_dock,    self._coordinates_dock)
+        self.tabifyDockWidget(self._coordinates_dock,  self._library_dock)
+        self.tabifyDockWidget(self._library_dock,      self._simulation_dock)
+        self.tabifyDockWidget(self._simulation_dock,   self._predictor_dock)
+        # Inspector is the visible tab on first launch.
+        self._inspector_dock.raise_()
 
         # ---- left toolbar ------------------------------------------------
         self._build_toolbar()
@@ -596,6 +619,36 @@ class MainWindow(QMainWindow):
             on_change=self._on_lattice_structurally_changed,
         )
         self.undo_stack.push(cmd)
+
+    def _on_tile_dropped(self, tile_name, cx, cy):
+        """A Tile-Library tile was dropped on the 2D canvas at canonical
+        ``(cx, cy)``. Compose it into the lattice (undoable), welding any
+        vertices that land near existing ones, and make sure the 2D view
+        is showing so the user sees the result. The drop is placed at the
+        Library's current tile size."""
+        from auxetic.tile_library import TILE_EDGE
+        tile_scale = float(self.library_panel.tile_edge()) / float(TILE_EDGE)
+        cmd = AddTileCommand(
+            self.lattice, str(tile_name), (float(cx), float(cy)),
+            on_change=self._on_lattice_structurally_changed,
+            tile_scale=tile_scale,
+        )
+        self.undo_stack.push(cmd)
+        # Composition is a 2D (mode 11) result — show the 2D canvas.
+        self._set_view_mode(VIEW_2D)
+        self.statusBar().showMessage(
+            f"Placed {tile_name} — drop more tiles nearby to merge them")
+
+    def _on_scale_model_requested(self, factor):
+        """Library "Scale model ×" → undoable uniform scale of the whole
+        composition about its centre (footprint + export size)."""
+        cmd = ScalePointsCommand(
+            self.lattice, float(factor),
+            on_change=self._on_lattice_structurally_changed,
+        )
+        self.undo_stack.push(cmd)
+        self.statusBar().showMessage(
+            f"Scaled model ×{float(factor):g} (footprint + export size)")
 
     def _on_edge_flip_requested(self, edge, already_flipped):
         """Edge click in View2D → ``FlipEdgeCommand`` (M1)."""

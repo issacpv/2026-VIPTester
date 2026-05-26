@@ -146,6 +146,108 @@ class DeletePointCommand(QUndoCommand):
             self.on_change()
 
 
+class AddTileCommand(QUndoCommand):
+    """Drop a Tile-Library tile onto the composed mesh (undoable).
+
+    ``redo`` calls :meth:`Lattice.compose_add_tile`, which welds the tile
+    into the current composition (or seeds a fresh one on the first drop)
+    and switches the lattice to mode 11 with ``preserve_triangulation``.
+    ``undo`` restores the full prior state — points, the exact prior
+    triangulation, mode, the preserve flag and ``points_original`` — so a
+    drop is a single clean step even across the first (compose-entering)
+    drop.
+    """
+
+    def __init__(self, lattice: Lattice, tile_name: str,
+                 offset_xy, weld_tol: float | None = None,
+                 on_change: Callback = None, tile_scale: float = 1.0):
+        super().__init__(f"Add tile {tile_name}")
+        from auxetic.tile_library import get_tile
+        self.lattice    = lattice
+        self.tile_name  = str(tile_name)
+        self.offset     = (float(offset_xy[0]), float(offset_xy[1]))
+        self.weld_tol   = weld_tol
+        self.on_change  = on_change
+        # Library tile-size factor: the template is scaled by this before
+        # composing, so the user can drop larger tiles. Weld/snap radii
+        # scale with it so alignment behaves the same at any tile size.
+        self.tile_scale = float(tile_scale)
+        self.template   = get_tile(self.tile_name)
+        self._prev: dict | None = None
+
+    def _snapshot(self) -> dict:
+        lat = self.lattice
+        return {
+            "points":    None if lat.points is None else lat.points.copy(),
+            "simplices": (None if lat.tri is None
+                          else np.asarray(lat.tri.simplices).copy()),
+            "mode":      int(lat.mode),
+            "preserve":  bool(lat.preserve_triangulation),
+            "points_original": (None if lat.points_original is None
+                                else lat.points_original.copy()),
+        }
+
+    def redo(self) -> None:
+        from auxetic.composition import DEFAULT_WELD_TOL, SNAP_RADIUS
+        if self._prev is None:
+            self._prev = self._snapshot()
+        s = self.tile_scale
+        pts = self.template.points * s                 # bigger tile
+        base_tol = DEFAULT_WELD_TOL if self.weld_tol is None else self.weld_tol
+        self.lattice.compose_add_tile(
+            pts, self.template.simplices, offset=self.offset,
+            weld_tol=base_tol * s, snap_radius=SNAP_RADIUS * s)
+        if self.on_change is not None:
+            self.on_change()
+
+    def undo(self) -> None:
+        from auxetic import geometry as _geom
+        p = self._prev or {}
+        lat = self.lattice
+        lat.mode = p.get("mode", lat.mode)
+        lat.preserve_triangulation = p.get("preserve", False)
+        lat.points_original = p.get("points_original")
+        prev_points = p.get("points")
+        prev_simplices = p.get("simplices")
+        if prev_points is not None and prev_simplices is not None:
+            # Restore the exact prior triangulation (wrap in _FlippedTri —
+            # downstream reads only ``.simplices``, so this is valid for a
+            # prior Delaunay or composed state alike).
+            lat._set_points_and_tri(prev_points,
+                                    _geom._FlippedTri(prev_simplices))
+        elif prev_points is not None:
+            lat._set_points_and_tri(prev_points, None)
+        if self.on_change is not None:
+            self.on_change()
+
+
+class ScalePointsCommand(QUndoCommand):
+    """Uniformly scale the lattice's points about their centroid by
+    ``factor`` (enlarge / shrink the whole model — footprint + export
+    size). Uniform scaling about the centroid is exactly reversible, so
+    undo just scales by ``1/factor`` (no snapshot needed); the centroid is
+    a fixed point of the scaling, so it returns to the original
+    coordinates."""
+
+    def __init__(self, lattice: Lattice, factor: float,
+                 on_change: Callback = None):
+        super().__init__(f"Scale ×{float(factor):g}")
+        self.lattice   = lattice
+        self.factor    = float(factor)
+        self.on_change = on_change
+
+    def redo(self) -> None:
+        self.lattice.scale_points(self.factor)
+        if self.on_change is not None:
+            self.on_change()
+
+    def undo(self) -> None:
+        if self.factor != 0.0:
+            self.lattice.scale_points(1.0 / self.factor)
+        if self.on_change is not None:
+            self.on_change()
+
+
 class ResetToOriginalCommand(QUndoCommand):
     """Restore ``lattice.points`` to ``points_original`` (the snapshot
     captured at the last ``regenerate()``). On undo, the pre-reset
@@ -247,6 +349,12 @@ class FlipEdgeCommand(QUndoCommand):
         self.edge            = (a, b)
         self.already_flipped = bool(already_flipped)
         self.on_change       = on_change
+        # A composed (Tile-Library) mesh has no canonical Delaunay to
+        # toggle against — ``_triangulate`` never re-Delaunays it, so the
+        # ``edge_flips`` set is never applied there. Flip it in place
+        # instead (snapshotting the simplices for undo).
+        self._composed = bool(getattr(lattice, "preserve_triangulation", False))
+        self._prev_simplices = None
 
     def _set_membership(self, present: bool) -> None:
         flips = set(self.lattice.edge_flips)
@@ -261,11 +369,28 @@ class FlipEdgeCommand(QUndoCommand):
             self.on_change()
 
     def redo(self) -> None:
-        # If the edge was NOT already flipped, redo flips it (adds);
-        # if it WAS flipped, redo unflips (removes).
+        if self._composed:
+            # Direct in-place diagonal swap of the authored mesh.
+            self._prev_simplices = np.asarray(
+                self.lattice.tri.simplices).copy()
+            self.lattice.flip_composed_edge(self.edge)
+            if self.on_change is not None:
+                self.on_change()
+            return
+        # Delaunay modes: if the edge was NOT already flipped, redo flips
+        # it (adds to the set); if it WAS flipped, redo unflips (removes).
         self._set_membership(not self.already_flipped)
 
     def undo(self) -> None:
+        if self._composed:
+            from auxetic import geometry as _geom
+            if self._prev_simplices is not None:
+                self.lattice._set_points_and_tri(
+                    self.lattice.points,
+                    _geom._FlippedTri(self._prev_simplices))
+            if self.on_change is not None:
+                self.on_change()
+            return
         self._set_membership(self.already_flipped)
 
 

@@ -203,17 +203,77 @@ def build_bipartite_network(
     polygons: list[BipartitePolygon] = []
     bonds: list[np.ndarray] = []
 
+    def _rotate_about(p, hinge):
+        return R @ (np.asarray(p, dtype=float) - hinge) + hinge
+
+    # ---- Pass 1: per-triangle centroid hinges + perpendicular feet -------
+    tris: list[dict] = []
     for tri_idx in range(simps.shape[0]):
         idx = [int(v) for v in simps[tri_idx]]
         P = [pts[i] for i in idx]
         M = (P[0] + P[1] + P[2]) / 3.0
         # Centroid hinges, shared between the central polygon and kites.
         T = [P[c] + t * (M - P[c]) for c in range(3)]
+        # foot[c][o] is the foot of the perpendicular from hinge T[c] onto
+        # the triangle edge (P[c], P[o]).
+        foot = [[None, None, None] for _ in range(3)]
+        for c in range(3):
+            for o in range(3):
+                if o != c:
+                    foot[c][o] = _perp_foot(T[c], P[c], P[o])
+        tris.append({
+            "idx": idx,
+            "g2l": {g: l for l, g in enumerate(idx)},
+            "P": P, "M": M, "T": T, "foot": foot,
+        })
 
-        # Rigid rotation of a point about hinge T[c] by theta. At
-        # theta = 0 this is the identity, so the rest tile is unchanged.
-        def about(p, c):
-            return R @ (np.asarray(p, dtype=float) - T[c]) + T[c]
+    # ---- Fuse shared-edge feet (defect coupling) -------------------------
+    #
+    # Two triangles sharing an edge each drop a perpendicular foot near each
+    # shared corner. When the adjacency is symmetric about the edge those two
+    # feet COINCIDE and the kites fuse there (a shared vertex) — that fusion
+    # is what couples neighbours into a single rigid mechanism (see
+    # ``test_shared_corner_kites_fuse_on_the_diagonal``). When the adjacency
+    # is NOT symmetric (e.g. after an edge flip, or an irregular mesh) the two
+    # feet land at different points, the fusion is lost, and the shared corner
+    # alone leaves a relative-rotation DOF — the neighbouring region floats
+    # free of the mechanism and overlaps under actuation. Snap both feet to
+    # their midpoint so they coincide again: the two triangles' edge bonds
+    # rejoin into one connection (instead of sitting offset) and the
+    # single-DOF coupling is restored, with no extra struts. A foot-to-foot
+    # bridge bond would be collinear with the shared edge and so can't resist
+    # rotation — fusing the vertices is the coupling that works. Edges whose
+    # feet already coincide (symmetric tilings) and boundary edges are
+    # untouched.
+    edge_tris: dict[tuple[int, int], list[int]] = {}
+    for r_idx, rec in enumerate(tris):
+        g = rec["idx"]
+        for a in range(3):
+            for b in range(a + 1, 3):
+                e = (g[a], g[b]) if g[a] < g[b] else (g[b], g[a])
+                edge_tris.setdefault(e, []).append(r_idx)
+    for (gi, gj), recs in edge_tris.items():
+        if len(recs) != 2:
+            continue  # boundary edge — no neighbour to fuse with
+        r1, r2 = tris[recs[0]], tris[recs[1]]
+        for gc, go in ((gi, gj), (gj, gi)):   # foot near each shared corner
+            l1c, l1o = r1["g2l"][gc], r1["g2l"][go]
+            l2c, l2o = r2["g2l"][gc], r2["g2l"][go]
+            f1, f2 = r1["foot"][l1c][l1o], r2["foot"][l2c][l2o]
+            if not np.allclose(f1, f2, atol=1e-9):
+                mid = 0.5 * (f1 + f2)
+                r1["foot"][l1c][l1o] = mid
+                r2["foot"][l2c][l2o] = mid
+
+    # ---- Pass 2: build central polygons, corner kites, and edge bonds ----
+    for tri_idx, rec in enumerate(tris):
+        idx, P, M, T, foot = (rec["idx"], rec["P"], rec["M"],
+                              rec["T"], rec["foot"])
+
+        # Rigid rotation of a point about hinge T[c] by theta. At theta = 0
+        # this is the identity, so the rest tile is unchanged.
+        def about(p, c, _T=T):
+            return _rotate_about(p, _T[c])
 
         # The central polygon is fixed (its vertices are the hinges).
         polygons.append(BipartitePolygon(
@@ -223,14 +283,6 @@ def build_bipartite_network(
             triangle_index=tri_idx,
             corner_point_index=-1,
         ))
-
-        # Perpendicular feet: foot[c][o] is the foot of the perpendicular
-        # from hinge T[c] onto the triangle edge (P[c], P[o]).
-        foot = [[None, None, None] for _ in range(3)]
-        for c in range(3):
-            for o in range(3):
-                if o != c:
-                    foot[c][o] = _perp_foot(T[c], P[c], P[o])
 
         # One kite per corner, rotated rigidly about its hinge.
         for c in range(3):

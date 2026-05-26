@@ -1303,6 +1303,13 @@ class Simulator:
         if collision_stop and self.dimension == 2:
             from .collision import CollisionChecker
             collider = CollisionChecker(self.tile_system, tol=collision_tol)
+            # If the rest tiling already self-overlaps (a degenerate
+            # triangulation — e.g. sliver triangles), collision-bounding
+            # would stop the march at rest. Fall back to the analytic
+            # mechanism limit in that case rather than producing a
+            # zero-motion sweep.
+            if collider.has_collision(rest):
+                collider = None
 
         target_inc = max_actuation / max(n_half_steps, 1)
 
@@ -1323,10 +1330,18 @@ class Simulator:
                 da = abs(a_new) - abs(a_prev)
                 if da <= 1.0e-5:
                     break   # mechanism jammed / stalled — stop this half
+                # Stop at the first real polygon collision: the reachable
+                # range ends where the tiles first overlap (the physical
+                # jamming limit), which is earlier than the analytic
+                # mechanism limit. Without this the rotating units keep
+                # going into a self-overlapping collapse. The colliding
+                # pose itself is not recorded, so every kept pose is
+                # collision-free.
+                if collider is not None and collider.has_collision(new):
+                    break
                 poses.append(new)
                 acts.append(a_new)
-                cols.append(bool(collider.has_collision(new))
-                            if collider is not None else False)
+                cols.append(False)
                 pose, a_prev = new, a_new
                 # Adapt the step toward a uniform actuation increment.
                 h *= float(np.clip(target_inc / da, 0.3, 3.0))
