@@ -344,6 +344,11 @@ class View2D(QWidget):
     # Human-readable guidance for the status bar as the user steps
     # through the select-edge → Ctrl+click-corners flip gesture.
     edgeFlipStatus      = pyqtSignal(str)
+    # Tile Library: a tile was dropped on the canvas. Carries
+    # (tile_name, canonical_x, canonical_y) — the drop point already
+    # mapped into lattice space. MainWindow turns it into a compose
+    # command.
+    tileDropRequested   = pyqtSignal(str, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -370,6 +375,9 @@ class View2D(QWidget):
         self._scatter.sigCornerClicked.connect(self._on_corner_clicked)
         self._scatter.sigCornerHoverChanged.connect(
             self._on_corner_hover_changed)
+
+        # Accept tile drags from the Library panel (see dropEvent).
+        self.setAcceptDrops(True)
 
         self.plot.addItem(self._scatter)
         # Keep the node scatter above the triangulation edge items in
@@ -546,6 +554,49 @@ class View2D(QWidget):
         M_inv = np.linalg.inv(self._lattice.world_transform())
         p = M_inv @ np.array([x_world, y_world, 0.0, 1.0])
         return float(p[0]), float(p[1])
+
+    # ------------------------------------------------------------------
+    # Tile Library drag-and-drop (drop target)
+    # ------------------------------------------------------------------
+
+    def _has_tile_payload(self, event) -> bool:
+        from .library_panel import TILE_MIME
+        md = event.mimeData()
+        return md is not None and md.hasFormat(TILE_MIME)
+
+    def dragEnterEvent(self, event) -> None:   # noqa: N802 (Qt override)
+        if self._has_tile_payload(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:    # noqa: N802 (Qt override)
+        if self._has_tile_payload(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:        # noqa: N802 (Qt override)
+        """A Library tile was dropped on the canvas. Map the drop point
+        from widget → scene → data → canonical lattice coords and emit
+        ``tileDropRequested`` so MainWindow can compose the tile there."""
+        from .library_panel import TILE_MIME
+        if not self._has_tile_payload(event):
+            event.ignore()
+            return
+        name = bytes(event.mimeData().data(TILE_MIME)).decode("utf-8")
+        try:
+            # QDropEvent.position() (Qt6) is in this widget's coords.
+            pos = event.position().toPoint()
+            plot_pt = self.plot.mapFrom(self, pos)
+            scene_pt = self.plot.mapToScene(plot_pt)
+            view_pt = self.plot.getPlotItem().vb.mapSceneToView(scene_pt)
+            cx, cy = self.world_to_canonical_2d(view_pt.x(), view_pt.y())
+        except Exception:
+            event.ignore()
+            return
+        self.tileDropRequested.emit(name, float(cx), float(cy))
+        event.acceptProposedAction()
 
     def _on_hover_changed(self, idx: int) -> None:
         if idx == self._hover_index:

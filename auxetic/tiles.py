@@ -68,6 +68,34 @@ def collect_kirigami_tiles(points_nd, tri, ratio, mode, nz_layers,
             tile_source.append({'type': 'bond', 'bond_idx': b_idx})
         return tiles, tile_source
 
+    if mode == 12:
+        # Mode 12 (3D tetrahedral auxetic): one rigid tile per internal
+        # tetra (4 verts) + one per corner polyhedron (8 verts). The
+        # canonical edge/face points fuse across adjacent tetrahedra
+        # (see auxetic.tetrahedral), so ``build_kirigami_constraints``
+        # turns the coincident vertices into the hinge constraints the
+        # kinematic mechanism rides on. ``bipartite_C`` carries the
+        # lattice's C in both call sites; clamp to the valid [0, 1]
+        # contraction range (mode 11's C can exceed 1).
+        from .tetrahedral import build_tetrahedral_network
+        c_clamped = min(max(float(bipartite_C), 0.0), 1.0)
+        net = build_tetrahedral_network(
+            points_nd, np.asarray(tri.simplices), C=c_clamped)
+        for poly in net.polyhedra:
+            verts = np.asarray(poly.vertices, dtype=float)
+            if poly.set_label == 'B':
+                add_tile(verts, {
+                    'type':      'tetrahedron',   # 4-vertex solid
+                    'tetra_idx': poly.tetra_index,
+                })
+            else:
+                add_tile(verts, {
+                    'type':      'hub_polyhedron',  # convex corner solid
+                    'tetra_idx': poly.tetra_index,
+                    'corner':    poly.corner_point_index,
+                })
+        return tiles, tile_source
+
     if mode in [3, 6, 9]:
         pts_norm = points_nd
 

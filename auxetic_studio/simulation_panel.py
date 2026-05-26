@@ -109,6 +109,32 @@ _SLIDER_SCALE    = 10  # int slider value = degrees × 10
 _SLIDER_MIN_DEG_THETA_MIN = -np.pi   # slider 0°   → math -π
 _SLIDER_MAX_DEG_THETA_MAX = +np.pi   # slider 180° → math +π
 
+
+def _mode11_overlap_spans(x_deg, margin_frac: float = 0.15):
+    """Red 'overlap' shading spans + x-limits for a mode-11 kinematic plot.
+
+    The bipartite mechanism follows its rigid manifold and stops at the
+    jamming angle — the exact point where the polygons first touch — so
+    (unlike the over-rotating ``sweep_theta`` modes) there is no
+    overlapping region *inside* the swept range to flag. Everything past
+    the reachable ends is overlap. This returns two red spans flanking the
+    reachable x-range (in slider degrees) plus widened x-limits so the
+    margins are visible past the curve.
+
+    Returns ``([(lo, hi), ...], (xlo, xhi))``; empty spans + ``None``
+    x-limits for a degenerate (zero-width) sweep, so nothing is shaded.
+    """
+    x = np.asarray(x_deg, dtype=float).ravel()
+    if x.size < 2:
+        return [], None
+    lo, hi = float(x.min()), float(x.max())
+    if hi - lo < 1e-6:
+        return [], None
+    margin = float(margin_frac) * (hi - lo)
+    spans = [(hi, hi + margin), (lo - margin, lo)]
+    xlim = (lo - margin * 1.15, hi + margin * 1.15)
+    return spans, xlim
+
 # Animation: 30 fps, full bistable cycle in ~3 s.
 _PLAY_FPS_INTERVAL_MS = 33
 _PLAY_CYCLE_FRAMES    = 90
@@ -140,10 +166,14 @@ def _solve_kinematic(tile_system, load_axis, is_mode_11: bool, jam: float):
     simulator = Simulator(tile_system, load_axis=load_axis)
     if is_mode_11:
         # Mode 11 is a large-amplitude rotating-units mechanism: follow the
-        # curved 1-DOF manifold out to the jamming angle (full hole closure)
-        # via sweep_mechanism — the fixed-rest-mode sweep_theta saturates
-        # part-way and never closes the holes.
-        sim_result = simulator.sweep_mechanism(max_actuation=jam)
+        # curved 1-DOF manifold via sweep_mechanism (the fixed-rest-mode
+        # sweep_theta saturates part-way). ``collision_stop`` bounds the
+        # march at the first real polygon collision — the physical jamming
+        # limit — so the units stop where they actually touch instead of
+        # rotating on into a self-overlapping collapse (the analytic
+        # ``jam`` angle overestimates the reachable range).
+        sim_result = simulator.sweep_mechanism(max_actuation=jam,
+                                               collision_stop=True)
     else:
         # M2.8: sweep the full ±π range with tile-tile collision detection
         # so the plot shows what's physically reachable.
@@ -1062,7 +1092,8 @@ class SimulationPanel(QDockWidget):
             return
 
         axial = self._simulator._axial_index()
-        if int(getattr(self._lattice, "mode", 0)) == 11:
+        is_mode11 = int(getattr(self._lattice, "mode", 0)) == 11
+        if is_mode11:
             # Mode 11's sweep is parameterised by physical actuation
             # (closure) angle, mapped to the slider the same way
             # _mode11_pose_index_for_slider does: 90°→rest, 180°→+jamming.
@@ -1099,8 +1130,23 @@ class SimulationPanel(QDockWidget):
                 self._ax.axvspan(x_lo, x_hi, color="#dd5050", alpha=0.15)
             )
 
+        # Mode 11 (bipartite): its mechanism stops at the jamming angle =
+        # the overlap onset, so there is no overlapping region inside the
+        # swept range to flag the way the sweep_theta modes do. Shade the
+        # area just past the reachable ends red ("polygons overlap past
+        # here") and widen the x-limits so that margin is visible.
+        mode11_xlim = None
+        if is_mode11:
+            spans, mode11_xlim = _mode11_overlap_spans(x_deg)
+            for a, b in spans:
+                self._collision_spans.append(
+                    self._ax.axvspan(a, b, color="#dd5050", alpha=0.15))
+
         self._ax.relim(); self._ax.autoscale_view(scalex=False, scaley=True)
-        self._ax.set_xlim(_SLIDER_MIN_DEG, _SLIDER_MAX_DEG)
+        if mode11_xlim is not None:
+            self._ax.set_xlim(*mode11_xlim)
+        else:
+            self._ax.set_xlim(_SLIDER_MIN_DEG, _SLIDER_MAX_DEG)
         self._canvas.draw_idle()
 
     def _update_plot_dynamic(self) -> None:

@@ -59,8 +59,11 @@ def _v5_payload(mode=1, n_points=5):
 # Version + stub
 # ---------------------------------------------------------------------------
 
-def test_preset_version_is_6():
-    assert PRESET_VERSION == 6
+def test_preset_version_at_least_6():
+    # v6 introduced the bezier block; the exact current version is pinned
+    # in the newest version's test (test_preset_v7). This only asserts
+    # v6's feature floor.
+    assert PRESET_VERSION >= 6
 
 
 def test_stub_bezier_defaults_off():
@@ -127,7 +130,7 @@ def test_bezier_roundtrip(tmp_path):
     save_preset(str(p), lat)
 
     data = json.loads(p.read_text())
-    assert data["version"] == 6
+    assert data["version"] == PRESET_VERSION
     assert data["bezier"] == {"enabled": True, "strength": 0.4, "segments": 20}
 
     lat2 = load_preset(str(p))

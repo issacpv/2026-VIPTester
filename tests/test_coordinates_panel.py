@@ -1,13 +1,14 @@
 """GUI tests for the Coordinates panel — the tabular point editor.
 
-The panel lists every lattice point with editable X / Y cells; typing a
-value routes through the same undoable ``MovePointCommand`` the
-viewport drag path uses. These tests drive the panel's table directly
-(``QTableWidgetItem.setText`` fires ``cellChanged`` synchronously, just
-like a user committing a cell edit).
+The panel lists every lattice point with editable X / Y (and Z in 3D)
+cells; typing a value routes through the same undoable
+``MovePointCommand`` the viewport drag path uses. These tests drive the
+panel's table directly (``QTableWidgetItem.setText`` fires
+``cellChanged`` synchronously, just like a user committing a cell edit).
 
-Scope is 2D / 2.5D only — in 3D modes the table is cleared and
-disabled.
+Scope: 2D / 2.5D modes show X / Y; 3D point-cloud modes (3, 6, 9, 12)
+show X / Y / Z. Mode 10 (cuboid kirigami) is the lone non-editable mode
+(fixed cube grid) — its table stays cleared and disabled.
 """
 
 from __future__ import annotations
@@ -178,25 +179,98 @@ def test_table_refreshes_after_external_point_change(main_window):
 
 
 # ---------------------------------------------------------------------------
-# 3D-mode gating
+# Mode gating — only the cuboid mode (10) stays non-editable
 # ---------------------------------------------------------------------------
 
-def test_3d_mode_clears_and_disables_table(main_window):
+def test_cuboid_mode_clears_and_disables_table(main_window):
+    """Mode 10 (cuboid kirigami) builds geometry from a fixed cube grid,
+    so its points stay non-editable — the table clears and disables."""
     win = main_window
-    win.inspector.select_mode(3)          # 3D random
+    win.inspector.select_mode(10)         # 3D cuboid kirigami
     cp = win.coordinates_panel
     assert cp.table.rowCount() == 0
     assert cp.table.isEnabled() is False
 
 
-def test_switching_back_to_2d_repopulates_table(main_window):
+def test_switching_from_disabled_mode_repopulates_table(main_window):
     win = main_window
-    win.inspector.select_mode(3)          # 3D — table cleared
+    win.inspector.select_mode(10)         # cuboid — table cleared
     assert win.coordinates_panel.table.rowCount() == 0
     win.inspector.select_mode(1)          # back to 2D
     cp = win.coordinates_panel
     assert cp.table.isEnabled() is True
     assert cp.table.rowCount() == len(win.lattice.points)
+
+
+# ---------------------------------------------------------------------------
+# 3D point-cloud modes (3, 6, 9, 12) — editable X / Y / Z
+# ---------------------------------------------------------------------------
+
+def test_3d_pointcloud_mode_shows_xyz_columns(main_window):
+    win = main_window
+    win.inspector.select_mode(3)          # 3D random point cloud
+    cp = win.coordinates_panel
+    assert cp.table.isEnabled() is True
+    assert cp.table.columnCount() == 4
+    headers = [cp.table.horizontalHeaderItem(c).text() for c in range(4)]
+    assert headers == ["#", "X", "Y", "Z"]
+    assert cp.table.rowCount() == len(win.lattice.points)
+    pts = np.asarray(win.lattice.points, dtype=float)
+    assert float(cp.table.item(0, 3).text()) == pytest.approx(
+        pts[0, 2], abs=1e-6)
+
+
+def test_tetrahedral_mode_12_shows_xyz(main_window):
+    win = main_window
+    win.inspector.select_mode(12)         # 3D tetrahedral auxetic
+    cp = win.coordinates_panel
+    assert cp.table.isEnabled() is True
+    assert cp.table.columnCount() == 4
+    assert cp.table.rowCount() == len(win.lattice.points)
+
+
+def test_editing_z_cell_moves_3d_point(main_window):
+    win = main_window
+    win.inspector.select_mode(12)
+    cp = win.coordinates_panel
+    cp.table.item(2, 3).setText("0.4242")
+    assert win.lattice.points[2][2] == pytest.approx(0.4242, abs=1e-9)
+
+
+def test_editing_3d_z_keeps_xy_exact(main_window):
+    """Editing only Z must not perturb X or Y — the un-edited axes come
+    from the lattice, not the display-rounded cells."""
+    win = main_window
+    win.inspector.select_mode(3)
+    cp = win.coordinates_panel
+    ex = float(win.lattice.points[1][0])
+    ey = float(win.lattice.points[1][1])
+    cp.table.item(1, 3).setText("0.314159")
+    assert win.lattice.points[1][2] == pytest.approx(0.314159, abs=1e-9)
+    assert win.lattice.points[1][0] == ex
+    assert win.lattice.points[1][1] == ey
+
+
+def test_3d_edit_is_undoable_and_redoable(main_window):
+    win = main_window
+    win.inspector.select_mode(12)
+    cp = win.coordinates_panel
+    original = float(win.lattice.points[0][2])
+    cp.table.item(0, 3).setText("0.8000")
+    assert win.lattice.points[0][2] == pytest.approx(0.8, abs=1e-9)
+    win.undo_stack.undo()
+    assert win.lattice.points[0][2] == pytest.approx(original, abs=1e-12)
+    win.undo_stack.redo()
+    assert win.lattice.points[0][2] == pytest.approx(0.8, abs=1e-9)
+
+
+def test_3d_z_expression_input(main_window):
+    """The Z cell accepts safe math expressions like the X / Y cells."""
+    win = main_window
+    win.inspector.select_mode(3)
+    cp = win.coordinates_panel
+    cp.table.item(0, 3).setText("sqrt(2)/2")
+    assert win.lattice.points[0][2] == pytest.approx(2 ** 0.5 / 2, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------

@@ -197,7 +197,9 @@ def generate_points(n_points, mode, *,
 
     if not bias_active:
         # Legacy code path — must remain byte-identical to V20.
-        if mode == 3:
+        # Mode 12 (3D tetrahedral auxetic) shares mode 3's point source:
+        # a random 3D cloud + Delaunay tetrahedralisation.
+        if mode in (3, 12):
             pts = np.random.rand(n_points, 3)
             return pts, Delaunay(pts)
         elif mode == 6:
@@ -220,7 +222,7 @@ def generate_points(n_points, mode, *,
             return pts, Delaunay(pts)
 
     # Biased random Delaunay path (modes 1, 2, 3).
-    dim = 3 if mode == 3 else 2
+    dim = 3 if mode in (3, 12) else 2
     pts = np.random.rand(n_points, dim)
     axis_idx = {"x": 0, "y": 1, "z": 2}.get(density_axis, -1)
     if 0 <= axis_idx < dim:
@@ -759,6 +761,7 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
                               cuboid_constraints=None,
                               bipartite_C=1.0,
                               bipartite_theta=0.0,
+                              tetra_C=0.5,
                               bezier_enabled: bool = False,
                               bezier_strength: float = 0.0,
                               bezier_segments: int = 1):
@@ -857,6 +860,22 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
         for bond in net.bonds:
             b = np.asarray(bond, float)
             add_strut([b[0, 0], b[0, 1], 0.0], [b[1, 0], b[1, 1], 0.0])
+        return strut_curves, all_triangles, joint_positions
+
+    # Mode-12 tetrahedral auxetic: the 3D analogue of mode 11. Each
+    # tetrahedron emits one internal tetra + four corner polyhedra, each
+    # rendered as a convex solid. No struts / joint spheres in the MVP —
+    # the rigid solids themselves are the visualisation.
+    if mode == 12:
+        from . import tetrahedral as _tet
+        # Clamp into the valid [0, 1] contraction range so a stale C left
+        # over from mode 11 (whose C ranges up to 20) can't crash the
+        # render — the build function itself validates strictly.
+        c_clamped = min(max(float(tetra_C), 0.0), 1.0)
+        net = _tet.build_tetrahedral_network(
+            points_nd, np.asarray(tri.simplices), C=c_clamped)
+        for poly in net.polyhedra:
+            all_triangles.extend(triangles_for_convex_solid(poly.vertices))
         return strut_curves, all_triangles, joint_positions
 
     if mode in [3, 6, 9]:

@@ -212,6 +212,15 @@ class CollisionChecker:
                 if a != b:
                     self._connected.add((a, b))
 
+        # Degenerate tiles (fewer than 3 vertices) are 1-D rigid links, not
+        # area tiles — e.g. mode-11 bond bars. Area-overlap SAT on a 2-point
+        # "polygon" is meaningless (it spuriously reports overlap when the
+        # segment lies along a neighbouring tile's edge), so exclude them.
+        self._skip: set[int] = {
+            i for i, t in enumerate(tile_system.tiles)
+            if np.asarray(t).shape[0] < 3
+        }
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -232,8 +241,10 @@ class CollisionChecker:
         # Cache world vertices per tile to amortise the pose decomposition.
         worlds = [self._sim._tile_world_vertices(pose, i) for i in range(n)]
         for i in range(n):
+            if i in self._skip:
+                continue
             for j in range(i + 1, n):
-                if (i, j) in self._connected:
+                if j in self._skip or (i, j) in self._connected:
                     continue
                 if self._overlap(worlds[i], worlds[j]):
                     out.append((i, j))
@@ -246,8 +257,10 @@ class CollisionChecker:
         n = self.tile_system.n_tiles
         worlds = [self._sim._tile_world_vertices(pose, i) for i in range(n)]
         for i in range(n):
+            if i in self._skip:
+                continue
             for j in range(i + 1, n):
-                if (i, j) in self._connected:
+                if j in self._skip or (i, j) in self._connected:
                     continue
                 if self._overlap(worlds[i], worlds[j]):
                     return True

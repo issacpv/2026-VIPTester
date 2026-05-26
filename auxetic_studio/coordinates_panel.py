@@ -7,10 +7,14 @@ undoable :class:`~auxetic_studio.commands.MovePointCommand` the drag
 path uses, so the table, the 2D view, and the undo stack stay
 consistent.
 
-Scope: 2D / 2.5D modes only (1, 2, 4, 5, 7, 8, 11) — matching the
-viewport Edit mode. 2.5D modes store 2-vector points (extruded into
-z-layers at render time), so the table shows X / Y for them too. In 3D
-modes the table is cleared and an explanatory note shown instead.
+Scope: the 2D / 2.5D modes (1, 2, 4, 5, 7, 8, 11) show editable X / Y
+cells (2.5D stores 2-vector points, extruded into z-layers at render
+time, so X / Y is the full story for them); the 3D point-cloud modes
+(3, 6, 9, 12) show editable X / Y / Z cells. Table editing has no
+viewport-projection ambiguity, so it is available in 3D even though the
+viewport's drag Edit mode stays 2D-only. Mode 10 (cuboid kirigami) is
+excluded — its points are a fixed cube grid, not a user-editable point
+cloud — so the table is cleared with a note there.
 
 A coordinate cell accepts a plain number *or* a math expression, so a
 perfect equilateral triangle can be entered as ``(0, 0)``,
@@ -47,10 +51,15 @@ from PyQt6.QtWidgets import (
 
 
 # Modes whose points are stored as editable 2-vectors (2D + 2.5D).
-# Mirrors ``auxetic_studio.main_window._EDITABLE_MODES``; 3D modes
-# (3, 6, 9, 10) store 3-vectors and point editing is deferred for them.
-# Mode 11 (bipartite auxetic) is 2D and editable like the others.
+# Mirrors ``auxetic_studio.main_window._EDITABLE_MODES`` (the viewport
+# drag-edit set). Mode 11 (bipartite auxetic) is 2D and editable too.
 _2D_EDITABLE_MODES = (1, 2, 4, 5, 7, 8, 11)
+
+# 3D point-cloud modes whose 3-vector points are editable in the table
+# (X / Y / Z). Mode 10 (cuboid kirigami) is intentionally absent — its
+# points are a fixed cube grid the geometry is built from, not a
+# free-form point cloud, so editing them would not update the tiles.
+_3D_EDITABLE_MODES = (3, 6, 9, 12)
 
 # Decimal places shown for / accepted from a coordinate cell. Lattice
 # space is the unit square per CLAUDE.md, so 6 places is sub-micro
@@ -138,7 +147,8 @@ class CoordinatesPanel(QDockWidget):
     cells. A keyboard alternative to the viewport's drag editing."""
 
     # Emitted when the user commits a coordinate edit. Carries
-    # ``(index, old_xy, new_xy)`` as numpy 2-vectors; the MainWindow
+    # ``(index, old_pos, new_pos)`` as numpy vectors — 2-vectors in
+    # 2D / 2.5D modes, 3-vectors in 3D point-cloud modes. The MainWindow
     # wraps it in a :class:`MovePointCommand` so the edit is undoable.
     pointMoveRequested = pyqtSignal(int, object, object)
 
@@ -196,11 +206,12 @@ class CoordinatesPanel(QDockWidget):
     def refresh_from_lattice(self) -> None:
         """Repopulate the table from ``lattice.points``.
 
-        In 2D / 2.5D modes every point gets an editable row; in 3D modes
-        the table is cleared, disabled, and an explanatory note shown
-        (3D point editing is out of scope — see CLAUDE.md)."""
+        2D / 2.5D modes get editable X / Y rows; 3D point-cloud modes
+        (3, 6, 9, 12) get editable X / Y / Z rows. Mode 10 (cuboid) and
+        any other non-point-cloud mode clear the table and show a note."""
         mode = int(getattr(self._lattice, "mode", 1))
-        editable = mode in _2D_EDITABLE_MODES
+        is_3d = mode in _3D_EDITABLE_MODES
+        editable = is_3d or (mode in _2D_EDITABLE_MODES)
 
         # cellChanged fires for every setItem below — suspend so the
         # repopulate isn't mistaken for a user edit.
@@ -209,44 +220,73 @@ class CoordinatesPanel(QDockWidget):
             if not editable:
                 self.table.setRowCount(0)
                 self.table.setEnabled(False)
-                self._info.setText(
-                    "<i>Coordinate editing is available in 2D / 2.5D modes "
-                    "only. Switch to a 2D mode to view and edit point "
-                    "coordinates.</i>"
-                )
+                self._info.setText(self._unavailable_note(mode))
                 return
 
             self.table.setEnabled(True)
+            self._configure_columns(is_3d)
             pts = np.asarray(self._lattice.points, dtype=float)
             n = pts.shape[0]
+            axes = "X, Y or Z" if is_3d else "X or Y"
             self._info.setText(
                 f"<b>{n}</b> point{'s' if n != 1 else ''} — double-click an "
-                f"X or Y cell to type a value or expression "
+                f"{axes} cell to type a value or expression "
                 f"(e.g. <code>sqrt(3)</code>, <code>2*pi/3</code>). "
                 f"Each edit is undoable (Ctrl+Z)."
             )
             self.table.setRowCount(n)
             for row in range(n):
-                self._populate_row(row, pts[row])
+                self._populate_row(row, pts[row], is_3d)
         finally:
             self._suspend = False
+
+    @staticmethod
+    def _unavailable_note(mode: int) -> str:
+        """Explanatory text for a mode whose points aren't table-editable."""
+        if mode == 10:
+            return (
+                "<i>Mode 10 (cuboid kirigami) builds its geometry from a "
+                "fixed cube grid, so its points aren't editable here.</i>"
+            )
+        return "<i>Coordinate editing isn't available for this mode.</i>"
+
+    def _configure_columns(self, is_3d: bool) -> None:
+        """Lay the table out for 2D (#, X, Y) or 3D (#, X, Y, Z) points.
+
+        Re-applies headers/resize-modes each call but only resizes the
+        column count when it actually changes, so a same-dimensionality
+        refresh doesn't thrash the header."""
+        want = 4 if is_3d else 3
+        if self.table.columnCount() != want:
+            self.table.setColumnCount(want)
+        self.table.setHorizontalHeaderLabels(
+            ["#", "X", "Y", "Z"] if is_3d else ["#", "X", "Y"])
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(1, want):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
 
     # ==================================================================
     # Internals
     # ==================================================================
 
-    def _populate_row(self, row: int, point: np.ndarray) -> None:
-        """Fill one table row from a lattice point 2-vector."""
+    def _populate_row(self, row: int, point: np.ndarray,
+                      is_3d: bool = False) -> None:
+        """Fill one table row from a lattice point (2- or 3-vector)."""
         # Index column — read-only.
         idx_item = QTableWidgetItem(str(row))
         idx_item.setFlags(idx_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         idx_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table.setItem(row, 0, idx_item)
-        # X / Y — editable.
+        # X / Y (and Z in 3D) — editable.
         x = float(point[0])
         y = float(point[1]) if point.shape[0] > 1 else 0.0
         self.table.setItem(row, 1, QTableWidgetItem(f"{x:.{_COORD_DECIMALS}f}"))
         self.table.setItem(row, 2, QTableWidgetItem(f"{y:.{_COORD_DECIMALS}f}"))
+        if is_3d:
+            z = float(point[2]) if point.shape[0] > 2 else 0.0
+            self.table.setItem(row, 3,
+                               QTableWidgetItem(f"{z:.{_COORD_DECIMALS}f}"))
 
     def _on_cell_changed(self, row: int, col: int) -> None:
         """A coordinate cell was committed. Emit an undoable move.
@@ -260,9 +300,12 @@ class CoordinatesPanel(QDockWidget):
         pts = np.asarray(self._lattice.points, dtype=float)
         if not (0 <= row < pts.shape[0]):
             return
-        old_xy = pts[row, :2].astype(float).copy()
+        dim = int(pts.shape[1])          # 2 (2D/2.5D) or 3 (3D point cloud)
+        axis = col - 1                   # col 1→x, 2→y, 3→z
+        if not (0 <= axis < dim):
+            return
+        old = pts[row, :dim].astype(float).copy()
 
-        axis = col - 1   # col 1 → x (axis 0), col 2 → y (axis 1)
         item = self.table.item(row, col)
         text = item.text() if item is not None else ""
         try:
@@ -270,14 +313,16 @@ class CoordinatesPanel(QDockWidget):
         except (TypeError, ValueError):
             # Bad input / unparseable expression — revert the cell to the
             # lattice value, no move.
-            self._revert_cell(row, col, old_xy[axis])
+            self._revert_cell(row, col, old[axis])
             return
 
-        new_xy = old_xy.copy()
-        new_xy[axis] = new_value
-        if np.allclose(new_xy, old_xy, atol=1e-12):
+        new = old.copy()
+        new[axis] = new_value
+        if np.allclose(new, old, atol=1e-12):
             return
-        self.pointMoveRequested.emit(int(row), old_xy, new_xy)
+        # Emit the full 2- or 3-vector; MovePointCommand assigns it
+        # straight into the (N, dim) point array, so 3D points move too.
+        self.pointMoveRequested.emit(int(row), old, new)
 
     def _revert_cell(self, row: int, col: int, value: float) -> None:
         """Rewrite a single cell back to ``value`` without re-emitting

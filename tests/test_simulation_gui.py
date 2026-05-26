@@ -323,6 +323,36 @@ def test_collision_shading_added_to_plot_when_collisions_exist(main_window):
     assert len(panel._collision_spans) == 2
 
 
+def test_mode11_overlap_spans_flank_reachable_range():
+    """Pure helper: the mode-11 overlap shading returns two spans just
+    past the reachable x-range and widened x-limits to show them."""
+    from auxetic_studio.simulation_panel import _mode11_overlap_spans
+    spans, xlim = _mode11_overlap_spans(np.linspace(0.0, 180.0, 40))
+    assert len(spans) == 2
+    (hi_a, hi_b), (lo_a, lo_b) = spans
+    assert hi_a == pytest.approx(180.0) and hi_b > 180.0   # past the high end
+    assert lo_b == pytest.approx(0.0) and lo_a < 0.0        # before the low end
+    assert xlim[0] < 0.0 and xlim[1] > 180.0
+
+
+def test_mode11_overlap_spans_degenerate_is_empty():
+    from auxetic_studio.simulation_panel import _mode11_overlap_spans
+    assert _mode11_overlap_spans(np.array([90.0])) == ([], None)
+    assert _mode11_overlap_spans(np.array([90.0, 90.0])) == ([], None)
+
+
+def test_mode11_kinematic_plot_shades_overlap_past_jamming(main_window):
+    """Mode 11's mechanism stops at the jamming angle, so its kinematic
+    plot marks the over-jammed (overlap) region past the reachable range
+    with red shading — two flanking spans."""
+    win = main_window
+    win.inspector.select_mode(11)
+    panel = win.simulation_panel
+    panel.run_simulation()
+    assert panel._sim_result is not None
+    assert len(panel._collision_spans) == 2
+
+
 def test_slider_convention_extended_to_full_pi_range():
     """The two convention helpers — the only place slider↔simulator
     mapping is allowed to live — implement the M2.8 extended mapping:
