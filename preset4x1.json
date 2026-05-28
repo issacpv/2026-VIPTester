@@ -1,0 +1,109 @@
+{
+  "version": 4,
+  "mode": 4,
+  "n_points": 10,
+  "ratio": 0.6,
+  "nz_layers": 2,
+  "points": [
+    [
+      0.749171740105407,
+      -0.0013020442955887779
+    ],
+    [
+      1.0,
+      0.0
+    ],
+    [
+      0.7469164360861661,
+      0.24671747358214935
+    ],
+    [
+      1.0,
+      0.25
+    ],
+    [
+      0.7512909909893362,
+      0.5011091999223241
+    ],
+    [
+      1.0,
+      0.5
+    ],
+    [
+      0.7477445096782535,
+      0.7518014589872228
+    ],
+    [
+      1.0,
+      0.75
+    ],
+    [
+      0.7497849490415699,
+      1.0002929696315035
+    ],
+    [
+      1.0,
+      1.0
+    ]
+  ],
+  "shape_params": {
+    "ngon_thickness": 0.03,
+    "hub_size_factor": 0.75,
+    "joint_sphere_radius": 0.015,
+    "strut_radius": 0.02
+  },
+  "generation": {
+    "density_axis": "none",
+    "density_law": "uniform",
+    "density_strength": 1.0,
+    "edge_flips": [
+      [
+        1,
+        2
+      ],
+      [
+        5,
+        6
+      ]
+    ],
+    "mesh_path": null,
+    "mesh_vertices": null,
+    "unit_scale_cm": 1.0
+  },
+  "dynamics": {
+    "piston_force_n": 5.0,
+    "forces": [],
+    "ground_face": null,
+    "pre_rotation_quat": null,
+    "pre_joint_angle_deg": null,
+    "fixed_tiles": [],
+    "config": {
+      "dt": 0.001,
+      "duration": 1.0,
+      "joint_stiffness": 500.0,
+      "joint_damping": 5.0,
+      "gravity_cm_per_s2": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "convergence_kinetic_thresh": 1e-05
+    }
+  },
+  "view_state": {
+    "rigid_rotation_quat": [
+      0.7071067811865476,
+      0.0,
+      0.0,
+      0.7071067811865475
+    ],
+    "flipped": false,
+    "joint_angle_deg": 0.0
+  },
+  "metadata": {
+    "name": "",
+    "created": "2026-05-16T03:37:35.776636+00:00",
+    "modified": "2026-05-16T03:37:35.777034+00:00",
+    "notes": ""
+  }
+}

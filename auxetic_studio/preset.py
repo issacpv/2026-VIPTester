@@ -56,12 +56,13 @@ from auxetic import Lattice
 from auxetic import geometry as _geom
 
 
-PRESET_VERSION = 7  # Tile Library — adds the "compose" block (a
-                     # user-authored explicit triangulation that must not
-                     # be re-Delaunayed). v6 → v7 migration fills it with
-                     # preserve_triangulation=False, so every pre-v7 preset
-                     # loads exactly as before. (v6 added the opt-in
-                     # "bezier" block; v5 added the mode-11 size ratio "C".)
+PRESET_VERSION = 8  # Per-triangle C — adds "tri_ids" + "piece_C" to the
+                     # "compose" block (stable triangle ids and their
+                     # mode-11 size-ratio overrides). v7 → v8 migration
+                     # leaves them empty, so every pre-v8 preset loads with
+                     # the uniform global C exactly as before. (v7 added the
+                     # "compose" block; v6 the "bezier" block; v5 the
+                     # mode-11 size ratio "C".)
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +122,13 @@ def _stub_generation() -> Dict[str, Any]:
 def _stub_compose() -> Dict[str, Any]:
     """v7 ``compose`` block defaults — not a composition. A non-composed
     lattice derives its triangulation from its points (Delaunay/grid), so
-    no explicit ``simplices`` are stored."""
+    no explicit ``simplices`` are stored. v8 adds ``tri_ids``/``piece_C``
+    (per-triangle C overrides), empty for a non-composed lattice."""
     return {
         "preserve_triangulation": False,
         "simplices":              None,
+        "tri_ids":                None,
+        "piece_C":                {},
     }
 
 
@@ -276,6 +280,15 @@ def save_preset(
                 if (getattr(lattice, "preserve_triangulation", False)
                     and lattice.tri is not None)
                 else None),
+            # Per-triangle C (v8): stable triangle ids aligned with the
+            # simplices above, and the id→C overrides. JSON keys are
+            # strings; the loader casts back to int.
+            "tri_ids": (
+                np.asarray(lattice.tri_ids).tolist()
+                if getattr(lattice, "tri_ids", None) is not None
+                else None),
+            "piece_C": {str(k): float(v)
+                        for k, v in getattr(lattice, "piece_C", {}).items()},
         },
         "view_state": dict(lattice.view_state) if lattice.view_state else _stub_view_state(),
         "metadata":   md,
@@ -343,6 +356,9 @@ def load_preset(path: str) -> Lattice:
     if int(data.get("version", PRESET_VERSION)) == 6:
         data = _migrate_v6_to_v7(data)
 
+    if int(data.get("version", PRESET_VERSION)) == 7:
+        data = _migrate_v7_to_v8(data)
+
     # ---- M1 generation block (v3) ---------------------------------------
     # Pull these out first so they can be passed to the Lattice
     # constructor. Mesh-import modes (7, 8, 9) need ``mesh_vertices``
@@ -393,6 +409,18 @@ def load_preset(path: str) -> Lattice:
             simp = np.asarray(compose_simplices, dtype=np.int64).reshape(-1, 3)
             lattice.preserve_triangulation = True
             lattice._set_points_and_tri(pts, _geom._FlippedTri(simp))
+            # Per-triangle C (v8): restore stable ids + overrides when they
+            # line up with the reinstalled simplices, so a tile's custom C
+            # survives a save/load. Mismatched/absent ids → leave None so
+            # the lattice mints fresh ones on the next override.
+            raw_ids = compose.get("tri_ids")
+            if raw_ids is not None and len(raw_ids) == simp.shape[0]:
+                lattice.tri_ids = np.asarray(raw_ids, dtype=np.int64)
+                lattice._next_tri_id = (int(lattice.tri_ids.max()) + 1
+                                        if lattice.tri_ids.size else 0)
+            lattice.piece_C = {int(k): float(v)
+                               for k, v in (compose.get("piece_C") or {}).items()}
+            lattice._prune_piece_C()
         else:
             lattice.regenerate_from_points(pts)
         # SPEC §5.1 doesn't store points_original; the as-loaded points
@@ -552,5 +580,18 @@ def _migrate_v6_to_v7(data: Dict[str, Any]) -> Dict[str, Any]:
     compose = dict(out.get("compose") or {})
     for key, value in _stub_compose().items():
         compose.setdefault(key, value)
+    out["compose"] = compose
+    return out
+
+
+def _migrate_v7_to_v8(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote a v7 preset to v8: adds ``tri_ids``/``piece_C`` to the
+    ``compose`` block (empty). Pre-v8 presets carried no per-triangle C
+    overrides, so they load with the uniform global C exactly as before."""
+    out = dict(data)
+    out["version"] = 8
+    compose = dict(out.get("compose") or {})
+    compose.setdefault("tri_ids", None)
+    compose.setdefault("piece_C", {})
     out["compose"] = compose
     return out

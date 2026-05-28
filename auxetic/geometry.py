@@ -756,6 +756,103 @@ def bezier_polyline(p0, p1, *,
     return out
 
 
+def _polygon_is_ccw(poly: np.ndarray) -> bool:
+    v = np.asarray(poly, dtype=float)
+    area = 0.5 * np.sum(v[:, 0] * np.roll(v[:, 1], -1)
+                        - np.roll(v[:, 0], -1) * v[:, 1])
+    return area >= 0.0
+
+
+def joint_smoothing_webs(net, *,
+                         radius_frac: float = 0.7,
+                         segments: int = 8) -> list[np.ndarray]:
+    """Concave (quadratic-Bézier) fillets that smooth the kirigami **joints**
+    of a mode-11 bipartite network.
+
+    At each centroid hinge ``T_c`` a central polygon corner and a corner
+    kite's corner meet at a single point — a sharp rotating-units pivot. The
+    two angular wedges between the central polygon's edges and the kite's
+    edges there are the open kirigami notches (re-entrant corners of the
+    solid). This rounds each notch with an **inside-corner fillet**: a
+    quadratic Bézier from a point ``qa`` on one edge to a point ``qb`` on the
+    other, with the control point AT the hinge. That makes the arc *tangent*
+    to both unit edges (so the straight edges flow smoothly into it) and bow
+    *toward* the hinge — a concave scoop into the negative space, not a convex
+    bump. Filling ``[J, qa, arc, qb]`` adds the thin fillet sliver that rounds
+    the sharp notch. The straight unit edges and the bond struts are
+    untouched — only the joint corner gains a curved scoop.
+
+    Returns a list of 2D polygon outlines (each ``(k, 2)``, CCW), ready to be
+    extruded into slabs by the same path that renders the rigid units.
+    ``radius_frac`` sets how far up each edge the fillet reaches (as a
+    fraction of the average edge at the joint, capped per-edge so it never
+    reaches a unit body or the bond); ``segments`` is the arc tessellation.
+
+    Hinges lie strictly inside their source triangle, so both wedges are
+    interior negative space — there is no exterior wedge to mis-fill."""
+    from collections import defaultdict
+
+    by_tri: dict[int, dict] = defaultdict(
+        lambda: {"central": None, "kites": []})
+    for p in net.polygons:
+        if p.set_label == "B":
+            by_tri[p.triangle_index]["central"] = p
+        elif p.hinge_index >= 0:
+            by_tri[p.triangle_index]["kites"].append(p)
+
+    webs: list[np.ndarray] = []
+    for grp in by_tri.values():
+        central = grp["central"]
+        if central is None:
+            continue
+        cv = np.asarray(central.vertices, dtype=float)
+        nC = len(cv)
+        for kite in grp["kites"]:
+            kv = np.asarray(kite.vertices, dtype=float)
+            nK = len(kv)
+            h = int(kite.hinge_index)
+            J = kv[h]
+            ci = int(np.argmin(np.linalg.norm(cv - J, axis=1)))
+            if float(np.linalg.norm(cv[ci] - J)) > 1e-7:
+                continue  # this kite's hinge isn't a central-polygon corner
+            # The four edge directions leaving the hinge: two from the
+            # central polygon, two from the kite. A wedge between two
+            # SAME-owner edges is a unit body (skip); a wedge between a
+            # central edge and a kite edge is an open joint notch (fill).
+            dirs = [("c", cv[(ci - 1) % nC] - J), ("c", cv[(ci + 1) % nC] - J),
+                    ("k", kv[(h - 1) % nK] - J), ("k", kv[(h + 1) % nK] - J)]
+            dirs.sort(key=lambda od: float(np.arctan2(od[1][1], od[1][0])))
+            for i in range(4):
+                la, da = dirs[i]
+                lb, db = dirs[(i + 1) % 4]
+                if la == lb:
+                    continue  # unit-body wedge
+                na, nb = float(np.linalg.norm(da)), float(np.linalg.norm(db))
+                if na < 1e-9 or nb < 1e-9:
+                    continue
+                # Size the web off the AVERAGE of the two edges meeting the
+                # joint (the kite's inner edge alone is tiny, which made the
+                # webs invisible specks), then cap how far it can run up each
+                # edge so it never reaches a unit body or the bond.
+                r = float(radius_frac) * 0.5 * (na + nb)
+                ra = min(r, 0.85 * na)
+                rb = min(r, 0.85 * nb)
+                qa = J + ra * da / na
+                qb = J + rb * db / nb
+                # Inside-corner fillet: quadratic Bézier qa -> qb with the
+                # control point AT the hinge J. Tangent to both edges at qa,
+                # qb and bowing toward J, so it scoops concavely into the gap
+                # rather than bulging out. Filling [J, arc] is the fillet
+                # sliver that rounds the notch.
+                tp = np.linspace(0.0, 1.0, int(segments) + 1)[:, None]
+                arc = ((1.0 - tp) ** 2 * qa
+                       + 2.0 * (1.0 - tp) * tp * J
+                       + tp ** 2 * qb)
+                poly = np.vstack([J[None, :], arc])
+                webs.append(poly if _polygon_is_ccw(poly) else poly[::-1])
+    return webs
+
+
 def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
                               cuboid_tiles=None,
                               cuboid_constraints=None,
@@ -764,7 +861,10 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
                               tetra_C=0.5,
                               bezier_enabled: bool = False,
                               bezier_strength: float = 0.0,
-                              bezier_segments: int = 1):
+                              bezier_segments: int = 1,
+                              joint_smooth_enabled: bool = False,
+                              joint_smooth_radius: float = 0.7,
+                              joint_smooth_segments: int = 8):
     """Build the strut curves, solid triangles, and joint positions for STL/OBJ/SCAD output.
 
     When ``bezier_enabled`` is set (and ``bezier_strength`` is non-zero
@@ -857,6 +957,17 @@ def collect_export_geometry(points_nd, tri, ratio, mode, nz_layers,
             all_triangles.extend(extrude_polygon_solid(face3))
             for pt in face3:
                 register_joint(pt)
+        # Curved webs that round the sharp pivot joints (opt-in). Each web is
+        # extruded as a slab exactly like a rigid unit, so it fuses with the
+        # central polygon + kite it bridges. Off by default → no change.
+        if bool(joint_smooth_enabled):
+            for web in joint_smoothing_webs(
+                    net, radius_frac=float(joint_smooth_radius),
+                    segments=int(joint_smooth_segments)):
+                if len(web) < 3:
+                    continue
+                wface = np.hstack([web, np.zeros((len(web), 1))])
+                all_triangles.extend(extrude_polygon_solid(wface))
         for bond in net.bonds:
             b = np.asarray(bond, float)
             add_strut([b[0, 0], b[0, 1], 0.0], [b[1, 0], b[1, 1], 0.0])

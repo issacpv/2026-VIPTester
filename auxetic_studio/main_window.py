@@ -38,6 +38,8 @@ from .commands import (
     RecommendationApplyCommand,
     AddTileCommand,
     ScalePointsCommand,
+    SetTriangleCCommand,
+    ClearTriangleCCommand,
 )
 
 
@@ -95,6 +97,12 @@ class MainWindow(QMainWindow):
 
         self.view_2d.pointMoveCompleted.connect(self._on_point_move_completed)
         self.view_2d.edgeFlipRequested.connect(self._on_edge_flip_requested)
+        # Shift+click a mode-11 triangle → per-tile C selection.
+        self.view_2d.trianglePicked.connect(self._on_triangle_picked)
+        # Simplex index of the canvas-selected triangle (-1 = none). The
+        # single source of truth for the per-triangle C control; revalidated
+        # after every refresh by ``_sync_selected_triangle``.
+        self._selected_triangle = -1
         # Edge-flip gesture guidance → status bar. Lambda defers the
         # ``statusBar()`` lookup to emit-time, since the status bar is
         # constructed later in __init__ than the views.
@@ -191,6 +199,11 @@ class MainWindow(QMainWindow):
         # "Scale model" → undoable scale of the whole composition.
         self.library_panel.scaleModelRequested.connect(
             self._on_scale_model_requested)
+        # Per-triangle C ratio for the selected (Shift+clicked) triangle.
+        self.library_panel.triangleCRatioChanged.connect(
+            self._on_triangle_c_changed)
+        self.library_panel.triangleCResetRequested.connect(
+            self._on_triangle_c_reset)
 
         # ---- consolidate every right-side panel into one tab strip ------
         # Inspector | Coordinates | Tile Library | Simulation | Predictor,
@@ -426,6 +439,16 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("2D view")
         else:
             self.act_view_3d.setChecked(True)
+            # Entering 3D auto-enables joint smoothing so the curved webs at
+            # the kirigami joints render without a manual toggle. The
+            # kinematic sim draws through a separate posed-tile path that
+            # adds no webs, so the joints strip back to sharp pivots while a
+            # simulation plays; File->Export honours the flag. The Inspector
+            # "Smooth joints" checkbox can still turn it off.
+            if not self.lattice.joint_smooth_enabled:
+                self.lattice.set_joint_smoothing(enabled=True)
+                self.inspector.refresh_from_lattice()
+                self.view_3d.update_lattice(self.lattice)
             self.statusBar().showMessage("3D view")
 
     def _refresh_views(self):
@@ -464,6 +487,9 @@ class MainWindow(QMainWindow):
         self._update_edit_action_enabled()
         self._update_edge_action_enabled()
         self._refresh_views()
+        # Keep the per-triangle C selection (highlight + Library control)
+        # valid and in sync after any mutation, including undo/redo.
+        self._sync_selected_triangle()
         # Must be last — drives the posed mesh on top of the canonical
         # render that ``_refresh_views`` just installed.
         self.simulation_panel.refresh_from_lattice()
@@ -593,7 +619,9 @@ class MainWindow(QMainWindow):
         # the existing triangulation — re-rolling the point cloud would
         # discard the user's placed lattice, so they apply without a
         # regenerate (the command invalidates the export cache instead).
-        _no_regen = ("C", "bezier_enabled", "bezier_strength", "bezier_segments")
+        _no_regen = ("C", "bezier_enabled", "bezier_strength", "bezier_segments",
+                     "joint_smooth_enabled", "joint_smooth_radius",
+                     "joint_smooth_segments")
         cmd = ParameterChangeCommand(
             self.lattice, field, old_value, new_value,
             on_change=self._on_lattice_structurally_changed,
@@ -649,6 +677,77 @@ class MainWindow(QMainWindow):
         self.undo_stack.push(cmd)
         self.statusBar().showMessage(
             f"Scaled model ×{float(factor):g} (footprint + export size)")
+
+    # ---- per-triangle C (mode 11) ---------------------------------------
+
+    def _on_triangle_picked(self, idx):
+        """Shift+click on a mode-11 triangle (from View2D): make it the
+        per-tile C selection, highlight it, and show its current C in the
+        Library panel. Selection itself is transient — not undoable."""
+        idx = int(idx)
+        lat = self.lattice
+        if (getattr(lat, "mode", None) != 11 or lat.tri is None
+                or not (0 <= idx < len(lat.tri.simplices))):
+            return
+        self._selected_triangle = idx
+        self.view_2d.set_selected_triangle(idx)
+        self.library_panel.set_selected_triangle(
+            idx, lat.get_triangle_C(idx), lat.has_triangle_C(idx))
+        # Bring the Tile Library tab forward so the C control is visible.
+        self._library_dock.raise_()
+        self.statusBar().showMessage(
+            f"Triangle {idx} selected — set its C ratio in the Tile "
+            f"Library panel")
+
+    def _on_triangle_c_changed(self, value):
+        """Library per-triangle C spinbox → undoable SetTriangleCCommand
+        on the selected triangle (no-op if unchanged or no selection)."""
+        idx = self._selected_triangle
+        lat = self.lattice
+        if (idx < 0 or getattr(lat, "mode", None) != 11 or lat.tri is None
+                or idx >= len(lat.tri.simplices)):
+            return
+        old = lat.get_triangle_C(idx)
+        if float(value) == float(old) and lat.has_triangle_C(idx):
+            return
+        cmd = SetTriangleCCommand(
+            lat, idx, old, float(value),
+            on_change=self._on_lattice_structurally_changed,
+        )
+        self.undo_stack.push(cmd)
+
+    def _on_triangle_c_reset(self):
+        """Library "Reset" → clear the selected triangle's override
+        (revert to global C), undoably."""
+        idx = self._selected_triangle
+        lat = self.lattice
+        if idx < 0 or lat.tri is None or not lat.has_triangle_C(idx):
+            return
+        cmd = ClearTriangleCCommand(
+            lat, idx, lat.get_triangle_C(idx),
+            on_change=self._on_lattice_structurally_changed,
+        )
+        self.undo_stack.push(cmd)
+
+    def _sync_selected_triangle(self):
+        """Revalidate the per-triangle C selection against the current
+        lattice and re-apply the highlight + Library control. Keeps things
+        consistent after undo/redo, tile adds, mode switches, etc."""
+        lat = self.lattice
+        idx = self._selected_triangle
+        valid = (idx >= 0 and getattr(lat, "mode", None) == 11
+                 and lat.tri is not None
+                 and idx < len(lat.tri.simplices))
+        if not valid:
+            self._selected_triangle = -1
+            idx = -1
+        self.view_2d.set_selected_triangle(idx)
+        if idx >= 0:
+            self.library_panel.set_selected_triangle(
+                idx, lat.get_triangle_C(idx), lat.has_triangle_C(idx))
+        else:
+            self.library_panel.set_selected_triangle(
+                -1, float(getattr(lat, "C", 1.0)), False)
 
     def _on_edge_flip_requested(self, edge, already_flipped):
         """Edge click in View2D → ``FlipEdgeCommand`` (M1)."""

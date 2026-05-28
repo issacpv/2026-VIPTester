@@ -66,7 +66,8 @@ def snap_tile_offset(existing_points: np.ndarray, tile_points: np.ndarray,
 
 
 def weld_points(points: np.ndarray, simplices: np.ndarray,
-                tol: float = DEFAULT_WELD_TOL) -> tuple[np.ndarray, np.ndarray]:
+                tol: float = DEFAULT_WELD_TOL, *,
+                return_kept: bool = False):
     """Merge vertices within Euclidean distance ``tol`` and remap the
     triangulation.
 
@@ -75,11 +76,20 @@ def weld_points(points: np.ndarray, simplices: np.ndarray,
     within ``tol`` or becomes a new kept point. Triangles are reindexed to
     the kept points; any triangle that ends up with a repeated vertex
     (its corners welded together) is dropped as degenerate.
+
+    With ``return_kept=True`` the result is
+    ``(new_points, new_simplices, kept_index)`` where ``kept_index`` is an
+    int array of the indices (into the input ``simplices``) of the
+    triangles that survived — letting a caller carry a per-triangle array
+    (e.g. tile/ownership ids) through the weld in lockstep.
     """
     pts = np.asarray(points, dtype=float).reshape(-1, 2)
     simp = np.asarray(simplices, dtype=np.int64).reshape(-1, 3)
     n = len(pts)
     if n == 0:
+        if return_kept:
+            return (pts.copy(), simp.copy(),
+                    np.arange(len(simp), dtype=np.int64))
         return pts.copy(), simp.copy()
 
     kept: list[np.ndarray] = []
@@ -102,19 +112,24 @@ def weld_points(points: np.ndarray, simplices: np.ndarray,
     new_pts = np.asarray(kept, dtype=float).reshape(-1, 2)
 
     out: list[list[int]] = []
-    for tri in simp:
+    kept_tris: list[int] = []
+    for ti, tri in enumerate(simp):
         a, b, c = (int(old_to_new[int(v)]) for v in tri)
         if a != b and b != c and a != c:
             out.append([a, b, c])
+            kept_tris.append(ti)
     new_simp = (np.asarray(out, dtype=np.int64).reshape(-1, 3)
                 if out else np.zeros((0, 3), dtype=np.int64))
+    if return_kept:
+        return new_pts, new_simp, np.asarray(kept_tris, dtype=np.int64)
     return new_pts, new_simp
 
 
 def add_tile(points: np.ndarray, simplices: np.ndarray,
              tile_points: np.ndarray, tile_simplices: np.ndarray,
              offset=(0.0, 0.0),
-             weld_tol: float = DEFAULT_WELD_TOL) -> tuple[np.ndarray, np.ndarray]:
+             weld_tol: float = DEFAULT_WELD_TOL, *,
+             return_kept: bool = False):
     """Append a tile to an existing mesh (shifted by ``offset``) and weld.
 
     ``points`` / ``simplices`` are the current mesh (may be empty).
@@ -124,6 +139,12 @@ def add_tile(points: np.ndarray, simplices: np.ndarray,
     their triangles are reindexed onto the appended block before welding
     the union. Welding fuses any tile vertex that lands within
     ``weld_tol`` of an existing vertex — the merge-on-proximity behaviour.
+
+    With ``return_kept=True`` the result is
+    ``(new_points, new_simplices, kept_index)``; ``kept_index`` indexes
+    into the *merged* triangle list (the existing ``simplices`` followed
+    by the tile's), naming the triangles that survived the weld — so the
+    caller can keep a per-triangle array aligned across the add.
     """
     pts = np.asarray(points, dtype=float).reshape(-1, 2)
     simp = np.asarray(simplices, dtype=np.int64).reshape(-1, 3)
@@ -133,4 +154,107 @@ def add_tile(points: np.ndarray, simplices: np.ndarray,
 
     merged_pts = np.vstack([pts, tp]) if len(pts) else tp
     merged_simp = np.vstack([simp, ts]) if len(simp) else ts
-    return weld_points(merged_pts, merged_simp, weld_tol)
+    return weld_points(merged_pts, merged_simp, weld_tol,
+                       return_kept=return_kept)
+
+
+# Perpendicular distance below which a vertex counts as lying *on* a
+# triangle edge, and the parametric margin that excludes the edge's own
+# endpoints. Welding/snapping makes shared vertices coincide exactly and
+# congruent axis-aligned tiles stay collinear, so a hanging node sits on
+# the host edge to floating-point precision — a tight tolerance is enough
+# and avoids false positives on merely-nearby vertices.
+_ON_EDGE_PERP_TOL = 1e-7
+_ON_EDGE_END_TOL = 1e-9
+
+
+def _interior_param(p: np.ndarray, a: np.ndarray, b: np.ndarray):
+    """If ``p`` lies strictly between ``a`` and ``b`` (off the endpoints,
+    within ``_ON_EDGE_PERP_TOL`` of the line), return its parameter ``s`` in
+    ``(0, 1)`` along ``a -> b``; otherwise ``None``."""
+    ab = b - a
+    L2 = float(ab @ ab)
+    if L2 < 1e-18:
+        return None
+    s = float((p - a) @ ab) / L2
+    if s <= _ON_EDGE_END_TOL or s >= 1.0 - _ON_EDGE_END_TOL:
+        return None
+    perp = p - (a + s * ab)
+    if float(perp @ perp) > _ON_EDGE_PERP_TOL * _ON_EDGE_PERP_TOL:
+        return None
+    return s
+
+
+def split_t_junctions(points: np.ndarray, simplices: np.ndarray, *,
+                      max_passes: int = 64, return_parents: bool = False):
+    """Make a composed triangulation **conforming** by splitting any edge
+    that has another tile's vertex sitting in its interior — a *T-junction*
+    (hanging node).
+
+    Tiles of different sizes can't share a full edge: a double-size square's
+    edge is twice as long as a unit tile's, so the unit tile's corner lands
+    at the *midpoint* of the big edge, where the big tile has no vertex. That
+    hanging node leaves the big and small tiles touching at a single corner;
+    under the mode-11 bipartite mechanism the under-coupled unit rotates free
+    and a point "breaks off". Splitting the host triangle at the hanging node
+    turns the single touch into a fully shared edge, so the existing
+    bipartite foot/corner fusion couples the tiles into one mechanism — no
+    simulation change required.
+
+    Points are never moved or added (the hanging node is already a vertex);
+    only the host triangle's connectivity changes. When there is no
+    T-junction the simplices are returned unchanged, in the same order, so
+    uniform-size compositions stay byte-for-byte identical.
+
+    With ``return_parents=True`` also returns an int array ``parents`` where
+    ``parents[i]`` is the index (into the input ``simplices``) of the
+    triangle new simplex ``i`` came from, so a caller can carry a
+    per-triangle array (e.g. tile/ownership ids) through the split.
+    """
+    pts = np.asarray(points, dtype=float).reshape(-1, 2)
+    simp = np.asarray(simplices, dtype=np.int64).reshape(-1, 3)
+    n_pts = len(pts)
+    cur: list[list[int]] = [[int(a), int(b), int(c)] for a, b, c in simp]
+    parents: list[int] = list(range(len(cur)))
+
+    for _ in range(int(max_passes)):
+        out: list[list[int]] = []
+        out_parents: list[int] = []
+        changed = False
+        for tri, par in zip(cur, parents):
+            a, b, c = tri
+            tri_set = {a, b, c}
+            split = False
+            # Try each edge; split the first one carrying interior vertices.
+            # Remaining edges are handled on the next pass (cheap, and keeps
+            # the fan construction simple).
+            for u, w, opp in ((a, b, c), (b, c, a), (c, a, b)):
+                interior = []
+                for v in range(n_pts):
+                    if v in tri_set:
+                        continue
+                    s = _interior_param(pts[v], pts[u], pts[w])
+                    if s is not None:
+                        interior.append((s, v))
+                if not interior:
+                    continue
+                interior.sort()
+                chain = [u] + [v for _, v in interior] + [w]
+                for k in range(len(chain) - 1):
+                    out.append([chain[k], chain[k + 1], opp])
+                    out_parents.append(par)
+                changed = True
+                split = True
+                break
+            if not split:
+                out.append([a, b, c])
+                out_parents.append(par)
+        cur, parents = out, out_parents
+        if not changed:
+            break
+
+    new_simp = (np.asarray(cur, dtype=np.int64).reshape(-1, 3)
+                if cur else np.zeros((0, 3), dtype=np.int64))
+    if return_parents:
+        return pts, new_simp, np.asarray(parents, dtype=np.int64)
+    return pts, new_simp

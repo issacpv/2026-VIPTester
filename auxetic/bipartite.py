@@ -112,7 +112,7 @@ class BipartiteNetwork:
     """
 
     polygons: tuple[BipartitePolygon, ...]
-    C: float
+    C: float | np.ndarray          # scalar, or one value per triangle
     bonds: tuple[np.ndarray, ...] = ()
 
     @property
@@ -161,8 +161,10 @@ def _orient_ccw(verts: np.ndarray) -> np.ndarray:
 def build_bipartite_network(
     points: np.ndarray,
     simplices: np.ndarray,
-    C: float = 1.0,
+    C: float | np.ndarray = 1.0,
     theta: float = 0.0,
+    *,
+    fuse_shared_feet: bool = True,
 ) -> BipartiteNetwork:
     """Build the auxetic tile network for a 2D triangulation.
 
@@ -172,8 +174,11 @@ def build_bipartite_network(
         Corner positions in lattice space.
     simplices : (T, 3) int array
         Triangle vertex indices into ``points``.
-    C : float, default 1.0
+    C : float or (T,) array, default 1.0
         Constant size ratio (paper step 3); ``t = 1/(1+C)``. Must be > 0.
+        A scalar applies one ratio to every triangle; a length-``T`` array
+        gives each triangle (``simplices[i]``) its own ratio, so composed
+        tiles can carry independent ``C`` values.
     theta : float, default 0.0
         Mechanism actuation angle (radians). Each corner kite rotates
         **rigidly about its hinge** ``T_c`` by ``theta`` while the central
@@ -181,6 +186,16 @@ def build_bipartite_network(
         the rotating-units motion of the auxetic (notes p.2:
         ``P_{a,j} = R(θ)[P_a - (T_a - M)] + (T_a - M)``, i.e. rotation of
         ``P_a`` about ``T_a``). ``theta = 0`` is the rest tile.
+    fuse_shared_feet : bool, default True
+        When two triangles share an edge but their kite feet there don't
+        coincide, the default fuses them to their midpoint *unless the two
+        tiles carry different ``C``*. Fusing mismatched-``C`` neighbours
+        would tilt the inner edges off-perpendicular into a locking right
+        trapezoid, so each keeps its true perpendicular foot instead (the
+        inter-tile hole stays a collapsible rectangle). Same-``C`` neighbours
+        — including irregular and edge-flipped meshes — still fuse, exactly
+        as before. Set ``False`` to force the perpendicular (no-fuse) method
+        on every shared edge.
 
     Returns
     -------
@@ -194,10 +209,21 @@ def build_bipartite_network(
     simps = np.asarray(simplices, dtype=np.int64)
     if simps.ndim != 2 or simps.shape[1] != 3:
         raise ValueError(f"simplices must be (T, 3); got {simps.shape}")
-    if not (C > 0.0):
+    # ``C`` may be a scalar (uniform size ratio) or a per-triangle array
+    # — one value per simplex — so each tile can carry its own ratio. A
+    # ``(T,)`` array is used as-is; a scalar broadcasts. Where adjacent
+    # triangles disagree on ``C`` their shared perpendicular feet stop
+    # coinciding and the foot-fusion step below snaps them to a midpoint
+    # (the documented asymmetric-defect coupling), so a per-tile ``C`` is
+    # a valid — if less symmetric — tiling.
+    C_arr = np.broadcast_to(
+        np.asarray(C, dtype=float), (simps.shape[0],)).astype(float)
+    if not np.all(C_arr > 0.0):
         raise ValueError(f"C must be > 0; got {C}")
 
-    t = 1.0 / (1.0 + float(C))
+    # ``t`` positions each centroid hinge along its corner->centroid
+    # segment; one per triangle so per-tile ``C`` gives per-tile hinges.
+    t_arr = 1.0 / (1.0 + C_arr)
     cth, sth = np.cos(float(theta)), np.sin(float(theta))
     R = np.array([[cth, -sth], [sth, cth]])
     polygons: list[BipartitePolygon] = []
@@ -213,6 +239,7 @@ def build_bipartite_network(
         P = [pts[i] for i in idx]
         M = (P[0] + P[1] + P[2]) / 3.0
         # Centroid hinges, shared between the central polygon and kites.
+        t = float(t_arr[tri_idx])
         T = [P[c] + t * (M - P[c]) for c in range(3)]
         # foot[c][o] is the foot of the perpendicular from hinge T[c] onto
         # the triangle edge (P[c], P[o]).
@@ -260,10 +287,26 @@ def build_bipartite_network(
             l1c, l1o = r1["g2l"][gc], r1["g2l"][go]
             l2c, l2o = r2["g2l"][gc], r2["g2l"][go]
             f1, f2 = r1["foot"][l1c][l1o], r2["foot"][l2c][l2o]
-            if not np.allclose(f1, f2, atol=1e-9):
-                mid = 0.5 * (f1 + f2)
-                r1["foot"][l1c][l1o] = mid
-                r2["foot"][l2c][l2o] = mid
+            if np.allclose(f1, f2, atol=1e-9):
+                continue                # symmetric — already coincident
+            if not fuse_shared_feet:
+                continue                # caller forced the perpendicular method
+            # Per-tile C MISMATCH is the reported case: when the two tiles
+            # carry different C their kites meet the shared edge at different
+            # perpendicular heights, so snapping both feet to their midpoint
+            # tilts each kite's inner edge off-perpendicular and turns the
+            # inter-tile hole into a NON-collapsible right trapezoid (the
+            # magenta-trapezoid lock). Skip the snap there and keep each
+            # tile's TRUE perpendicular foot, so its holes stay rectangular
+            # and the lattice can still rotate; the tiles remain coupled
+            # through the shared corner node. Same-C neighbours (incl.
+            # irregular / edge-flipped meshes) keep the midpoint fusion that
+            # couples them into one mechanism — unchanged from before.
+            if abs(float(C_arr[recs[0]]) - float(C_arr[recs[1]])) > 1e-12:
+                continue                # mismatched C → perpendicular method
+            mid = 0.5 * (f1 + f2)
+            r1["foot"][l1c][l1o] = mid
+            r2["foot"][l2c][l2o] = mid
 
     # ---- Pass 2: build central polygons, corner kites, and edge bonds ----
     for tri_idx, rec in enumerate(tris):
@@ -306,14 +349,17 @@ def build_bipartite_network(
         for a, b in ((0, 1), (1, 2), (2, 0)):
             bonds.append(np.array([about(foot[a][b], a), about(foot[b][a], b)]))
 
-    return BipartiteNetwork(polygons=tuple(polygons), C=float(C),
+    # Preserve the caller's intent on the network: a scalar stays a
+    # float; a per-triangle array is stored verbatim.
+    C_store = float(C) if np.ndim(C) == 0 else np.asarray(C, dtype=float)
+    return BipartiteNetwork(polygons=tuple(polygons), C=C_store,
                             bonds=tuple(bonds))
 
 
 def jamming_angle(
     points: np.ndarray,
     simplices: np.ndarray,
-    C: float = 1.0,
+    C: float | np.ndarray = 1.0,
 ) -> float:
     """Largest ``|theta|`` a kite can rotate about its hinge before an
     inner edge collides with the adjacent central-polygon face — the
@@ -329,14 +375,23 @@ def jamming_angle(
     pts = np.asarray(points, dtype=float)
     simps = np.asarray(simplices, dtype=np.int64)
     if (pts.ndim != 2 or pts.shape[1] != 2
-            or simps.ndim != 2 or simps.shape[1] != 3 or not (C > 0.0)):
+            or simps.ndim != 2 or simps.shape[1] != 3):
+        return float(np.pi / 2.0)
+    # ``C`` is scalar or per-triangle (see ``build_bipartite_network``).
+    try:
+        C_arr = np.broadcast_to(
+            np.asarray(C, dtype=float), (simps.shape[0],)).astype(float)
+    except ValueError:
+        return float(np.pi / 2.0)
+    if simps.shape[0] == 0 or not np.all(C_arr > 0.0):
         return float(np.pi / 2.0)
 
-    t = 1.0 / (1.0 + float(C))
+    t_arr = 1.0 / (1.0 + C_arr)
     min_ang = float(np.pi / 2.0)
-    for tri in simps:
+    for ti, tri in enumerate(simps):
         P = [pts[int(v)] for v in tri]
         M = (P[0] + P[1] + P[2]) / 3.0
+        t = float(t_arr[ti])
         T = [P[c] + t * (M - P[c]) for c in range(3)]
         for c in range(3):
             for o in range(3):

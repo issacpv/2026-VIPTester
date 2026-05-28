@@ -123,3 +123,47 @@ def test_refresh_from_lattice_syncs_widgets(main_window):
     assert insp.bezier_enabled_check.isChecked() is True
     assert insp.bezier_strength_spin.value() == pytest.approx(0.5)
     assert insp.bezier_segments_spin.value() == 20
+
+
+# ---------------------------------------------------------------------------
+# Auto-enable joint smoothing on entering the 3D view
+# ---------------------------------------------------------------------------
+# Entering 3D auto-enables JOINT smoothing (curved webs at the pivots), NOT
+# strut-bezier — the user wants the joints smoothed, not the struts/edges
+# curved. Strut bezier stays off unless explicitly toggled.
+
+def test_entering_3d_auto_enables_joint_smoothing(main_window):
+    """Switching to 3D turns joint smoothing on (and ticks the Inspector
+    checkbox) so the curved joint webs are visible without a manual toggle.
+    The app starts in 2D with smoothing off, and strut bezier stays off."""
+    from auxetic_studio.main_window import VIEW_3D
+
+    win = main_window
+    assert win.lattice.joint_smooth_enabled is False     # 2D default: off
+    win._set_view_mode(VIEW_3D)
+    assert win.lattice.joint_smooth_enabled is True
+    assert win.inspector.joint_smooth_check.isChecked() is True
+    assert win.lattice.bezier_enabled is False           # struts NOT curved
+
+
+def test_entering_3d_does_not_regenerate_points(main_window):
+    """The auto-enable must not re-roll the point cloud."""
+    import numpy as np
+
+    from auxetic_studio.main_window import VIEW_3D
+
+    win = main_window
+    before = win.lattice.points.copy()
+    win._set_view_mode(VIEW_3D)
+    assert np.array_equal(win.lattice.points, before)
+
+
+def test_entering_3d_joint_smoothing_is_not_an_undoable_edit(main_window):
+    """Auto-enabling on 3D entry is a view convenience, not a user edit, so it
+    must not land on the undo stack."""
+    from auxetic_studio.main_window import VIEW_3D
+
+    win = main_window
+    n = win.undo_stack.count()
+    win._set_view_mode(VIEW_3D)
+    assert win.undo_stack.count() == n

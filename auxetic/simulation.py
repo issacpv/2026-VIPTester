@@ -168,8 +168,11 @@ class TileSystem:
                 lattice.mode, lattice.nz_layers,
                 # Mode 11: the solver starts from the rest tile (theta=0)
                 # and finds the deformation itself; pass the lattice's C
-                # so the rest tile matches the design.
-                bipartite_C=float(getattr(lattice, "C", 1.0)),
+                # so the rest tile matches the design — per-triangle when
+                # tiles carry their own C overrides, else the global scalar.
+                bipartite_C=(lattice._per_triangle_C()
+                             if hasattr(lattice, "_per_triangle_C")
+                             else float(getattr(lattice, "C", 1.0))),
                 bipartite_theta=0.0,
             )
             constraint_tuples = _tiles.build_kirigami_constraints(

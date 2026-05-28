@@ -15,10 +15,26 @@ from auxetic.composition import (
     SNAP_RADIUS,
     add_tile,
     snap_tile_offset,
+    split_t_junctions,
     weld_points,
 )
 from auxetic.lattice import Lattice
 from auxetic.tile_library import TILE_LIBRARY, get_tile
+
+
+def _compose_big_plus_small(big_scale=2.0):
+    """Raw (no-Lattice) composition of a big square + a unit square sharing
+    the LEFT HALF of the big square's bottom edge — the mismatched-size case
+    that leaves a hanging node at the big edge's midpoint."""
+    sq = get_tile("Square")
+    big = sq.points * big_scale
+    empty_p = np.zeros((0, 2)); empty_s = np.zeros((0, 3), dtype=np.int64)
+    p, s = add_tile(empty_p, empty_s, big, sq.simplices, offset=(0.5, 0.5))
+    # Big (edge 0.5) corners: (.25,.25),(.75,.25),(.75,.75),(.25,.75).
+    # Unit square (edge 0.25) centred at (.375,.125) -> bottom-right corner at
+    # (.5,.25), the MIDPOINT of the big square's bottom edge.
+    p, s = add_tile(p, s, sq.points, sq.simplices, offset=(0.375, 0.125))
+    return p, s
 
 
 # ---------------------------------------------------------------------------
@@ -306,3 +322,78 @@ def test_mode11_sweep_stops_at_real_collision_not_analytic_jamming():
     # ... and every reachable pose is collision-free (no collapse).
     cc = CollisionChecker(ts, tol=1e-6)
     assert not any(cc.has_collision(p) for p in res.poses)
+
+
+# ---------------------------------------------------------------------------
+# split_t_junctions — conforming meshes from mismatched-size tiles
+# ---------------------------------------------------------------------------
+
+def test_split_t_junctions_conforms_mismatched_square():
+    """A unit tile sharing half of a double-size square's edge leaves a
+    hanging node at the big edge's midpoint; the split fan-divides the host
+    triangle so the node becomes a shared corner (the mesh conforms)."""
+    p, s = _compose_big_plus_small()
+    n_before = len(s)
+    assert n_before == 4          # 2 (big) + 2 (unit), pre-split
+
+    p2, s2, parents = split_t_junctions(p, s, return_parents=True)
+    assert len(p2) == len(p)      # no points added or moved
+    assert len(s2) == n_before + 1  # one host triangle fan-split into two
+    assert len(parents) == len(s2)
+    assert int(parents.max()) < n_before  # parents index the pre-split tris
+
+    # Idempotent: a conforming mesh has nothing left to split.
+    _, s3 = split_t_junctions(p2, s2)
+    assert np.array_equal(s3, s2)
+
+
+def test_split_t_junctions_noop_on_uniform_composition():
+    """Two equal-size squares sharing a full edge are already conforming, so
+    the split must return the simplices unchanged (byte-identical export for
+    every existing uniform composition)."""
+    sq = get_tile("Square")
+    e = float(sq.points[:, 0].max() - sq.points[:, 0].min())
+    empty_p = np.zeros((0, 2)); empty_s = np.zeros((0, 3), dtype=np.int64)
+    p, s = add_tile(empty_p, empty_s, sq.points, sq.simplices, offset=(0.4, 0.5))
+    p, s = add_tile(p, s, sq.points, sq.simplices, offset=(0.4 + e, 0.5))
+
+    p2, s2, parents = split_t_junctions(p, s, return_parents=True)
+    assert np.array_equal(s2, s)
+    assert np.array_equal(parents, np.arange(len(s)))
+
+
+def test_split_t_junctions_empty_is_safe():
+    p2, s2, parents = split_t_junctions(
+        np.zeros((0, 2)), np.zeros((0, 3), dtype=np.int64), return_parents=True)
+    assert s2.shape == (0, 3)
+    assert parents.shape == (0,)
+
+
+def test_compose_add_tile_conforms_and_simulates_mismatched_size():
+    """End-to-end: dropping a 2x square then a unit tile against it (the user
+    bug) produces a conforming mesh whose tri_ids stay aligned, and the
+    lattice builds ONE coupled kinematic mechanism instead of leaving an
+    under-constrained tile that breaks off."""
+    from auxetic.simulation import Simulator, TileSystem
+
+    sq = get_tile("Square")
+    lat = Lattice(mode=11, n_points=4, ratio=0.35)
+    lat.compose_add_tile(sq.points * 2.0, sq.simplices, offset=(0.5, 0.5),
+                         weld_tol=DEFAULT_WELD_TOL * 2,
+                         snap_radius=SNAP_RADIUS * 2)
+    lat.compose_add_tile(sq.points, sq.simplices, offset=(0.375, 0.125))
+
+    p = np.asarray(lat.points)
+    s = np.asarray(lat.tri.simplices)
+    # Conforming: nothing left to split.
+    _, s2 = split_t_junctions(p, s)
+    assert np.array_equal(s2, s)
+    # Per-triangle ids stay aligned 1:1 with the post-split simplices.
+    assert lat.tri_ids is not None and len(lat.tri_ids) == len(s)
+
+    # The mismatched lattice builds a valid single mechanism (no crash, no
+    # detached unit). Before the conforming split, identify_kirigami_mode saw
+    # an extra free DOF from the hanging unit.
+    ts = TileSystem.from_lattice(lat)
+    sim = Simulator(ts, np.array([0.0, -1.0]))
+    assert sim.identify_kirigami_mode() is not None
