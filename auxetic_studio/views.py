@@ -101,6 +101,11 @@ _BIP_BOND_PEN       = pg.mkPen(0, 0, 0, width=3.0)
 _BIP_HINGE_BAR_PEN = pg.mkPen(60, 60, 60, width=2.0)
 _BIP_HINGE_BRUSH   = pg.mkBrush(20, 20, 20, 230)
 _BIP_HINGE_SIZE    = 6.0
+# Selected-triangle highlight (Shift+click to pick a triangle, then set
+# its per-tile C ratio): the four polygons of that triangle get a thick
+# red outline + warm tint so it's obvious which tile the C control edits.
+_BIP_SELECTED_TRI_PEN   = pg.mkPen(225, 45, 45, width=2.8)
+_BIP_SELECTED_TRI_BRUSH = pg.mkBrush(250, 175, 95, 200)
 
 
 def _snap(value: float) -> float:
@@ -196,6 +201,11 @@ class DraggablePointsItem(pg.ScatterPlotItem):
             ev.ignore(); return
 
         if self._edit_enabled:
+            # Shift+click is reserved for triangle picking (handled at the
+            # scene level) — let it fall through rather than selecting a
+            # node, so "Shift+click = pick a triangle" holds everywhere.
+            if ev.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                ev.ignore(); return
             ev.accept()
             self.sigPointClicked.emit(idx)
             return
@@ -349,6 +359,10 @@ class View2D(QWidget):
     # mapped into lattice space. MainWindow turns it into a compose
     # command.
     tileDropRequested   = pyqtSignal(str, float, float)
+    # Mode-11 only: a Shift+left-click on the canvas picked the triangle
+    # under the cursor. Carries the simplex index; MainWindow uses it to
+    # drive the per-triangle C control.
+    trianglePicked      = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -404,6 +418,16 @@ class View2D(QWidget):
         self.selected_index   = -1
         self._hover_index     = -1
         self._drag_old_pos    = None  # 2-vector captured at drag start
+        # Mode-11 per-triangle C selection: the simplex index highlighted
+        # for the per-tile C control. Render-only input set by MainWindow
+        # (the single source of truth) via ``set_selected_triangle``.
+        self.selected_triangle = -1
+
+        # Shift+left-click anywhere on the canvas picks the triangle under
+        # the cursor (mode 11). Routed through the scene signal so it fires
+        # over nodes, polygons, or empty space alike — the scatter
+        # deliberately ignores Shift+clicks so they reach here.
+        self.plot.scene().sigMouseClicked.connect(self._on_scene_clicked)
 
         # ---- edge-flip gesture state -------------------------------------
         # The flip is a two-step gesture: (1) click a flippable / flipped
@@ -427,6 +451,12 @@ class View2D(QWidget):
             self.selected_index = -1
         if self._hover_index >= len(lattice.points):
             self._hover_index = -1
+        # Drop a stale triangle selection if the lattice left mode 11 or
+        # the triangle count shrank below it (e.g. after undo).
+        if lattice is None or getattr(lattice, "mode", None) != 11 \
+                or lattice.tri is None \
+                or self.selected_triangle >= len(np.asarray(lattice.tri.simplices)):
+            self.selected_triangle = -1
         # 3D modes can't show edges meaningfully; force-exit edge mode
         # if the lattice switched into one. The toolbar enable-state
         # is also kept consistent in MainWindow.
@@ -440,6 +470,12 @@ class View2D(QWidget):
         self._refresh_edges()
         self._refresh_bipartite()
         self._auto_range()
+
+    def set_selected_triangle(self, idx: int) -> None:
+        """Set which triangle is highlighted for the per-tile C control
+        and repaint the bipartite overlay. ``-1`` clears the highlight."""
+        self.selected_triangle = int(idx)
+        self._refresh_bipartite()
 
     def set_edit_mode(self, on: bool) -> None:
         self._edit_mode = bool(on)
@@ -603,6 +639,32 @@ class View2D(QWidget):
             return
         self._hover_index = idx
         self._refresh_visuals()
+
+    def _on_scene_clicked(self, ev) -> None:
+        """Shift+left-click → pick the mode-11 triangle under the cursor.
+
+        Emits ``trianglePicked`` (the simplex index) so MainWindow can
+        drive the per-tile C control. Only fires for mode 11 with Shift
+        held, so it never interferes with point drags or the edge-flip
+        gesture. The highlight itself is applied by MainWindow calling
+        back into ``set_selected_triangle`` (single source of truth)."""
+        lat = self._lattice
+        if lat is None or getattr(lat, "mode", None) != 11:
+            return
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+        if not (ev.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            return
+        try:
+            vb = self.plot.getViewBox()
+            view_pt = vb.mapSceneToView(ev.scenePos())
+            idx = lat.triangle_at_point((view_pt.x(), view_pt.y()), world=True)
+        except Exception:
+            return
+        if idx is None or idx < 0:
+            return
+        ev.accept()
+        self.trianglePicked.emit(int(idx))
 
     # ------------------------------------------------------------------
     # Rendering
@@ -769,13 +831,21 @@ class View2D(QWidget):
                 qpoly = QPolygonF([QPointF(float(x), float(y))
                                    for x, y in vw])
                 item = QGraphicsPolygonItem(qpoly)
-                if poly.set_label == 'A':
+                is_sel = (self.selected_triangle >= 0
+                          and getattr(poly, "triangle_index", -1)
+                          == self.selected_triangle)
+                if is_sel:
+                    item.setBrush(_BIP_SELECTED_TRI_BRUSH)
+                    item.setPen(_BIP_SELECTED_TRI_PEN)
+                elif poly.set_label == 'A':
                     item.setBrush(_BIP_SET_A_BRUSH)
                     item.setPen(_BIP_SET_A_PEN)
                 else:
                     item.setBrush(_BIP_SET_B_BRUSH)
                     item.setPen(_BIP_SET_B_PEN)
-                item.setZValue(-10)
+                # Lift the selected triangle's polygons just above their
+                # neighbours so the red highlight outline isn't covered.
+                item.setZValue(-9 if is_sel else -10)
                 vb.addItem(item)
                 self._bipartite_items.append(item)
 

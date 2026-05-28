@@ -325,6 +325,46 @@ class InspectorPanel(QWidget):
         outer.addWidget(bezier_box)
 
         # =================================================================
+        # Joint smoothing (mode 11): curved webs that round the sharp pivot
+        # joints. Render/export only — routed through ParameterChangeCommand
+        # with regenerate=False. Auto-enabled when entering the 3D view.
+        # =================================================================
+        joint_box = QGroupBox("Joint smoothing", self)
+        joint_form = QFormLayout(joint_box)
+
+        self.joint_smooth_check = QCheckBox("Smooth joints", joint_box)
+        self.joint_smooth_check.setToolTip(
+            "Add curved webs of material at the kirigami pivot joints, "
+            "rounding the sharp point-contacts into necks (mode 11). "
+            "Render/export only — the simulation is unaffected. "
+            "Auto-enabled when you switch to the 3D view.")
+        self.joint_smooth_check.toggled.connect(self._on_joint_smooth_toggled)
+
+        self.joint_smooth_radius_spin = QDoubleSpinBox(joint_box)
+        self.joint_smooth_radius_spin.setRange(0.0, 1.0)
+        self.joint_smooth_radius_spin.setSingleStep(0.05)
+        self.joint_smooth_radius_spin.setDecimals(3)
+        self.joint_smooth_radius_spin.setToolTip(
+            "Web size as a fraction of the shorter edge meeting the joint. "
+            "Larger = chunkier rounded joints.")
+        self.joint_smooth_radius_spin.editingFinished.connect(
+            self._on_joint_smooth_radius_committed)
+
+        self.joint_smooth_segments_spin = QSpinBox(joint_box)
+        self.joint_smooth_segments_spin.setRange(2, 32)
+        self.joint_smooth_segments_spin.setToolTip(
+            "Number of segments each joint web's curved edge is "
+            "tessellated into. Higher = smoother.")
+        self.joint_smooth_segments_spin.valueChanged.connect(
+            self._on_joint_smooth_segments_changed)
+
+        joint_form.addRow(self.joint_smooth_check)
+        joint_form.addRow(QLabel("Web size"), self.joint_smooth_radius_spin)
+        joint_form.addRow(QLabel("Segments"), self.joint_smooth_segments_spin)
+
+        outer.addWidget(joint_box)
+
+        # =================================================================
         # Tessellation section (task 6d) — fill a square region with an
         # equilateral-fill triangular lattice at a chosen density. Builds a
         # fresh 2D lattice via Lattice.from_tessellation (geometry in
@@ -411,6 +451,14 @@ class InspectorPanel(QWidget):
                 float(getattr(self._lattice, "bezier_strength", 0.25)))
             self.bezier_segments_spin.setValue(
                 int(getattr(self._lattice, "bezier_segments", 12)))
+
+            # Joint-smoothing widgets.
+            self.joint_smooth_check.setChecked(
+                bool(getattr(self._lattice, "joint_smooth_enabled", False)))
+            self.joint_smooth_radius_spin.setValue(
+                float(getattr(self._lattice, "joint_smooth_radius", 0.7)))
+            self.joint_smooth_segments_spin.setValue(
+                int(getattr(self._lattice, "joint_smooth_segments", 8)))
 
             self._update_visibility()
             self._sync_orientation_widgets()
@@ -605,6 +653,21 @@ class InspectorPanel(QWidget):
     def _on_bezier_segments_changed(self, value):
         old = int(getattr(self._lattice, "bezier_segments", 12))
         self._emit_param("bezier_segments", old, int(value))
+
+    # ---- joint-smoothing handlers (mode 11) ------------------------------
+
+    def _on_joint_smooth_toggled(self, checked):
+        old = bool(getattr(self._lattice, "joint_smooth_enabled", False))
+        self._emit_param("joint_smooth_enabled", old, bool(checked))
+
+    def _on_joint_smooth_radius_committed(self):
+        new = float(self.joint_smooth_radius_spin.value())
+        old = float(getattr(self._lattice, "joint_smooth_radius", 0.7))
+        self._emit_param("joint_smooth_radius", old, new)
+
+    def _on_joint_smooth_segments_changed(self, value):
+        old = int(getattr(self._lattice, "joint_smooth_segments", 8))
+        self._emit_param("joint_smooth_segments", old, int(value))
 
     # ---- tessellation handler (task 6d) ----------------------------------
 

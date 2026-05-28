@@ -25,8 +25,10 @@ from auxetic_studio.preset import (
 )
 
 
-def test_preset_version_is_7():
-    assert PRESET_VERSION == 7
+def test_preset_version_is_current():
+    # Bumped to 8 when per-triangle C overrides (tri_ids + piece_C) were
+    # added to the compose block; v7 composition behaviour is unchanged.
+    assert PRESET_VERSION == 8
 
 
 def _composed_lattice() -> tuple[Lattice, np.ndarray]:

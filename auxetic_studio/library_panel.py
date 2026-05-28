@@ -90,9 +90,19 @@ class LibraryPanel(QDockWidget):
     # to apply to the current composition (MainWindow wraps it in an
     # undoable ScalePointsCommand).
     scaleModelRequested = pyqtSignal(float)
+    # Per-triangle C (mode 11): the user changed the selected triangle's
+    # C ratio, or asked to clear its override. MainWindow turns these into
+    # undoable commands against the currently-selected triangle.
+    triangleCRatioChanged = pyqtSignal(float)
+    triangleCResetRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("Tile Library", parent)
+        # Simplex index of the canvas-selected triangle (-1 = none). Set
+        # by MainWindow via ``set_selected_triangle``.
+        self._selected_idx = -1
+        # Guards the C spinbox signal while we update it programmatically.
+        self._suspend = False
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea
             | Qt.DockWidgetArea.RightDockWidgetArea
@@ -158,6 +168,38 @@ class LibraryPanel(QDockWidget):
         scale_row.addWidget(self.scale_button)
         outer.addLayout(scale_row)
 
+        # ---- per-triangle C ratio (mode 11) ------------------------------
+        # Shift+click a triangle on the 2D canvas to select it, then set
+        # *that triangle's* C ratio here — every other triangle keeps the
+        # global C (Inspector). Lets one composed shape mix meshy and
+        # solid tiles.
+        self.triangle_label = QLabel(
+            "Shift+click a triangle on the canvas to set its C ratio.", body)
+        self.triangle_label.setWordWrap(True)
+        outer.addWidget(self.triangle_label)
+
+        tri_row = QHBoxLayout()
+        tri_row.addWidget(QLabel("Triangle C"))
+        self.triangle_c_spin = QDoubleSpinBox(body)
+        self.triangle_c_spin.setRange(0.05, 20.0)
+        self.triangle_c_spin.setSingleStep(0.05)
+        self.triangle_c_spin.setDecimals(3)
+        self.triangle_c_spin.setValue(1.0)
+        self.triangle_c_spin.setEnabled(False)
+        self.triangle_c_spin.setToolTip(
+            "Size ratio C for the selected triangle only. Smaller C → "
+            "solider tile; larger C → meshier. Overrides the global C for "
+            "this one triangle.")
+        self.triangle_c_spin.valueChanged.connect(self._on_triangle_c_changed)
+        tri_row.addWidget(self.triangle_c_spin)
+        self.triangle_reset_button = QPushButton("Reset", body)
+        self.triangle_reset_button.setEnabled(False)
+        self.triangle_reset_button.setToolTip(
+            "Clear this triangle's override and return it to the global C.")
+        self.triangle_reset_button.clicked.connect(self._on_triangle_c_reset)
+        tri_row.addWidget(self.triangle_reset_button)
+        outer.addLayout(tri_row)
+
         self.setWidget(body)
 
     def tile_edge(self) -> float:
@@ -168,3 +210,39 @@ class LibraryPanel(QDockWidget):
         factor = float(self.scale_spin.value())
         if factor > 0.0:
             self.scaleModelRequested.emit(factor)
+
+    def set_selected_triangle(self, idx: int, c_value: float,
+                              has_override: bool) -> None:
+        """Reflect the canvas selection in the per-triangle C control.
+
+        ``idx >= 0`` enables the spinbox and shows the triangle's current
+        C (its override or the global value); ``idx < 0`` disables it and
+        restores the prompt. The spinbox signal is blocked during the
+        update so this doesn't fire a (recursive) change command."""
+        self._selected_idx = int(idx)
+        enabled = self._selected_idx >= 0
+        self._suspend = True
+        try:
+            self.triangle_c_spin.setEnabled(enabled)
+            self.triangle_reset_button.setEnabled(enabled and bool(has_override))
+            if enabled:
+                self.triangle_c_spin.setValue(float(c_value))
+                tag = "overridden" if has_override else "global C"
+                self.triangle_label.setText(
+                    f"Triangle #{self._selected_idx} selected ({tag}) — "
+                    f"set its C ratio.")
+            else:
+                self.triangle_label.setText(
+                    "Shift+click a triangle on the canvas to set its C ratio.")
+        finally:
+            self._suspend = False
+
+    def _on_triangle_c_changed(self, value: float) -> None:
+        if self._suspend or self._selected_idx < 0:
+            return
+        self.triangleCRatioChanged.emit(float(value))
+
+    def _on_triangle_c_reset(self) -> None:
+        if self._selected_idx < 0:
+            return
+        self.triangleCResetRequested.emit()

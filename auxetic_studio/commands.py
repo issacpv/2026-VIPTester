@@ -83,7 +83,11 @@ class ParameterChangeCommand(QUndoCommand):
                 # the point cloud — but they DO change the cached strut
                 # curves, so the non-regenerate branch invalidates the
                 # export-geometry cache below.
-                "bezier_enabled", "bezier_strength", "bezier_segments")
+                "bezier_enabled", "bezier_strength", "bezier_segments",
+                # Mode-11 joint smoothing (curved webs at the pivots).
+                # Same regenerate=False / derived-geometry treatment.
+                "joint_smooth_enabled", "joint_smooth_radius",
+                "joint_smooth_segments")
 
     def __init__(self, lattice: Lattice, field: str,
                  old_value: Any, new_value: Any,
@@ -185,6 +189,12 @@ class AddTileCommand(QUndoCommand):
             "preserve":  bool(lat.preserve_triangulation),
             "points_original": (None if lat.points_original is None
                                 else lat.points_original.copy()),
+            # Per-triangle C state changes on add (fresh ids minted) — keep
+            # it so undo restores the prior ids/overrides exactly.
+            "tri_ids":   (None if lat.tri_ids is None
+                          else np.asarray(lat.tri_ids).copy()),
+            "piece_C":   dict(lat.piece_C),
+            "next_tri_id": int(lat._next_tri_id),
         }
 
     def redo(self) -> None:
@@ -207,6 +217,9 @@ class AddTileCommand(QUndoCommand):
         lat.mode = p.get("mode", lat.mode)
         lat.preserve_triangulation = p.get("preserve", False)
         lat.points_original = p.get("points_original")
+        lat.tri_ids = p.get("tri_ids")
+        lat.piece_C = dict(p.get("piece_C") or {})
+        lat._next_tri_id = int(p.get("next_tri_id", lat._next_tri_id))
         prev_points = p.get("points")
         prev_simplices = p.get("simplices")
         if prev_points is not None and prev_simplices is not None:
@@ -217,6 +230,70 @@ class AddTileCommand(QUndoCommand):
                                     _geom._FlippedTri(prev_simplices))
         elif prev_points is not None:
             lat._set_points_and_tri(prev_points, None)
+        if self.on_change is not None:
+            self.on_change()
+
+
+class SetTriangleCCommand(QUndoCommand):
+    """Set a single triangle's bipartite size ratio ``C`` (mode 11).
+
+    Keyed by the triangle's **stable id** (resolved once at construction
+    via ``Lattice.triangle_id_at_index``), not its positional index — so
+    undo/redo stay correct even if later tile adds reorder the simplices.
+    ``C`` only repositions hinges on the existing triangulation, so this
+    never re-rolls points; ``set_triangle_C_by_id`` invalidates the export
+    cache. Undo restores the prior override, or clears it when the
+    triangle had none."""
+
+    def __init__(self, lattice: Lattice, tri_index: int,
+                 old_c: float, new_c: float,
+                 on_change: Callback = None):
+        super().__init__(f"Set triangle {int(tri_index)} C")
+        self.lattice      = lattice
+        self.tri_id       = lattice.triangle_id_at_index(int(tri_index))
+        self.had_override = lattice.has_triangle_C(int(tri_index))
+        self.old_c        = float(old_c)
+        self.new_c        = float(new_c)
+        self.on_change    = on_change
+
+    def redo(self) -> None:
+        if self.tri_id is not None:
+            self.lattice.set_triangle_C_by_id(self.tri_id, self.new_c)
+        if self.on_change is not None:
+            self.on_change()
+
+    def undo(self) -> None:
+        if self.tri_id is not None:
+            if self.had_override:
+                self.lattice.set_triangle_C_by_id(self.tri_id, self.old_c)
+            else:
+                self.lattice.clear_triangle_C_by_id(self.tri_id)
+        if self.on_change is not None:
+            self.on_change()
+
+
+class ClearTriangleCCommand(QUndoCommand):
+    """Clear a triangle's per-tile ``C`` override so it tracks the global
+    ``C`` again (mode 11). Keyed by stable triangle id; undo restores the
+    prior override value."""
+
+    def __init__(self, lattice: Lattice, tri_index: int,
+                 old_c: float, on_change: Callback = None):
+        super().__init__(f"Reset triangle {int(tri_index)} C")
+        self.lattice   = lattice
+        self.tri_id    = lattice.triangle_id_at_index(int(tri_index))
+        self.old_c     = float(old_c)
+        self.on_change = on_change
+
+    def redo(self) -> None:
+        if self.tri_id is not None:
+            self.lattice.clear_triangle_C_by_id(self.tri_id)
+        if self.on_change is not None:
+            self.on_change()
+
+    def undo(self) -> None:
+        if self.tri_id is not None:
+            self.lattice.set_triangle_C_by_id(self.tri_id, self.old_c)
         if self.on_change is not None:
             self.on_change()
 

@@ -112,7 +112,15 @@ class Lattice:
                  # is the polyline tessellation density (>=2 to curve).
                  bezier_enabled: bool = False,
                  bezier_strength: float = 0.25,
-                 bezier_segments: int = 12):
+                 bezier_segments: int = 12,
+                 # Joint smoothing (mode 11, opt-in). When enabled, each
+                 # kirigami pivot joint gets a curved Bézier web of material
+                 # bridging the two units. Default OFF => byte-identical
+                 # export. ``radius`` is the web size as a fraction of the
+                 # shorter edge at the joint; ``segments`` the arc density.
+                 joint_smooth_enabled: bool = False,
+                 joint_smooth_radius: float = 0.7,
+                 joint_smooth_segments: int = 8):
         self.mode      = mode
         self.n_points  = n_points
         self.ratio     = ratio
@@ -128,6 +136,17 @@ class Lattice:
         self.bezier_enabled  = bool(bezier_enabled)
         self.bezier_strength = float(bezier_strength)
         self.bezier_segments = int(bezier_segments)
+
+        # ---- Joint smoothing (mode 11, opt-in) --------------------------
+        # When enabled, each pivot joint (central-polygon corner meeting a
+        # kite corner) gets a curved web of material that rounds the sharp
+        # point-contact into a neck. Render/export only — the kinematic sim
+        # builds from the rigid polygons and never sees the webs. Default
+        # OFF => byte-identical export. :meth:`set_joint_smoothing`
+        # invalidates the export cache.
+        self.joint_smooth_enabled  = bool(joint_smooth_enabled)
+        self.joint_smooth_radius   = float(joint_smooth_radius)
+        self.joint_smooth_segments = int(joint_smooth_segments)
 
         # Shape parameters per SPEC §5.1's ``shape_params`` block.
         self.ngon_thickness      = (_geom.NGON_THICKNESS      if ngon_thickness      is None else float(ngon_thickness))
@@ -221,6 +240,19 @@ class Lattice:
         # the preset v7 loader; cleared by ``regenerate`` (a re-roll exits
         # compose). ``_triangulate`` short-circuits on it.
         self.preserve_triangulation: bool = False
+
+        # ---- per-triangle bipartite C overrides (mode 11) ---------------
+        # ``tri_ids`` is a stable id per simplex, aligned with
+        # ``tri.simplices`` — minted fresh per added tile so an override
+        # follows its triangle across later welds/adds rather than
+        # tracking a positional index that shifts. ``piece_C`` maps a
+        # tri-id to a per-triangle ``C`` (size ratio); triangles without
+        # an entry use the global ``self.C``. Both are reset by
+        # ``regenerate`` (a re-roll exits compose) and round-tripped
+        # through preset v8.
+        self.tri_ids: np.ndarray | None = None
+        self.piece_C: dict[int, float] = {}
+        self._next_tri_id: int = 0
 
         self.points: np.ndarray | None = None
         self.tri = None
@@ -418,8 +450,12 @@ class Lattice:
 
     def regenerate(self):
         # A re-roll generates a fresh point cloud, so it exits any
-        # Tile-Library composition (the authored triangulation is gone).
+        # Tile-Library composition (the authored triangulation is gone)
+        # and discards per-triangle C overrides bound to it.
         self.preserve_triangulation = False
+        self.tri_ids = None
+        self.piece_C = {}
+        self._next_tri_id = 0
         if self.seed is not None:
             np.random.seed(self.seed)
         if self.mode in _CUBOID_MODES:
@@ -529,6 +565,23 @@ class Lattice:
             base_pts = np.zeros((0, 2), dtype=float)
             base_simp = np.zeros((0, 3), dtype=np.int64)
 
+        # Stable ids for the existing triangles: reuse the current
+        # ``tri_ids`` when they line up, otherwise mint fresh ones (e.g. a
+        # composition loaded from a pre-v8 preset, or a tessellation, that
+        # carried no ids). The tile's own triangles always get brand-new
+        # ids so a per-triangle C override stays bound to its triangle.
+        if base_simp.shape[0] > 0:
+            if (self.tri_ids is not None
+                    and len(self.tri_ids) == base_simp.shape[0]):
+                base_ids = np.asarray(self.tri_ids, dtype=np.int64)
+            else:
+                base_ids = self._mint_tri_ids(base_simp.shape[0])
+        else:
+            base_ids = np.zeros((0,), dtype=np.int64)
+        tile_n = np.asarray(tile_simplices, dtype=np.int64).reshape(-1, 3).shape[0]
+        tile_ids = self._mint_tri_ids(tile_n)
+        merged_ids = np.concatenate([base_ids, tile_ids])
+
         # Snap the drop so the tile's nearest vertex lands exactly on the
         # nearest existing vertex — a roughly-aimed drop then locks into
         # alignment (shared edge coincides) instead of skewing off one
@@ -536,15 +589,182 @@ class Lattice:
         offset = _composition.snap_tile_offset(
             base_pts, tile_points, offset, snap)
 
-        new_pts, new_simp = _composition.add_tile(
+        new_pts, new_simp, kept = _composition.add_tile(
             base_pts, base_simp, tile_points, tile_simplices,
-            offset=offset, weld_tol=tol)
+            offset=offset, weld_tol=tol, return_kept=True)
+
+        # ``kept`` indexes into the merged (base + tile) triangle list, so
+        # the surviving triangles keep their ids in lockstep.
+        kept_ids = merged_ids[kept] if len(kept) else merged_ids[:0]
+
+        # Conform any T-junction a mismatched-size tile leaves behind (a
+        # smaller tile's corner landing mid-edge of a larger one): split the
+        # host triangle so the hanging node becomes a shared corner, else the
+        # under-coupled unit detaches under the kinematic mechanism. A no-op
+        # for uniform compositions (byte-identical), and the per-triangle ids
+        # follow each split child through ``parents``.
+        new_pts, new_simp, parents = _composition.split_t_junctions(
+            new_pts, new_simp, return_parents=True)
+        if len(kept_ids):
+            kept_ids = kept_ids[parents]
 
         self.mode = 11
         self.preserve_triangulation = True
+        self.tri_ids = kept_ids
+        self._prune_piece_C()
         self._set_points_and_tri(new_pts, _geom._FlippedTri(new_simp))
         self.points_original = new_pts.copy()
         return self.points, np.asarray(self.tri.simplices)
+
+    # ==================================================================
+    # Per-triangle bipartite C overrides (mode 11)
+    # ==================================================================
+
+    def _n_simplices(self) -> int:
+        if self.tri is None:
+            return 0
+        simp = np.asarray(self.tri.simplices)
+        return int(simp.shape[0]) if simp.ndim == 2 else 0
+
+    def _mint_tri_ids(self, n: int) -> np.ndarray:
+        """Allocate ``n`` fresh, never-reused triangle ids."""
+        ids = np.arange(self._next_tri_id, self._next_tri_id + int(n),
+                        dtype=np.int64)
+        self._next_tri_id += int(n)
+        return ids
+
+    def _ensure_tri_ids(self) -> None:
+        """Make ``tri_ids`` exist and align 1:1 with the current
+        simplices. If they're missing or stale (a topology change left
+        them the wrong length), mint a fresh sequential set and drop any
+        now-orphaned C overrides — a graceful reset rather than applying
+        an override to the wrong triangle."""
+        n = self._n_simplices()
+        if self.tri_ids is None or len(self.tri_ids) != n:
+            self.tri_ids = self._mint_tri_ids(n)
+            self._prune_piece_C()
+
+    def _prune_piece_C(self) -> None:
+        """Drop C overrides whose triangle id is no longer present."""
+        if not self.piece_C or self.tri_ids is None:
+            return
+        live = {int(t) for t in self.tri_ids}
+        self.piece_C = {k: v for k, v in self.piece_C.items() if k in live}
+
+    def _per_triangle_C(self):
+        """The ``C`` argument for the bipartite builders: the scalar
+        ``self.C`` when no per-triangle overrides apply (the fast,
+        behaviour-preserving path), else a length-``T`` array with each
+        overridden triangle's own ``C`` and ``self.C`` everywhere else."""
+        n = self._n_simplices()
+        if (not self.piece_C or self.tri_ids is None
+                or len(self.tri_ids) != n or n == 0):
+            return self.C
+        arr = np.full(n, float(self.C), dtype=float)
+        for i, tid in enumerate(self.tri_ids):
+            c = self.piece_C.get(int(tid))
+            if c is not None:
+                arr[i] = float(c)
+        return arr
+
+    def triangle_id_at_index(self, tri_index: int) -> int | None:
+        """Stable id of the triangle at simplex index ``tri_index``
+        (ensuring ids exist first). ``None`` if out of range."""
+        n = self._n_simplices()
+        if not (0 <= int(tri_index) < n):
+            return None
+        self._ensure_tri_ids()
+        return int(self.tri_ids[int(tri_index)])
+
+    def has_triangle_C(self, tri_index: int) -> bool:
+        """Whether the triangle at ``tri_index`` carries a C override."""
+        if self.tri_ids is None or not (0 <= int(tri_index) < len(self.tri_ids)):
+            return False
+        return int(self.tri_ids[int(tri_index)]) in self.piece_C
+
+    def get_triangle_C(self, tri_index: int) -> float:
+        """The effective ``C`` for the triangle at ``tri_index`` — its
+        override if set, else the global ``self.C``."""
+        if self.tri_ids is not None and 0 <= int(tri_index) < len(self.tri_ids):
+            tid = int(self.tri_ids[int(tri_index)])
+            if tid in self.piece_C:
+                return float(self.piece_C[tid])
+        return float(self.C)
+
+    def set_triangle_C(self, tri_index: int, C: float) -> None:
+        """Set a per-triangle ``C`` override by simplex index (mints ids
+        on first use). No-op for an out-of-range index."""
+        tid = self.triangle_id_at_index(tri_index)
+        if tid is not None:
+            self.set_triangle_C_by_id(tid, C)
+
+    def set_triangle_C_by_id(self, tri_id: int, C: float) -> None:
+        """Set a per-triangle ``C`` override keyed by stable triangle id.
+        Keyed by id (not index) so undo/redo stay correct even after later
+        tile adds shuffle the positional order."""
+        self.piece_C[int(tri_id)] = float(C)
+        self._clear_caches()
+
+    def clear_triangle_C_by_id(self, tri_id: int) -> None:
+        """Remove a per-triangle ``C`` override (revert to global C)."""
+        if int(tri_id) in self.piece_C:
+            del self.piece_C[int(tri_id)]
+            self._clear_caches()
+
+    def triangle_at_point(self, point, *, world: bool = True) -> int | None:
+        """Simplex index of the 2D triangle containing ``point`` (the
+        same picking used by :meth:`poisson_ratio_at_point`). ``world``
+        coords are inverse-transformed through ``world_transform``; a
+        point outside every triangle falls back to the nearest one by
+        centroid. ``None`` for 3D modes or a lattice with no 2D
+        triangulation.
+
+        The containment test is done here (barycentric, vectorised over
+        the simplices) rather than via ``tri.find_simplex`` because a
+        composed mesh's ``tri`` is a lightweight ``_FlippedTri`` that only
+        carries ``simplices`` — so this works for both Delaunay and
+        Tile-Library composed triangulations."""
+        if self.mode in _3D_MODES or self.tri is None:
+            return None
+        pts = np.asarray(self.points, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            return None
+        simplices = np.asarray(self.tri.simplices)
+        if simplices.ndim != 2 or simplices.shape[1] != 3 or simplices.shape[0] == 0:
+            return None
+
+        p = np.asarray(point, dtype=float).ravel()
+        if world:
+            try:
+                M_inv = np.linalg.inv(self.world_transform())
+            except np.linalg.LinAlgError:
+                return None
+            h = np.array([p[0], p[1], p[2] if p.size > 2 else 0.0, 1.0])
+            xy = (M_inv @ h)[:2]
+        else:
+            xy = p[:2]
+
+        tris = pts[simplices]                       # (T, 3, 2)
+        a, b, c = tris[:, 0], tris[:, 1], tris[:, 2]
+        v0, v1, v2 = b - a, c - a, xy - a           # v2 broadcasts to (T, 2)
+        d00 = np.einsum("ij,ij->i", v0, v0)
+        d01 = np.einsum("ij,ij->i", v0, v1)
+        d11 = np.einsum("ij,ij->i", v1, v1)
+        d20 = np.einsum("ij,ij->i", v2, v0)
+        d21 = np.einsum("ij,ij->i", v2, v1)
+        denom = d00 * d11 - d01 * d01
+        safe = np.where(np.abs(denom) > 1e-18, denom, 1.0)
+        v = (d11 * d20 - d01 * d21) / safe
+        w = (d00 * d21 - d01 * d20) / safe
+        u = 1.0 - v - w
+        tol = 1e-9
+        inside = ((np.abs(denom) > 1e-18)
+                  & (u >= -tol) & (v >= -tol) & (w >= -tol))
+        hit = np.nonzero(inside)[0]
+        if hit.size:
+            return int(hit[0])
+        centroids = tris.mean(axis=1)
+        return int(np.argmin(np.linalg.norm(centroids - xy, axis=1)))
 
     def scale_points(self, factor: float) -> None:
         """Uniformly scale the lattice's points about their centroid by
@@ -623,6 +843,26 @@ class Lattice:
             self.bezier_strength = float(strength)
         if segments is not None:
             self.bezier_segments = int(segments)
+        self._clear_caches()
+
+    def set_joint_smoothing(self, *,
+                            enabled: bool | None = None,
+                            radius: float | None = None,
+                            segments: int | None = None) -> None:
+        """Update the mode-11 joint-smoothing options and invalidate the
+        cached export geometry so the next export/render re-runs with the
+        new settings. Only the provided fields change.
+
+        When ``enabled``, each kirigami pivot joint gets a curved Bézier web
+        of material; ``radius`` sets the web size (fraction of the shorter
+        edge at the joint) and ``segments`` the arc tessellation. Render and
+        export only — the kinematic sim is unaffected."""
+        if enabled is not None:
+            self.joint_smooth_enabled = bool(enabled)
+        if radius is not None:
+            self.joint_smooth_radius = float(radius)
+        if segments is not None:
+            self.joint_smooth_segments = int(segments)
         self._clear_caches()
 
     # ==================================================================
@@ -733,10 +973,14 @@ class Lattice:
              self._solid_triangles,
              self._joint_positions) = _geom.collect_export_geometry(
                 self.points, self.tri, self.ratio, self.mode, self.nz_layers,
-                bipartite_C=self.C, bipartite_theta=self._bipartite_theta(),
+                bipartite_C=self._per_triangle_C(),
+                bipartite_theta=self._bipartite_theta(),
                 bezier_enabled=self.bezier_enabled,
                 bezier_strength=self.bezier_strength,
-                bezier_segments=self.bezier_segments)
+                bezier_segments=self.bezier_segments,
+                joint_smooth_enabled=self.joint_smooth_enabled,
+                joint_smooth_radius=self.joint_smooth_radius,
+                joint_smooth_segments=self.joint_smooth_segments)
             return
         # Mode-12 geometry depends on the live ``C`` (the internal-tetra
         # contraction), which changes without a re-triangulation — so,
@@ -807,7 +1051,8 @@ class Lattice:
             return float(math.pi / 2.0)
         from . import bipartite as _bip
         return _bip.jamming_angle(self.points,
-                                  np.asarray(self.tri.simplices), self.C)
+                                  np.asarray(self.tri.simplices),
+                                  self._per_triangle_C())
 
     def edge_vector_poisson_ratio(self, theta: float = 0.1) -> float:
         """Lattice-level generalized Poisson's ratio from the edge-vector
@@ -833,10 +1078,11 @@ class Lattice:
             return float("nan")
 
         vals: list[float] = []
-        for s in simplices:
+        for i, s in enumerate(simplices):
             tri = pts[s]
             try:
-                nu = _ep.generalized_poisson_ratio(tri, float(self.C), float(theta))
+                nu = _ep.generalized_poisson_ratio(
+                    tri, self.get_triangle_C(i), float(theta))
             except ValueError:
                 continue
             if np.isfinite(nu):
@@ -862,35 +1108,17 @@ class Lattice:
         triangle or ``theta == 0``. Selection + ν live here, not the GUI."""
         from . import edge_poisson as _ep
 
-        if self.mode in _3D_MODES or self.tri is None:
+        idx = self.triangle_at_point(point, world=world)
+        if idx is None:
             return None, float("nan")
         pts = np.asarray(self.points, dtype=float)
-        if pts.ndim != 2 or pts.shape[1] != 2:
-            return None, float("nan")
         simplices = np.asarray(self.tri.simplices)
-        if simplices.ndim != 2 or simplices.shape[1] != 3:
-            return None, float("nan")
-
-        p = np.asarray(point, dtype=float).ravel()
-        if world:
-            try:
-                M_inv = np.linalg.inv(self.world_transform())
-            except np.linalg.LinAlgError:
-                return None, float("nan")
-            h = np.array([p[0], p[1], p[2] if p.size > 2 else 0.0, 1.0])
-            xy = (M_inv @ h)[:2]
-        else:
-            xy = p[:2]
-
-        idx = int(self.tri.find_simplex(xy))
-        if idx < 0:
-            # Outside the hull — nearest triangle by centroid.
-            centroids = pts[simplices].mean(axis=1)
-            idx = int(np.argmin(np.linalg.norm(centroids - xy, axis=1)))
         tri = pts[simplices[idx]]
         try:
+            # Per-triangle C so a tile with its own size ratio reports the
+            # ratio it actually renders with.
             nu = float(_ep.generalized_poisson_ratio(
-                tri, float(self.C), float(theta)))
+                tri, self.get_triangle_C(idx), float(theta)))
         except ValueError:
             nu = float("nan")
         return idx, nu
@@ -931,12 +1159,13 @@ class Lattice:
         simplices = np.asarray(self.tri.simplices)
         th = self._bipartite_theta() if theta is None else float(theta)
         return _bip.build_bipartite_network(self.points, simplices,
-                                            self.C, theta=th)
+                                            self._per_triangle_C(), theta=th)
 
     def collect_kirigami(self):
         tiles, source = _tiles.collect_kirigami_tiles(
             self.points, self.tri, self.ratio, self.mode, self.nz_layers,
-            bipartite_C=self.C, bipartite_theta=self._bipartite_theta())
+            bipartite_C=self._per_triangle_C(),
+            bipartite_theta=self._bipartite_theta())
         constraints = _tiles.build_kirigami_constraints(tiles, source)
         return tiles, source, constraints
 
