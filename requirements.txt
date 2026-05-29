@@ -1,0 +1,24 @@
+# Core mesh and geometry
+trimesh>=4.0
+shapely>=2.0
+numpy>=1.24
+scipy>=1.10
+networkx>=3.0
+lxml>=4.9
+pillow>=10.0
+
+# Polygon triangulation backend for trimesh.creation.extrude_polygon
+mapbox-earcut>=1.0
+
+# Spatial index required by trimesh when handling polygons with holes
+rtree>=1.0
+
+# GUI
+PyQt5>=5.15
+
+# 3D visualization
+pyvista>=0.43
+pyvistaqt>=0.11
+
+# Optional — only needed if you want to export .dae (Collada) files
+pycollada>=0.8
