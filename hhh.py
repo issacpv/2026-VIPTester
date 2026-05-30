@@ -1,37 +1,37 @@
 """Standalone centroid-tile construction demo.
 
 Given N 2D points (N >= 3):
-  1. Build a Delaunay triangulation.
-  2. For every triangle (P0, P1, P2), with shrink c:
-       C    = incenter(P0, P1, P2)                -- weighted vertex average
+1. Build a Delaunay triangulation.
+2. For every triangle (P0, P1, P2), with shrink c:
+    C    = incenter(P0, P1, P2)                -- weighted vertex average
                                                     weights = lengths of the
                                                     opposite edges
                                                     (a = |P1-P2|, b = |P0-P2|,
-                                                     c_w = |P0-P1|;
-                                                     C = (a*P0 + b*P1 + c_w*P2)
-                                                         / (a + b + c_w))
-       v_i  = P_i - C
-       T_i  = C + c * v_i                         -- inner-triangle vertex
+                                                    c_w = |P0-P1|;
+                                                    C = (a*P0 + b*P1 + c_w*P2)
+                                                        / (a + b + c_w))
+    v_i  = P_i - C
+    T_i  = C + c * v_i                         -- inner-triangle vertex
                                                     (c=0 -> all T's at C,
-                                                     c=1 -> T_i = P_i)
-       foot of T on edge(P_a, P_b):
-           d = P_b - P_a
-           t = ((T - P_a) . d) / (d . d)
-           foot = P_a + t * d
-     - Fill inner triangle T0-T1-T2.
-     - Six foot points (canonical order): P001, P101, P112, P212, P002, P202.
+                                                    c=1 -> T_i = P_i)
+    foot of T on edge(P_a, P_b):
+        d = P_b - P_a
+        t = ((T - P_a) . d) / (d . d)
+        foot = P_a + t * d
+    - Fill inner triangle T0-T1-T2.
+    - Six foot points (canonical order): P001, P101, P112, P212, P002, P202.
 
-  3. Each T_i owns a quadrilateral "wing" panel of four corners:
-       wing(T0) = (T0, P001, P0,  P002)
-       wing(T1) = (T1, P101, P1,  P112)
-       wing(T2) = (T2, P212, P2,  P202)
-     With the kirigami joint angle theta, the THREE non-T corners of each
-     wing rotate rigidly about T_i by theta:
-         (P001, P0, P002)  rotates about T0
-         (P101, P1, P112)  rotates about T1
-         (P212, P2, P202)  rotates about T2
-     T_i and the inner triangle T0-T1-T2 are fixed by theta; only the
-     wing panels move. theta=0 reproduces the original (un-opened) tile.
+3. Each T_i owns a quadrilateral "wing" panel of four corners:
+    wing(T0) = (T0, P001, P0,  P002)
+    wing(T1) = (T1, P101, P1,  P112)
+    wing(T2) = (T2, P212, P2,  P202)
+    With the kirigami joint angle theta, the THREE non-T corners of each
+    wing rotate rigidly about T_i by theta:
+        (P001, P0, P002)  rotates about T0
+        (P101, P1, P112)  rotates about T1
+        (P212, P2, P202)  rotates about T2
+    T_i and the inner triangle T0-T1-T2 are fixed by theta; only the
+    wing panels move. theta=0 reproduces the original (un-opened) tile.
 
 The math is fully vectorized over Delaunay triangles. Static geometry
 (vertices, centroids, edge anchors, projection denominators) is built
@@ -113,6 +113,126 @@ def _order_ccw(polys: np.ndarray) -> np.ndarray:
     ang = np.arctan2(rel[..., 1], rel[..., 0])
     order = np.argsort(ang, axis=-1)
     return np.take_along_axis(polys, order[..., None], axis=-2)
+
+
+def _quadratic_bezier(p0, p1, p2, n_samples: int = 12) -> np.ndarray:
+    """Sample `n_samples` points along the quadratic Bezier p0 -> p1 -> p2.
+
+    p1 is the control point (the curve passes through p0 and p2 and is
+    tangent to p0->p1 at p0 and to p1->p2 at p2). Adapted from the STL
+    fillet tool's corner-rounding routine.
+    """
+    t = np.linspace(0.0, 1.0, n_samples).reshape(-1, 1)
+    p0, p1, p2 = (np.asarray(p, dtype=float) for p in (p0, p1, p2))
+    return (1 - t) ** 2 * p0 + 2 * (1 - t) * t * p1 + t ** 2 * p2
+
+
+def _find_junctions(polys, tol: float) -> list:
+    """Cluster polygon corners by position; keep clusters spanning >=2 polygons.
+
+    Bucketed by rounded coordinate (O(V)): corners that coincide exactly --
+    which is the case at every kirigami joint, since the inner triangle, its
+    wings, and the links all reference the *same* T / foot / shared-vertex
+    arrays -- land in the same bucket. Returns a list of clusters, each a list
+    of (poly_index, vertex_index, position).
+    """
+    inv = 1.0 / tol
+    buckets: dict[tuple[int, int], list] = {}
+    for pi, poly in enumerate(polys):
+        for vi in range(len(poly)):
+            v = np.asarray(poly[vi], dtype=float)
+            key = (int(round(v[0] * inv)), int(round(v[1] * inv)))
+            buckets.setdefault(key, []).append((pi, vi, v))
+    return [cl for cl in buckets.values() if len({c[0] for c in cl}) >= 2]
+
+
+def _build_joint_bridge(junction, polys, frac: float, samples: int = 10):
+    """Bezier 'flower' that welds the pieces meeting at one junction.
+
+    Reproduces the STL fillet tool's bridge construction: collect every edge
+    of every participating polygon that ends at the junction, back off along
+    it by a radius, sort the back-off points by angle around the junction, and
+    join consecutive ones with a quadratic Bezier whose control point is the
+    junction centre. The control point pulls each arc toward the joint, so the
+    polygon sits like a fillet over the meeting corners. Returns (P, 2) or None.
+    """
+    center = np.mean([c[2] for c in junction], axis=0)
+    edges = []
+    for pi, vi, _ in junction:
+        poly = np.asarray(polys[pi], dtype=float)
+        n = len(poly)
+        for ni in ((vi - 1) % n, (vi + 1) % n):
+            d = poly[ni] - center
+            L = float(np.linalg.norm(d))
+            if L > 1e-9:
+                edges.append((d / L, L, float(np.arctan2(d[1], d[0]))))
+    if len(edges) < 2:
+        return None
+    edges.sort(key=lambda e: e[2])
+    radius = frac * 0.45 * float(np.median([e[1] for e in edges]))
+    if radius < 1e-9:
+        return None
+    backoffs = [center + e[0] * min(radius, e[1] * 0.45) for e in edges]
+    pts = []
+    for i in range(len(backoffs)):
+        bez = _quadratic_bezier(
+            backoffs[i], center, backoffs[(i + 1) % len(backoffs)], samples
+        )
+        pts.extend(bez[:-1])           # drop duplicated arc endpoints
+    return np.asarray(pts) if len(pts) >= 3 else None
+
+
+def build_joint_bridges(polys, frac: float, samples: int = 10) -> list[np.ndarray]:
+    """Bezier bridge polygons welding every joint where >=2 polygons meet.
+
+    `polys` is the full set of rendered panels (inner triangles + wings +
+    links). `frac` in [0, 1] scales the bridge radius (0 = no smoothing).
+    """
+    if frac <= 1e-6 or len(polys) < 2:
+        return []
+    allv = np.concatenate([np.asarray(p, dtype=float) for p in polys], axis=0)
+    scale = float(np.linalg.norm(allv.max(axis=0) - allv.min(axis=0)))
+    if scale < 1e-12:
+        return []
+    bridges = []
+    for jn in _find_junctions(polys, tol=scale * 1e-6):
+        b = _build_joint_bridge(jn, polys, frac, samples)
+        if b is not None:
+            bridges.append(b)
+    return bridges
+
+
+def _segments_cross(p1, p2, p3, p4) -> np.ndarray:
+    """Vectorized proper-crossing test for segments p1p2 vs p3p4. (K,2) inputs."""
+    def cz(a, b, c):  # z of (b-a) x (c-a)
+        return (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - \
+               (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    d1, d2 = cz(p3, p4, p1), cz(p3, p4, p2)
+    d3, d4 = cz(p1, p2, p3), cz(p1, p2, p4)
+    return (d1 * d2 < 0) & (d3 * d4 < 0)
+
+
+def _quad_fixed_lead_edge(A, B, C, D) -> np.ndarray:
+    """Order quad corners as [A, B, ?, ?] keeping A-B adjacent and simple.
+
+    A, B, C, D are (K, 2). The lead edge A->B is preserved; the remaining
+    pair (C, D) is placed as (C, D) unless that self-intersects, in which
+    case it is swapped to (D, C).
+
+    When the lead edge A-B itself crosses the segment C-D (C and D lie on
+    opposite sides of A-B), no simple quad can keep A-B as an edge -- this
+    happens only at extreme wing rotations. There we fall back to a plain
+    CCW ordering so the polygon is at least simple. Returns (K, 4, 2).
+    """
+    swap = _segments_cross(B, C, D, A)           # connecting edges cross -> swap C/D
+    order = np.where(swap[:, None, None],
+                     np.stack([A, B, D, C], axis=1),
+                     np.stack([A, B, C, D], axis=1))
+    degenerate = _segments_cross(A, B, C, D)     # A-B crosses C-D: no A-B-edge quad
+    if np.any(degenerate):
+        ccw = _order_ccw(np.stack([A, B, C, D], axis=1))
+        order = np.where(degenerate[:, None, None], ccw, order)
+    return order
 
 
 def _triangle_at(geom: "TilingGeometry", xy) -> int:
@@ -296,7 +416,7 @@ def _build_link_indexing(
 
     Each shared edge contributes two link polygons (one per endpoint).
     Returns (link_tri_m, link_tri_n, link_ti_m, link_ti_n,
-             link_slot_m, link_slot_n).
+            link_slot_m, link_slot_n).
     """
     tri_m, tri_n, ti_m, ti_n, slot_m, slot_n = [], [], [], [], [], []
     M = len(tri)
@@ -360,9 +480,9 @@ def compute_wings(
     Returns:
         T:     (M, 3, 2)        -- inner-triangle vertices (unaffected by theta)
         wings: (M, 3, 3, 2)     -- (triangle, T_index, point_in_wing, xy)
-                                   point_in_wing order: [foot_a, P_i, foot_b].
-                                   Together with T_i these form the quad
-                                   (T_i, foot_a, P_i, foot_b) traversed in order.
+                                point_in_wing order: [foot_a, P_i, foot_b].
+                                Together with T_i these form the quad
+                                (T_i, foot_a, P_i, foot_b) traversed in order.
     """
     T = compute_T(geom, c)
     feet = compute_feet(geom, T)
@@ -388,40 +508,50 @@ def compute_links(
 ) -> np.ndarray:
     """Hexagons that join inner triangles across each shared Delaunay edge.
 
-    For each shared edge between adjacent triangles m and n, two link
-    hexagons are produced (one at each endpoint of the shared edge). Each
-    hexagon's six corners are:
+    For each shared edge between adjacent triangles m and n, two link hexagons
+    are produced (one at each endpoint of the shared edge). Corner order:
 
-        T_m, foot_m, P_m   (from triangle m: inner-T, its foot, shared vertex)
-        T_n, foot_n, P_n   (from triangle n: inner-T, its foot, shared vertex)
+        [T_m, F_m, P_m, P_n, F_n, T_n]
 
     where T_m / T_n are the inner-triangle vertices at the shared endpoint,
-    foot_m / foot_n are the wing-corner feet of those T's on the shared edge,
-    and P_m / P_n are the two (rotated) copies of the shared vertex -- one in
-    each triangle's wing. At theta = 0 the two P copies coincide, so the
-    hexagon degenerates to a pentagon; as theta opens the wings, P_m and P_n
-    separate and the full hexagon appears.
-
-    The six corners are reordered CCW about their centroid (`_order_ccw`) so
-    the hexagon is always a simple polygon -- the natural corner order can
-    otherwise cross itself and fill as a "bowtie".
+    P_m / P_n are the two (rotated) copies of the shared vertex, and F_m / F_n
+    are each T's wing foot on the NON-shared edge (the wing's other foot). This
+    hexagon is exactly the union of the two junction wings and the inner-vertex
+    link, so it lets us drop those green junction wings and draw a single
+    purple panel. The closing edge T_n -> T_m joins the two inner-triangle
+    vertices DIRECTLY; the P_m -> P_n side is the shared vertex, which splits
+    open as theta rotates the wings (at theta = 0 the P copies coincide).
 
     Returns: (K, 6, 2) where K = 2 * (number of shared edges).
-             Empty array of shape (0, 6, 2) when there are no shared edges
-             (e.g., a single-triangle Delaunay).
+            Empty array of shape (0, 6, 2) when there are no shared edges.
     """
     T, wings = compute_wings(geom, c, theta)
     K = len(geom.link_tri_m)
     if K == 0:
         return np.zeros((0, 6, 2))
-    T_m    = T[geom.link_tri_m, geom.link_ti_m]                     # (K, 2)
-    T_n    = T[geom.link_tri_n, geom.link_ti_n]
-    foot_m = wings[geom.link_tri_m, geom.link_ti_m, geom.link_slot_m]
-    foot_n = wings[geom.link_tri_n, geom.link_ti_n, geom.link_slot_n]
-    P_m    = wings[geom.link_tri_m, geom.link_ti_m, 1]             # shared vertex in m's wing
-    P_n    = wings[geom.link_tri_n, geom.link_ti_n, 1]             # shared vertex in n's wing
-    hexa = np.stack([T_m, foot_m, P_m, P_n, foot_n, T_n], axis=1)  # (K, 6, 2)
-    return _order_ccw(hexa)
+    T_m = T[geom.link_tri_m, geom.link_ti_m]                       # (K, 2)
+    T_n = T[geom.link_tri_n, geom.link_ti_n]
+    P_m = wings[geom.link_tri_m, geom.link_ti_m, 1]               # shared vertex in m's wing
+    P_n = wings[geom.link_tri_n, geom.link_ti_n, 1]               # shared vertex in n's wing
+    # Non-shared-edge foot = the wing's OTHER foot (slots are 0 and 2).
+    ns_m = 2 - geom.link_slot_m
+    ns_n = 2 - geom.link_slot_n
+    F_m = wings[geom.link_tri_m, geom.link_ti_m, ns_m]
+    F_n = wings[geom.link_tri_n, geom.link_ti_n, ns_n]
+    return np.stack([T_m, F_m, P_m, P_n, F_n, T_n], axis=1)       # (K, 6, 2)
+
+
+def junction_wing_mask(geom: TilingGeometry) -> np.ndarray:
+    """Boolean (M, 3): True where a wing sits at a shared-edge endpoint.
+
+    These "junction wings" are absorbed into the link hexagons, so the viewer
+    skips drawing them. Wings at boundary corners (no shared edge) stay False.
+    """
+    mask = np.zeros((len(geom.triangles), 3), dtype=bool)
+    if len(geom.link_tri_m):
+        mask[geom.link_tri_m, geom.link_ti_m] = True
+        mask[geom.link_tri_n, geom.link_ti_n] = True
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -435,23 +565,26 @@ def show(
     """Open an interactive matplotlib window.
 
     Sliders:
-      * c     -- global shrink factor.
-      * theta -- wing rotation (kirigami joint angle), in degrees.
-      * spin  -- rigid rotation of the WHOLE structure in world space
-                 (about the centroid of the points), in degrees.
+    * c      -- global shrink factor.
+    * theta  -- wing rotation (kirigami joint angle), in degrees.
+    * spin   -- rigid rotation of the WHOLE structure in world space
+                (about the centroid of the points), in degrees.
+    * fillet -- joint smoothing (0 = none, 1 = max): adds a quadratic-Bezier
+                bridge panel at each joint (where >=2 pieces meet at a point --
+                the T hinges, feet, and shared vertices) to weld them smoothly.
 
     Radio buttons:
-      * anchor -- point the T's shrink toward: "incenter" or "centroid".
+    * anchor -- point the T's shrink toward: "incenter" or "centroid".
 
     Mouse (hold a modifier and click on the main plot):
-      * Shift-click a triangle -> select it; the c slider then edits only
+    * Shift-click a triangle -> select it; the c slider then edits only
         that triangle's c. Shift-click empty space to deselect.
-      * Ctrl-click-drag a point -> move it; re-triangulates live.
-      * Alt-click -> add a new point at the cursor.
+    * Ctrl-click-drag a point -> move it; re-triangulates live.
+    * Alt-click -> add a new point at the cursor.
 
     Keys:
-      * c -> print the current spun coordinates (points, T's, wings, links)
-             to the console.
+    * c -> print the current spun coordinates (points, T's, wings, links)
+            to the console.
 
     Re-triangulating (moving or adding a point) resets any per-triangle c
     overrides, because triangle indices are not stable across triangulations.
@@ -475,7 +608,7 @@ def show(
 
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.set_aspect("equal")
-    plt.subplots_adjust(bottom=0.22, left=0.16)
+    plt.subplots_adjust(bottom=0.26, left=0.16)
 
     outer_lc = LineCollection(
         [], colors="lightgray", linewidths=0.7, linestyles="--", zorder=1,
@@ -496,6 +629,12 @@ def show(
         [], facecolors="#bcd7f0", edgecolors="#1f77b4",
         linewidths=1.2, zorder=4,
     )
+    # Bezier "bridge" panels that weld the joints (where >=2 pieces meet at a
+    # point). Drawn on top so the smoothed joints are visible.
+    joint_pc = PolyCollection(
+        [], facecolors="#e9c46a", edgecolors="#b8860b",
+        linewidths=0.8, alpha=0.85, zorder=5,
+    )
     init_bbox = Rectangle(
         (0, 0), 0, 0, fill=False,
         edgecolor="#888888", linewidth=1.0, linestyle="--", zorder=7,
@@ -509,6 +648,7 @@ def show(
     ax.add_collection(wing_pc)
     ax.add_collection(link_pc)
     ax.add_collection(inner_pc)
+    ax.add_collection(joint_pc)
     pts_scatter = ax.scatter([], [], s=25, c="black", zorder=6)
     title = ax.set_title("")
 
@@ -570,10 +710,18 @@ def show(
         T0s, w0s = spin_apply(T0), spin_apply(w0)
         links = spin_apply(compute_links(geom, c, theta))
 
-        inner_pc.set_verts(list(Ts))
-        quads = np.concatenate([Ts[:, :, None, :], ws], axis=2)
-        wing_pc.set_verts(list(quads.reshape(-1, 4, 2)))
-        link_pc.set_verts(list(links))
+        # Sharp panels, then Bezier bridges welding the joints between them.
+        # Junction wings are absorbed into the link hexagons, so skip drawing them.
+        ffrac = s_fillet.val
+        quads = np.concatenate([Ts[:, :, None, :], ws], axis=2).reshape(-1, 4, 2)
+        keep_wing = ~junction_wing_mask(geom).reshape(-1)
+        inner_list = list(Ts)
+        wing_list = [q for q, k in zip(quads, keep_wing) if k]
+        link_list = list(links)
+        inner_pc.set_verts(inner_list)
+        wing_pc.set_verts(wing_list)
+        link_pc.set_verts(link_list)
+        joint_pc.set_verts(build_joint_bridges(inner_list + wing_list + link_list, ffrac))
 
         mn0, mx0 = _aabb(T0s, w0s)
         mnR, mxR = _aabb(Ts, ws)
@@ -593,8 +741,8 @@ def show(
         else:
             ctxt = f"c[tri {sel}] = {effective_c()[sel]:.3f}"
         title.set_text(
-            f"{ctxt},  theta = {np.degrees(theta):5.1f},  spin = {s_spin.val:5.1f} deg"
-            f"   Δ {dw:+.1f}% / {dh:+.1f}%{ratio}"
+            f"{ctxt},  theta = {np.degrees(theta):5.1f},  spin = {s_spin.val:5.1f} deg,"
+            f"  fillet = {ffrac:.2f}   Δ {dw:+.1f}% / {dh:+.1f}%{ratio}"
         )
         refresh_static()
         fig.canvas.draw_idle()
@@ -613,12 +761,14 @@ def show(
         return True
 
     # ---- sliders -----------------------------------------------------------
-    ax_c    = plt.axes([0.25, 0.13, 0.6, 0.03])
-    ax_th   = plt.axes([0.25, 0.08, 0.6, 0.03])
-    ax_spin = plt.axes([0.25, 0.03, 0.6, 0.03])
-    s_c    = Slider(ax_c,    "c",           0.0,    1.0,   valinit=c_init)
-    s_th   = Slider(ax_th,   "theta (deg)", -180.0, 180.0, valinit=np.degrees(theta_init))
-    s_spin = Slider(ax_spin, "spin (deg)",  -180.0, 180.0, valinit=0.0)
+    ax_c      = plt.axes([0.25, 0.175, 0.6, 0.025])
+    ax_th     = plt.axes([0.25, 0.130, 0.6, 0.025])
+    ax_spin   = plt.axes([0.25, 0.085, 0.6, 0.025])
+    ax_fillet = plt.axes([0.25, 0.040, 0.6, 0.025])
+    s_c      = Slider(ax_c,      "c",           0.0,    1.0,   valinit=c_init)
+    s_th     = Slider(ax_th,     "theta (deg)", -180.0, 180.0, valinit=np.degrees(theta_init))
+    s_spin   = Slider(ax_spin,   "spin (deg)",  -180.0, 180.0, valinit=0.0)
+    s_fillet = Slider(ax_fillet, "fillet",      0.0,    1.0,   valinit=0.0)
 
     # ---- anchor radio ------------------------------------------------------
     ax_radio = plt.axes([0.005, 0.80, 0.135, 0.13])
@@ -643,6 +793,7 @@ def show(
     s_c.on_changed(on_c)
     s_th.on_changed(lambda _: redraw())
     s_spin.on_changed(lambda _: redraw())
+    s_fillet.on_changed(lambda _: redraw())
 
     # ---- mouse interaction -------------------------------------------------
     def _mods(event):
@@ -694,7 +845,7 @@ def show(
         wings_s, links_s = spin_apply(wings), spin_apply(links)
         print("=" * 64)
         print(f"spin={s_spin.val:.1f} deg  theta={np.degrees(theta):.1f} deg  "
-              f"anchor={state['anchor']}  c_global={state['c_global']:.3f}")
+            f"anchor={state['anchor']}  c_global={state['c_global']:.3f}")
         if state["c_over"]:
             print("  c overrides:", {k: round(v, 3) for k, v in state["c_over"].items()})
         print(f"\npoints ({len(pts_s)}):")
@@ -719,7 +870,8 @@ def show(
     fig.canvas.mpl_connect("key_press_event", on_key)
 
     print("Controls: shift-click triangle = per-tri c | ctrl-drag = move point"
-          " | alt-click = add point | press 'c' = dump spun coords")
+        " | alt-click = add point | fillet slider = smooth joints"
+        " | press 'c' = dump spun coords")
     refresh_static()
     redraw()
     plt.show()
@@ -727,9 +879,9 @@ def show(
 
 if __name__ == "__main__":
     example_points = np.array([
-         [0.0, 0.0],
-         [1.0, 0.0],
-         [2.0, 0.0],
-         [1.73, 1.0]
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [2.0, 0.0],
+        [1.73, 1.0]
     ])
     show(example_points, c_init=0.5)
