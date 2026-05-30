@@ -25,13 +25,25 @@ Given N 2D points (N >= 3):
     wing(T0) = (T0, P001, P0,  P002)
     wing(T1) = (T1, P101, P1,  P112)
     wing(T2) = (T2, P212, P2,  P202)
-    With the kirigami joint angle theta, the THREE non-T corners of each
-    wing rotate rigidly about T_i by theta:
-        (P001, P0, P002)  rotates about T0
-        (P101, P1, P112)  rotates about T1
-        (P212, P2, P202)  rotates about T2
-    T_i and the inner triangle T0-T1-T2 are fixed by theta; only the
-    wing panels move. theta=0 reproduces the original (un-opened) tile.
+    With the kirigami actuation angle theta, every panel pivots about the
+    vertex that connects it to an inner triangle:
+        - Each wing rotates rigidly by +theta about its own T_i.
+        - Each link polygon (the purple panel that joins two inner
+          triangles across a shared Delaunay edge) rotates rigidly by
+          +theta about its T-pivot on the UPSTREAM inner triangle (the
+          BFS-parent side of the dual graph from the chosen root).
+        - The root inner triangle stays fixed at its rest position. Every
+          other inner triangle is TRANSLATED (orientation preserved) so
+          its pivot T-vertex stays attached to its upstream link. Because
+          (T_n_A - T_n_B) = c * (P_A - P_B) = (T_m_A - T_m_B) for the two
+          endpoints A, B of any shared edge with uniform shrink c, both
+          links across the same shared edge agree on the same translation
+          (the auxetic kinematic constraint).
+    The shared Delaunay vertex P between adjacent wings stays a single
+    point at every theta -- it's the kirigami hinge. As a result, wings,
+    inner triangles, and link polygons all keep their REST SHAPES under
+    the whole theta sweep; only their positions change.
+    theta = 0 reproduces the original (un-opened) tile.
 
 The math is fully vectorized over Delaunay triangles. Static geometry
 (vertices, centroids, edge anchors, projection denominators) is built
@@ -289,6 +301,68 @@ def _anchor_points(P: np.ndarray, anchor: str = "incenter") -> np.ndarray:
     raise ValueError(f"anchor must be 'centroid' or 'incenter'; got {anchor!r}")
 
 
+def _bfs_propagate(
+    triangles: np.ndarray, neighbors: np.ndarray, T_rest: np.ndarray,
+    theta: float, root: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """BFS from `root` inner triangle; return per-triangle (translation, parent).
+
+    Each Delaunay triangle's inner triangle is TRANSLATED (no rotation) to its
+    world position. The translation is determined by the rigid rotation of the
+    link polygon joining it to its BFS parent: the link rotates by `theta`
+    about the parent-side T-pivot, so the downstream pivot lands at
+
+        T_n_world = T_m_world + R(theta) @ (T_n_rest - T_m_rest)
+        t[n]      = T_n_world - T_n_rest
+                  = t[m] + (R(theta) - I) @ (T_n_rest - T_m_rest)
+
+    With uniform shrink factor `c`, both endpoints A, B of any shared edge
+    yield the same translation -- (T_n_A - T_n_B) = c * (P_A - P_B) =
+    (T_m_A - T_m_B) -- so the kinematics close up and inner triangles keep
+    their orientation (the auxetic constraint). With per-triangle `c`
+    overrides the equality breaks; we pick the first shared-edge endpoint
+    we encounter and the structure is then only approximately rigid.
+
+    For cross-edges in the BFS (cycles in the dual graph) we skip already-
+    visited triangles; under the auxetic constraint the cycle closes
+    automatically, so the BFS tree is enough.
+
+    Returns:
+        t:      (M, 2) translation of each inner triangle (rest -> world)
+        parent: (M,) BFS parent of each triangle (-1 for component roots)
+    """
+    M = len(triangles)
+    t = np.zeros((M, 2))
+    parent = np.full(M, -1, dtype=int)
+    visited = np.zeros(M, dtype=bool)
+    R_th = _rotation_matrix(theta)
+    starts = [root] + [i for i in range(M) if i != root]
+    for start in starts:
+        if visited[start]:
+            continue
+        visited[start] = True
+        queue = [start]
+        while queue:
+            m = queue.pop(0)
+            for kk in range(3):
+                n = int(neighbors[m, kk])
+                if n < 0 or visited[n]:
+                    continue
+                # The scipy edge kk in m corresponds to _SCIPY_TO_MY_EDGE[kk] in our table.
+                # Pick the first endpoint as the propagation pivot (the second endpoint
+                # gives the same translation under the auxetic constraint).
+                my_edge = int(_SCIPY_TO_MY_EDGE[kk])
+                ep_local_m = int(_EDGES[my_edge, 0])
+                global_ep = int(triangles[m, ep_local_m])
+                ep_local_n = int(np.where(triangles[n] == global_ep)[0][0])
+                delta = T_rest[n, ep_local_n] - T_rest[m, ep_local_m]
+                t[n] = t[m] + (R_th @ delta) - delta
+                parent[n] = m
+                visited[n] = True
+                queue.append(n)
+    return t, parent
+
+
 def poisson_ratios(
     init_size: tuple[float, float],
     rot_size: tuple[float, float],
@@ -324,10 +398,14 @@ def construct_triangle_tile(
     """T's and the six foot points for one triangle (named-dict wrapper).
 
     `anchor` selects the point the T's shrink toward ("incenter" or
-    "centroid"). For theta != 0 each foot is rotated about its OWNING T
-    (P001/P002 about T0, P101/P112 about T1, P212/P202 about T2) — the
-    kirigami wing rotation. T_i itself does not move with theta. At
-    theta = 0 the dict is identical to the un-rotated construction.
+    "centroid"). For theta != 0 the inner triangle T0-T1-T2 stays fixed
+    and each wing rotates rigidly about its T_i pivot by theta:
+        (P001, P002)  rotates about T0
+        (P101, P112)  rotates about T1
+        (P212, P202)  rotates about T2
+    A single isolated triangle has no link polygons, so BFS propagation is
+    trivial -- this matches the multi-triangle compute_wings on a tile
+    that happens to be the BFS root.
     """
     P = np.stack([P0, P1, P2])
     C = _anchor_points(P, anchor)
@@ -473,72 +551,245 @@ def compute_feet(geom: TilingGeometry, T: np.ndarray) -> np.ndarray:
 
 
 def compute_wings(
-    geom: TilingGeometry, c: float, theta: float = 0.0,
+    geom: TilingGeometry, c: float, theta: float = 0.0, root: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Wings rotated about each T_i by theta.
+    """Inner triangles (translated) and wings (rotated about T_i) for rigid kirigami.
+
+    Every wing rotates by +theta about its OWN T_i (the vertex of its inner
+    triangle that anchors it). Inner triangles translate but do not rotate;
+    `_bfs_propagate` walks the dual graph from `root` and computes each
+    triangle's translation from the rigid rotation of its parent link. The
+    root inner triangle stays fixed.
+
+    The shared Delaunay vertex P between two wings (one in tile m, one in
+    tile n) stays a single point at every theta -- the wing rotations and
+    the link rotation agree on its world position by construction.
 
     Returns:
-        T:     (M, 3, 2)        -- inner-triangle vertices (unaffected by theta)
+        T:     (M, 3, 2)        -- inner-triangle vertices in world space
+                                   (root tile at rest; others translated).
         wings: (M, 3, 3, 2)     -- (triangle, T_index, point_in_wing, xy)
-                                point_in_wing order: [foot_a, P_i, foot_b].
-                                Together with T_i these form the quad
-                                (T_i, foot_a, P_i, foot_b) traversed in order.
+                                   point_in_wing order: [foot_a, P_i, foot_b].
+                                   Together with T_i these form the quad
+                                   (T_i, foot_a, P_i, foot_b) traversed in order.
     """
-    T = compute_T(geom, c)
-    feet = compute_feet(geom, T)
+    T_rest = compute_T(geom, c)
+    feet = compute_feet(geom, T_rest)
     foot_a = feet[:, _WING_FOOT_A, :]                       # (M, 3, 2)
     foot_b = feet[:, _WING_FOOT_B, :]                       # (M, 3, 2)
-    wings = np.stack([foot_a, geom.P, foot_b], axis=2)      # (M, 3, 3, 2)
+    wings_rest = np.stack([foot_a, geom.P, foot_b], axis=2) # (M, 3, 3, 2)
     if theta == 0.0:
-        return T, wings
+        return T_rest, wings_rest
+    t, _ = _bfs_propagate(geom.triangles, geom.neighbors, T_rest, theta, root)
+    T_world = T_rest + t[:, None, :]                        # (M, 3, 2)
     R = _rotation_matrix(theta)
-    pivot = T[:, :, None, :]                                # (M, 3, 1, 2)
-    return T, pivot + (wings - pivot) @ R.T
+    pivot_rest  = T_rest[:, :, None, :]                     # (M, 3, 1, 2)
+    pivot_world = T_world[:, :, None, :]                    # (M, 3, 1, 2)
+    return T_world, pivot_world + (wings_rest - pivot_rest) @ R.T
 
 
 def tile_state(
-    geom: TilingGeometry, c: float, theta: float = 0.0,
+    geom: TilingGeometry, c: float, theta: float = 0.0, root: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """One-shot (T, wings) evaluation. See compute_wings for shapes."""
-    return compute_wings(geom, c, theta)
+    return compute_wings(geom, c, theta, root)
+
+
+def _feet_rest_index(T_local: int, edge_local: int) -> int | None:
+    """Index into compute_feet's (M, 6, 2) of the foot at (T_local, edge_local)."""
+    for fi in range(6):
+        if int(_T_FOR_FOOT[fi]) == T_local and int(_EDGE_FOR_FOOT[fi]) == edge_local:
+            return fi
+    return None
+
+
+def _other_adjacent_edge(T_local: int, this_edge: int) -> int:
+    """The edge (other than `this_edge`) of the local triangle that contains T_local."""
+    for e in range(3):
+        if e == this_edge:
+            continue
+        if T_local in _EDGES[e].tolist():
+            return e
+    raise ValueError(f"no other edge contains T={T_local} besides {this_edge}")
 
 
 def compute_links(
-    geom: TilingGeometry, c: float, theta: float = 0.0,
-) -> np.ndarray:
-    """Hexagons that join inner triangles across each shared Delaunay edge.
+    geom: TilingGeometry, c: float, theta: float = 0.0, root: int = 0,
+) -> list[np.ndarray]:
+    """Rigid joint polygons at every Delaunay vertex shared by K >= 2 inner triangles.
 
-    For each shared edge between adjacent triangles m and n, two link hexagons
-    are produced (one at each endpoint of the shared edge). Corner order:
+    For each shared Delaunay vertex v, the K incident inner triangles are
+    ordered angularly around v and ONE polygon is built that walks the joint
+    perimeter:
 
-        [T_m, F_m, P_m, P_n, F_n, T_n]
+    - K == 2 (two triangles share a single Delaunay edge meeting at v):
+      6 corners [T_m, F_m_non_shared, P_m, P_n, F_n_non_shared, T_n].
+      F_m / F_n are the non-shared-edge feet (the wing's "other" foot at v);
+      P_m and P_n are the shared vertex v, coincident in both wings at all
+      theta (the kirigami hinge -- one zero-length edge).
 
-    where T_m / T_n are the inner-triangle vertices at the shared endpoint,
-    P_m / P_n are the two (rotated) copies of the shared vertex, and F_m / F_n
-    are each T's wing foot on the NON-shared edge (the wing's other foot). This
-    hexagon is exactly the union of the two junction wings and the inner-vertex
-    link, so it lets us drop those green junction wings and draw a single
-    purple panel. The closing edge T_n -> T_m joins the two inner-triangle
-    vertices DIRECTLY; the P_m -> P_n side is the shared vertex, which splits
-    open as theta rotates the wings (at theta = 0 the P copies coincide).
+    - K >= 3 INTERIOR (closed cycle around v, no boundary edges):
+      K corners [T_0, T_1, ..., T_{K-1}] -- just the inner-triangle T's
+      connected directly in angular order around v. Triangle (K=3),
+      quadrilateral (K=4), pentagon (K=5), hexagon (K=6), etc. No legs,
+      no central P -- this is the convex K-gon spanning the joint T's.
 
-    Returns: (K, 6, 2) where K = 2 * (number of shared edges).
-            Empty array of shape (0, 6, 2) when there are no shared edges.
+    - K >= 3 BOUNDARY (v lies on the convex hull, fan with open ends):
+      K + 3 corners [T_0, T_1, ..., T_{K-1}, outer_last, P, outer_first].
+      K T's + 2 outer-edge feet (one for each fan-end wing) + 1 central P.
+      Consecutive T's are connected directly; the polygon then descends to
+      the convex-hull vertex P along the CCW-side boundary edge and rises
+      back along the CW-side boundary edge. Hexagon for K = 3 (3 reds +
+      2 oranges + 1 yellow in the annotated UI), heptagon for K = 4, etc.
+
+    Each polygon is RIGID under the auxetic constraint: every corner is
+    obtained by rotating its rest position about the first incident T
+    (the chosen pivot) by `theta` and translating by that pivot's
+    BFS-propagated displacement. Wing feet rigid with wing 0 (the pivot)
+    follow directly; wing feet rigid with wing k (k > 0) match by the
+    auxetic identity t_k = (R(theta) - I)(T_k_rest - T_0_rest), which
+    folds the wing-k rotation into the same single rigid transform.
+
+    Returns a LIST of (P, 2) arrays -- one polygon per joint vertex. The
+    polygon size P varies with K (6 for K = 2, 2K for K >= 3).
     """
-    T, wings = compute_wings(geom, c, theta)
-    K = len(geom.link_tri_m)
-    if K == 0:
-        return np.zeros((0, 6, 2))
-    T_m = T[geom.link_tri_m, geom.link_ti_m]                       # (K, 2)
-    T_n = T[geom.link_tri_n, geom.link_ti_n]
-    P_m = wings[geom.link_tri_m, geom.link_ti_m, 1]               # shared vertex in m's wing
-    P_n = wings[geom.link_tri_n, geom.link_ti_n, 1]               # shared vertex in n's wing
-    # Non-shared-edge foot = the wing's OTHER foot (slots are 0 and 2).
-    ns_m = 2 - geom.link_slot_m
-    ns_n = 2 - geom.link_slot_n
-    F_m = wings[geom.link_tri_m, geom.link_ti_m, ns_m]
-    F_n = wings[geom.link_tri_n, geom.link_ti_n, ns_n]
-    return np.stack([T_m, F_m, P_m, P_n, F_n, T_n], axis=1)       # (K, 6, 2)
+    from collections import defaultdict
+
+    T_rest = compute_T(geom, c)
+    feet_rest = compute_feet(geom, T_rest)
+
+    # Vertex -> [(triangle_index, local_T_index_in_that_triangle), ...]
+    incidence: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for m, tri in enumerate(geom.triangles):
+        for li in range(3):
+            incidence[int(tri[li])].append((m, li))
+
+    if theta == 0.0:
+        t = np.zeros((len(geom.triangles), 2))
+    else:
+        t, _ = _bfs_propagate(
+            geom.triangles, geom.neighbors, T_rest, theta, root,
+        )
+    T_world = T_rest + t[:, None, :]
+    R = _rotation_matrix(theta) if theta != 0.0 else np.eye(2)
+
+    polygons: list[np.ndarray] = []
+    for v, incs in incidence.items():
+        K = len(incs)
+        if K < 2:
+            continue
+        v_pos = np.asarray(geom.points[v], dtype=float)
+
+        # Order incidences angularly around v (CCW at rest).
+        angles = np.array([
+            np.arctan2(
+                T_rest[m, li, 1] - v_pos[1],
+                T_rest[m, li, 0] - v_pos[0],
+            )
+            for (m, li) in incs
+        ])
+        incs_ord = [incs[i] for i in np.argsort(angles)]
+
+        # Is `v` a boundary (convex-hull) vertex? -- True iff any incident
+        # triangle has a Delaunay edge at `v` with no neighbour across it.
+        is_boundary_v = any(
+            int(geom.neighbors[m, k]) == -1
+            for (m, li) in incs
+            for k in range(3)
+            if k != li
+        )
+
+        if K == 2:
+            # Existing 6-corner formula: 2 T's + 2 outer-edge feet + P twice
+            # (kirigami hinge). At a K=2 vertex the two adjacent edges of each
+            # wing are exactly one shared edge + one boundary edge, so the
+            # "non-shared" foot IS the outer-edge foot.
+            (m_, li_m), (n_, li_n) = incs_ord
+            kk_m = next(
+                (kk for kk in range(3) if int(geom.neighbors[m_, kk]) == n_),
+                None,
+            )
+            kk_n = next(
+                (kk for kk in range(3) if int(geom.neighbors[n_, kk]) == m_),
+                None,
+            )
+            if kk_m is None or kk_n is None:
+                # Triangles share v but not an edge (rare, e.g. fan boundary).
+                continue
+            my_edge_m = int(_SCIPY_TO_MY_EDGE[kk_m])
+            my_edge_n = int(_SCIPY_TO_MY_EDGE[kk_n])
+            ns_edge_m = _other_adjacent_edge(li_m, my_edge_m)
+            ns_edge_n = _other_adjacent_edge(li_n, my_edge_n)
+            fi_m = _feet_rest_index(li_m, ns_edge_m)
+            fi_n = _feet_rest_index(li_n, ns_edge_n)
+            corners_rest = np.stack([
+                T_rest[m_, li_m],
+                feet_rest[m_, fi_m],
+                v_pos,
+                v_pos,
+                feet_rest[n_, fi_n],
+                T_rest[n_, li_n],
+            ])
+        elif is_boundary_v:
+            # K >= 3 BOUNDARY fan: K T's + 2 outer-edge feet (one at each fan
+            # end) + 1 central P  ==  K + 3 corners.
+            #
+            # [T_0, T_1, ..., T_{K-1}, outer_foot_last, P, outer_foot_first]
+            #
+            # Consecutive T's are connected DIRECTLY along the inner triangle
+            # edges of their adjoining wings (no shared-edge leg corner). The
+            # polygon then "drops down" along the CCW-side boundary edge to
+            # the convex-hull vertex P, and back up along the CW-side boundary
+            # edge to T_0 -- matching the maroon-outline hexagon (3 red T's,
+            # 2 orange outer-edge feet, 1 yellow P).
+            m_first, li_first = incs_ord[0]
+            m_last, li_last = incs_ord[K - 1]
+            bk_first = next(
+                (k for k in range(3)
+                 if k != li_first and int(geom.neighbors[m_first, k]) == -1),
+                None,
+            )
+            bk_last = next(
+                (k for k in range(3)
+                 if k != li_last and int(geom.neighbors[m_last, k]) == -1),
+                None,
+            )
+            if bk_first is None or bk_last is None:
+                # Could not identify both fan-end boundary edges; skip.
+                continue
+            my_edge_first = int(_SCIPY_TO_MY_EDGE[bk_first])
+            my_edge_last = int(_SCIPY_TO_MY_EDGE[bk_last])
+            fi_first = _feet_rest_index(li_first, my_edge_first)
+            fi_last = _feet_rest_index(li_last, my_edge_last)
+            if fi_first is None or fi_last is None:
+                continue
+            outer_foot_first = feet_rest[m_first, fi_first]
+            outer_foot_last = feet_rest[m_last, fi_last]
+            corners_list = [T_rest[m, li] for (m, li) in incs_ord]
+            corners_list.append(outer_foot_last)
+            corners_list.append(v_pos)
+            corners_list.append(outer_foot_first)
+            corners_rest = np.stack(corners_list)
+        else:
+            # K >= 3 INTERIOR cyclic: just connect the K inner-triangle T's
+            # directly in angular order around v. K corners total -- a
+            # triangle (K=3), quadrilateral (K=4), pentagon (K=5), hexagon
+            # (K=6), etc. No central P, no shared-edge legs -- the polygon
+            # is the convex K-gon spanning the joint T's, matching the
+            # yellow-outlined K-gon in the annotated UI.
+            corners_list = [T_rest[m, li] for (m, li) in incs_ord]
+            corners_rest = np.stack(corners_list)
+
+        # Rigid rotation about the first incident T (auxetic constraint
+        # guarantees all corners ride along consistently, regardless of
+        # which wing they're individually rigid with).
+        m_root, li_root = incs_ord[0]
+        pivot_rest = T_rest[m_root, li_root]
+        pivot_world = T_world[m_root, li_root]
+        rel = corners_rest - pivot_rest
+        polygons.append(pivot_world + rel @ R.T)
+
+    return polygons
 
 
 def junction_wing_mask(geom: TilingGeometry) -> np.ndarray:
@@ -566,7 +817,12 @@ def show(
 
     Sliders:
     * c      -- global shrink factor.
-    * theta  -- wing rotation (kirigami joint angle), in degrees.
+    * theta  -- kirigami actuation angle, in degrees. Every wing rotates
+                by +theta about its T_i pivot; every link polygon rotates
+                rigidly by +theta about its pivot on the upstream inner
+                triangle (BFS parent side). The root inner triangle stays
+                fixed; other inner triangles translate (orientation
+                preserved) so the rigid links stay attached.
     * spin   -- rigid rotation of the WHOLE structure in world space
                 (about the centroid of the points), in degrees.
     * fillet -- joint smoothing (0 = none, 1 = max): adds a quadratic-Bezier
@@ -578,7 +834,9 @@ def show(
 
     Mouse (hold a modifier and click on the main plot):
     * Shift-click a triangle -> select it; the c slider then edits only
-        that triangle's c. Shift-click empty space to deselect.
+        that triangle's c, AND that triangle becomes the BFS root that
+        stays fixed during the theta sweep. Shift-click empty space to
+        deselect (root falls back to triangle 0).
     * Ctrl-click-drag a point -> move it; re-triangulates live.
     * Alt-click -> add a new point at the cursor.
 
@@ -668,6 +926,14 @@ def show(
                 arr[i] = cv
         return arr
 
+    def current_root() -> int:
+        """Selected triangle becomes the BFS root; default 0."""
+        sel = state["sel_tri"]
+        M = len(state["geom"].triangles)
+        if sel is None or not (0 <= sel < M):
+            return 0
+        return int(sel)
+
     def spin_apply(arr):
         """Rigidly rotate coords about the structure centre by the spin angle."""
         a = np.asarray(arr, dtype=float)
@@ -703,21 +969,24 @@ def show(
         geom = state["geom"]
         theta = np.radians(s_th.val)
         c = effective_c()
-        T, wings = tile_state(geom, c, theta)
-        T0, w0 = (T, wings) if theta == 0.0 else tile_state(geom, c, 0.0)
+        root = current_root()
+        T, wings = tile_state(geom, c, theta, root)
+        T0, w0 = (T, wings) if theta == 0.0 else tile_state(geom, c, 0.0, root)
 
         Ts, ws = spin_apply(T), spin_apply(wings)
         T0s, w0s = spin_apply(T0), spin_apply(w0)
-        links = spin_apply(compute_links(geom, c, theta))
+        # compute_links now returns a list of per-vertex joint polygons with
+        # variable corner counts (6 for K=2 vertices, 2K for K>=3 vertices),
+        # so apply spin per-polygon.
+        link_list = [spin_apply(p) for p in compute_links(geom, c, theta, root)]
 
         # Sharp panels, then Bezier bridges welding the joints between them.
-        # Junction wings are absorbed into the link hexagons, so skip drawing them.
+        # Junction wings are absorbed into the joint polygons, so skip drawing them.
         ffrac = s_fillet.val
         quads = np.concatenate([Ts[:, :, None, :], ws], axis=2).reshape(-1, 4, 2)
         keep_wing = ~junction_wing_mask(geom).reshape(-1)
         inner_list = list(Ts)
         wing_list = [q for q, k in zip(quads, keep_wing) if k]
-        link_list = list(links)
         inner_pc.set_verts(inner_list)
         wing_pc.set_verts(wing_list)
         link_pc.set_verts(link_list)
@@ -742,7 +1011,8 @@ def show(
             ctxt = f"c[tri {sel}] = {effective_c()[sel]:.3f}"
         title.set_text(
             f"{ctxt},  theta = {np.degrees(theta):5.1f},  spin = {s_spin.val:5.1f} deg,"
-            f"  fillet = {ffrac:.2f}   Δ {dw:+.1f}% / {dh:+.1f}%{ratio}"
+            f"  fillet = {ffrac:.2f},  root = {root}"
+            f"   Δ {dw:+.1f}% / {dh:+.1f}%{ratio}"
         )
         refresh_static()
         fig.canvas.draw_idle()
@@ -839,13 +1109,14 @@ def show(
         geom = state["geom"]
         theta = np.radians(s_th.val)
         c = effective_c()
-        T, wings = tile_state(geom, c, theta)
-        links = compute_links(geom, c, theta)
+        root = current_root()
+        T, wings = tile_state(geom, c, theta, root)
+        links_s = [spin_apply(p) for p in compute_links(geom, c, theta, root)]
         pts_s, T_s = spin_apply(state["pts"]), spin_apply(T)
-        wings_s, links_s = spin_apply(wings), spin_apply(links)
+        wings_s = spin_apply(wings)
         print("=" * 64)
         print(f"spin={s_spin.val:.1f} deg  theta={np.degrees(theta):.1f} deg  "
-            f"anchor={state['anchor']}  c_global={state['c_global']:.3f}")
+            f"anchor={state['anchor']}  c_global={state['c_global']:.3f}  root={root}")
         if state["c_over"]:
             print("  c overrides:", {k: round(v, 3) for k, v in state["c_over"].items()})
         print(f"\npoints ({len(pts_s)}):")
@@ -859,9 +1130,9 @@ def show(
             for j in range(3):
                 quad = np.vstack([T_s[i, j], wings_s[i, j]])
                 print(f"  tri{i} wing{j}: {np.round(quad, 4).tolist()}")
-        print(f"\nlinks ({len(links_s)} hexagons):")
+        print(f"\nlinks ({len(links_s)} joint polygons):")
         for i, h in enumerate(links_s):
-            print(f"  link{i}: {np.round(h, 4).tolist()}")
+            print(f"  link{i} ({len(h)} corners): {np.round(h, 4).tolist()}")
         print("=" * 64)
 
     fig.canvas.mpl_connect("button_press_event", on_press)
