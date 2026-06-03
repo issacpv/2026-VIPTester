@@ -1011,8 +1011,6 @@ def show(
             ctxt = f"c[tri {sel}] = {effective_c()[sel]:.3f}"
         title.set_text(
             f"{ctxt},  theta = {np.degrees(theta):5.1f},  spin = {s_spin.val:5.1f} deg,"
-            f"  fillet = {ffrac:.2f},  root = {root}"
-            f"   Δ {dw:+.1f}% / {dh:+.1f}%{ratio}"
         )
         refresh_static()
         fig.canvas.draw_idle()
@@ -1151,8 +1149,9 @@ def show(
 if __name__ == "__main__":
     example_points = np.array([
         [0.0, 0.0],
-        [1.0, 0.0],
+        [1.0, 1.73],
         [2.0, 0.0],
-        [1.73, 1.0]
+        [3.0, 1.73],
+        [4.0, 0.0]
     ])
     show(example_points, c_init=0.5)
