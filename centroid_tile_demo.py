@@ -162,54 +162,66 @@ def _find_junctions(polys, tol: float) -> list:
 
 
 def _build_joint_bridge(junction, polys, d: float, samples: int = 10,
-                        far_is_junction=None):
+                        n_inner: int = 0):
     """Bezier 'flower' that welds the pieces meeting at one junction.
 
-    Per-corner fillet construction. For every edge of every participating
-    polygon that ends at the junction, back off from the junction centre toward
-    that edge's far endpoint by the fillet fraction `d`, with a per-edge cap:
+    Uniform-radius fillet. Every arm leaving the joint centre backs off by the
+    SAME distance
 
-        D = center + cap * d * (vertex - center)
+        radius = d * min(0.5 * shortest_leg, 0.25 * shortest_inner_edge)
 
-    `cap = 0.5` when the far endpoint is ANOTHER junction -- a T-to-T edge
-    between two inner-triangle corners -- so the reach stops at the edge
-    MIDPOINT (M01) and the two corners' fillets meet there cleanly. `cap = 1.0`
-    when the far endpoint is not a junction -- a foot point such as P001 -- so
-    the arm reaches the FULL point. `far_is_junction(point) -> bool` supplies
-    that test (everything is treated as full reach if it is None). d = 1 lands
-    on the midpoint / the foot; d = 0 collapses every arm onto the centre.
+    so the back-off points sit on a circle around the corner and the resulting
+    Bezier flower is symmetric. The two bounds, whichever is smaller:
+
+    * 0.5 * shortest_leg -- half the shortest arm of any kind at the joint, i.e.
+      the MIDPOINT of the shortest leg. Keeps the flower from overrunning the
+      nearest panel edge (two fillets sharing a leg meet no further than its
+      midpoint).
+    * 0.25 * shortest_inner_edge -- a quarter of the shortest inner-triangle
+      edge incident at this corner. Inner-triangle edges are identified by their
+      source polygon: the first `n_inner` entries of `polys` are the inner
+      triangles, so an arm coming from one of those is a genuine inner-triangle
+      edge (a T-to-T edge of the SAME inner triangle) -- as opposed to a link
+      cross-arm to a NEIGHBOUR's T, which is also T-to-T but is NOT an inner
+      edge. Under the uniform radius each wing-foot arm pairs with one of the
+      corner's two incident inner edges, so the binding value is their shorter.
+
+    `d` in [0, 1] scales the radius: d = 0 collapses every arm onto the centre
+    (a sharp join); larger d grows the flower until it reaches the shortest
+    leg's midpoint or a quarter of the shortest inner edge, whichever comes
+    first.
 
     The back-off points are sorted by angle around the junction and consecutive
     ones are joined by a quadratic Bezier whose control point is the junction
-    centre -- the arc  D_i -> (centre) -> D_{i+1}. This is the
-    M01' -> T0 -> P01' construction applied around the whole joint: each arm's
-    Bezier endpoint is (1 - d) * T0 + d * anchor (anchor = the inner-edge
-    midpoint M01, or the foot point P001), the Bezier is pulled through the
-    shared corner T0, and the straight run from the anchor in to the back-off
-    point is left to the panel itself (the two are colinear). d = 1 reproduces
-    the midpoint-to-foot curve; d = 0 degenerates to the single joint point (a
-    sharp connection). Returns (P, 2) or None.
+    centre -- the arc D_i -> (centre) -> D_{i+1}. Returns (P, 2) or None.
     """
     center = np.mean([c[2] for c in junction], axis=0)
-    edges = []
+    arms = []                       # (unit_dir, leg_len, angle, is_inner_edge)
     for pi, vi, _ in junction:
         poly = np.asarray(polys[pi], dtype=float)
         n = len(poly)
+        is_inner = pi < n_inner
         for ni in ((vi - 1) % n, (vi + 1) % n):
             vec = poly[ni] - center
             L = float(np.linalg.norm(vec))
             if L > 1e-9:
-                # T-to-T edge (far end is another joint) -> cap at the midpoint;
-                # edge to a foot point (P001) -> reach the full point.
-                cap = 0.5 if (far_is_junction and far_is_junction(poly[ni])) else 1.0
-                edges.append((vec / L, L, float(np.arctan2(vec[1], vec[0])), cap))
-    if len(edges) < 2:
+                arms.append(
+                    (vec / L, L, float(np.arctan2(vec[1], vec[0])), is_inner)
+                )
+    if len(arms) < 2:
         return None
-    edges.sort(key=lambda e: e[2])
-    if d * max(e[1] for e in edges) < 1e-9:
+    arms.sort(key=lambda e: e[2])
+
+    # Uniform back-off radius: the smaller of half the shortest leg and a
+    # quarter of the shortest incident inner-triangle edge, scaled by d.
+    half_leg = 0.5 * min(e[1] for e in arms)
+    inner_lens = [e[1] for e in arms if e[3]]
+    quarter_inner = 0.25 * min(inner_lens) if inner_lens else float("inf")
+    radius = d * min(half_leg, quarter_inner)
+    if radius < 1e-9:
         return None
-    # Reach along each arm = cap * d * L  (cap = 0.5 -> midpoint, 1.0 -> full).
-    backoffs = [center + e[0] * (e[3] * d * e[1]) for e in edges]
+
+    backoffs = [center + e[0] * radius for e in arms]
     pts = []
     for i in range(len(backoffs)):
         bez = _quadratic_bezier(
@@ -219,17 +231,21 @@ def _build_joint_bridge(junction, polys, d: float, samples: int = 10,
     return np.asarray(pts) if len(pts) >= 3 else None
 
 
-def build_joint_bridges(polys, d: float, samples: int = 10) -> list[np.ndarray]:
+def build_joint_bridges(polys, d: float, n_inner: int = 0,
+                        samples: int = 10) -> list[np.ndarray]:
     """Bezier bridge polygons welding every joint where >=2 polygons meet.
 
-    `polys` is the full set of rendered panels (inner triangles + wings +
-    links). `d` in [0, 1] is the fillet parameter. At each joint every incident
-    edge is rounded by a quadratic-Bezier bridge whose control point is the
-    joint corner; the rounded span is scaled by d (d = 0 -> sharp, single-point
-    connection). Each arm is capped by its far endpoint: a T-to-T edge (far end
-    is another joint, e.g. an inner-triangle edge) reaches that edge's MIDPOINT
-    at d = 1, while an edge ending at a non-joint (a foot point such as P001)
-    reaches the FULL point at d = 1. See `_build_joint_bridge`.
+    `polys` is the full set of rendered panels. The FIRST `n_inner` of them must
+    be the inner-triangle polygons (the caller concatenates inner + wings +
+    links in that order); an arm sourced from one of those counts as an
+    inner-triangle edge for the "quarter of the inner triangle" bound, which
+    excludes link cross-arms that are also T-to-T. `d` in [0, 1] is the fillet
+    fraction.
+
+    At each joint every incident arm backs off from the corner by the same
+    radius = d * min(0.5 * shortest leg, 0.25 * shortest inner-triangle edge),
+    and a quadratic-Bezier arc (control point = the corner) joins consecutive
+    back-off points. d = 0 -> sharp single-point join. See `_build_joint_bridge`.
     """
     if d <= 1e-6 or len(polys) < 2:
         return []
@@ -238,21 +254,10 @@ def build_joint_bridges(polys, d: float, samples: int = 10) -> list[np.ndarray]:
     if scale < 1e-12:
         return []
     tol = scale * 1e-6
-    inv = 1.0 / tol
     juncs = _find_junctions(polys, tol)
-    # Every coincident corner in a junction shares the same bucket key, so a
-    # junction is identified by that key. An arm whose far endpoint lands on
-    # another junction is a T-to-T edge (capped at the midpoint); anything else
-    # (a foot point) is reached in full.
-    jkeys = {(int(round(jn[0][2][0] * inv)), int(round(jn[0][2][1] * inv)))
-             for jn in juncs}
-
-    def far_is_junction(pt) -> bool:
-        return (int(round(pt[0] * inv)), int(round(pt[1] * inv))) in jkeys
-
     bridges = []
     for jn in juncs:
-        b = _build_joint_bridge(jn, polys, d, samples, far_is_junction)
+        b = _build_joint_bridge(jn, polys, d, samples, n_inner)
         if b is not None:
             bridges.append(b)
     return bridges
@@ -1013,14 +1018,15 @@ def show(
                 preserved) so the rigid links stay attached.
     * spin   -- rigid rotation of the WHOLE structure in world space
                 (about the centroid of the points), in degrees.
-    * fillet -- joint smoothing parameter d in [0, 1]. At each joint (a T
+    * fillet -- joint smoothing fraction d in [0, 1]. At each joint (a T
                 corner where >=2 pieces meet) the incident edges are rounded by
                 a quadratic-Bezier bridge whose control point is the corner.
-                Each arm is capped by its far end: an inner-triangle (T-to-T)
-                edge reaches that edge's MIDPOINT (M01), while an edge to a foot
-                point reaches the FULL point (P001). d = 0 -> sharp (panels meet
-                at the single joint point); d = 1 -> full midpoint-to-foot
-                curve.
+                Every arm backs off from the corner by the SAME radius
+                d * min(1/2 * shortest leg, 1/4 * shortest inner-triangle edge),
+                whichever bound is smaller -- so the flower is symmetric and
+                never overruns the shortest leg's midpoint or a quarter of the
+                inner triangle. d = 0 -> sharp (panels meet at the single joint
+                point).
 
     Radio buttons:
     * anchor -- point the T's shrink toward: "incenter" or "centroid".
@@ -1188,7 +1194,8 @@ def show(
         inner_pc.set_verts(inner_list)
         wing_pc.set_verts(wing_list)
         link_pc.set_verts(link_list)
-        joint_pc.set_verts(build_joint_bridges(inner_list + wing_list + link_list, d_fillet))
+        joint_pc.set_verts(build_joint_bridges(
+            inner_list + wing_list + link_list, d_fillet, len(inner_list)))
 
         mn0, mx0 = _aabb(T0s, w0s)
         mnR, mxR = _aabb(Ts, ws)
@@ -1312,7 +1319,8 @@ def show(
         inner_list = list(Ts)
         wing_list = [q for q, k in zip(quads, keep_wing) if k]
         link_list = [spin_apply(p) for p in compute_links(geom, c, theta, root)]
-        bridges = build_joint_bridges(inner_list + wing_list + link_list, s_fillet.val)
+        bridges = build_joint_bridges(
+            inner_list + wing_list + link_list, s_fillet.val, len(inner_list))
         polys = inner_list + wing_list + link_list + bridges
         # Slab thickness: 5% of the in-plane bounding-box diagonal.
         allv = np.concatenate([np.asarray(p, float).reshape(-1, 2) for p in polys], axis=0)
