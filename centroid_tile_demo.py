@@ -55,6 +55,9 @@ Run:
 """
 from __future__ import annotations
 
+import os
+import struct
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -158,15 +161,34 @@ def _find_junctions(polys, tol: float) -> list:
     return [cl for cl in buckets.values() if len({c[0] for c in cl}) >= 2]
 
 
-def _build_joint_bridge(junction, polys, frac: float, samples: int = 10):
+def _build_joint_bridge(junction, polys, d: float, samples: int = 10,
+                        far_is_junction=None):
     """Bezier 'flower' that welds the pieces meeting at one junction.
 
-    Reproduces the STL fillet tool's bridge construction: collect every edge
-    of every participating polygon that ends at the junction, back off along
-    it by a radius, sort the back-off points by angle around the junction, and
-    join consecutive ones with a quadratic Bezier whose control point is the
-    junction centre. The control point pulls each arc toward the joint, so the
-    polygon sits like a fillet over the meeting corners. Returns (P, 2) or None.
+    Per-corner fillet construction. For every edge of every participating
+    polygon that ends at the junction, back off from the junction centre toward
+    that edge's far endpoint by the fillet fraction `d`, with a per-edge cap:
+
+        D = center + cap * d * (vertex - center)
+
+    `cap = 0.5` when the far endpoint is ANOTHER junction -- a T-to-T edge
+    between two inner-triangle corners -- so the reach stops at the edge
+    MIDPOINT (M01) and the two corners' fillets meet there cleanly. `cap = 1.0`
+    when the far endpoint is not a junction -- a foot point such as P001 -- so
+    the arm reaches the FULL point. `far_is_junction(point) -> bool` supplies
+    that test (everything is treated as full reach if it is None). d = 1 lands
+    on the midpoint / the foot; d = 0 collapses every arm onto the centre.
+
+    The back-off points are sorted by angle around the junction and consecutive
+    ones are joined by a quadratic Bezier whose control point is the junction
+    centre -- the arc  D_i -> (centre) -> D_{i+1}. This is the
+    M01' -> T0 -> P01' construction applied around the whole joint: each arm's
+    Bezier endpoint is (1 - d) * T0 + d * anchor (anchor = the inner-edge
+    midpoint M01, or the foot point P001), the Bezier is pulled through the
+    shared corner T0, and the straight run from the anchor in to the back-off
+    point is left to the panel itself (the two are colinear). d = 1 reproduces
+    the midpoint-to-foot curve; d = 0 degenerates to the single joint point (a
+    sharp connection). Returns (P, 2) or None.
     """
     center = np.mean([c[2] for c in junction], axis=0)
     edges = []
@@ -174,17 +196,20 @@ def _build_joint_bridge(junction, polys, frac: float, samples: int = 10):
         poly = np.asarray(polys[pi], dtype=float)
         n = len(poly)
         for ni in ((vi - 1) % n, (vi + 1) % n):
-            d = poly[ni] - center
-            L = float(np.linalg.norm(d))
+            vec = poly[ni] - center
+            L = float(np.linalg.norm(vec))
             if L > 1e-9:
-                edges.append((d / L, L, float(np.arctan2(d[1], d[0]))))
+                # T-to-T edge (far end is another joint) -> cap at the midpoint;
+                # edge to a foot point (P001) -> reach the full point.
+                cap = 0.5 if (far_is_junction and far_is_junction(poly[ni])) else 1.0
+                edges.append((vec / L, L, float(np.arctan2(vec[1], vec[0])), cap))
     if len(edges) < 2:
         return None
     edges.sort(key=lambda e: e[2])
-    radius = frac * 0.45 * float(np.median([e[1] for e in edges]))
-    if radius < 1e-9:
+    if d * max(e[1] for e in edges) < 1e-9:
         return None
-    backoffs = [center + e[0] * min(radius, e[1] * 0.45) for e in edges]
+    # Reach along each arm = cap * d * L  (cap = 0.5 -> midpoint, 1.0 -> full).
+    backoffs = [center + e[0] * (e[3] * d * e[1]) for e in edges]
     pts = []
     for i in range(len(backoffs)):
         bez = _quadratic_bezier(
@@ -194,21 +219,40 @@ def _build_joint_bridge(junction, polys, frac: float, samples: int = 10):
     return np.asarray(pts) if len(pts) >= 3 else None
 
 
-def build_joint_bridges(polys, frac: float, samples: int = 10) -> list[np.ndarray]:
+def build_joint_bridges(polys, d: float, samples: int = 10) -> list[np.ndarray]:
     """Bezier bridge polygons welding every joint where >=2 polygons meet.
 
     `polys` is the full set of rendered panels (inner triangles + wings +
-    links). `frac` in [0, 1] scales the bridge radius (0 = no smoothing).
+    links). `d` in [0, 1] is the fillet parameter. At each joint every incident
+    edge is rounded by a quadratic-Bezier bridge whose control point is the
+    joint corner; the rounded span is scaled by d (d = 0 -> sharp, single-point
+    connection). Each arm is capped by its far endpoint: a T-to-T edge (far end
+    is another joint, e.g. an inner-triangle edge) reaches that edge's MIDPOINT
+    at d = 1, while an edge ending at a non-joint (a foot point such as P001)
+    reaches the FULL point at d = 1. See `_build_joint_bridge`.
     """
-    if frac <= 1e-6 or len(polys) < 2:
+    if d <= 1e-6 or len(polys) < 2:
         return []
     allv = np.concatenate([np.asarray(p, dtype=float) for p in polys], axis=0)
     scale = float(np.linalg.norm(allv.max(axis=0) - allv.min(axis=0)))
     if scale < 1e-12:
         return []
+    tol = scale * 1e-6
+    inv = 1.0 / tol
+    juncs = _find_junctions(polys, tol)
+    # Every coincident corner in a junction shares the same bucket key, so a
+    # junction is identified by that key. An arm whose far endpoint lands on
+    # another junction is a T-to-T edge (capped at the midpoint); anything else
+    # (a foot point) is reached in full.
+    jkeys = {(int(round(jn[0][2][0] * inv)), int(round(jn[0][2][1] * inv)))
+             for jn in juncs}
+
+    def far_is_junction(pt) -> bool:
+        return (int(round(pt[0] * inv)), int(round(pt[1] * inv))) in jkeys
+
     bridges = []
-    for jn in _find_junctions(polys, tol=scale * 1e-6):
-        b = _build_joint_bridge(jn, polys, frac, samples)
+    for jn in juncs:
+        b = _build_joint_bridge(jn, polys, d, samples, far_is_junction)
         if b is not None:
             bridges.append(b)
     return bridges
@@ -806,6 +850,150 @@ def junction_wing_mask(geom: TilingGeometry) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# STL export: extrude the flat panels into a thin slab and write binary STL.
+# ---------------------------------------------------------------------------
+def _signed_area(poly: np.ndarray) -> float:
+    """Signed area of a 2D polygon (CCW positive). poly: (N, 2)."""
+    x, y = poly[:, 0], poly[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def _clean_polygon(poly: np.ndarray, tol: float = 1e-9) -> np.ndarray:
+    """Drop consecutive duplicate vertices (incl. wrap-around). (N, 2) -> (M, 2).
+
+    The K=2 link polygons repeat the shared Delaunay vertex (the kirigami hinge)
+    as a zero-length edge; this collapses such repeats so the cap triangulator
+    sees a clean simple polygon.
+    """
+    pts = np.asarray(poly, dtype=float)
+    if len(pts) == 0:
+        return pts
+    keep = [pts[0]]
+    for p in pts[1:]:
+        if np.linalg.norm(p - keep[-1]) > tol:
+            keep.append(p)
+    if len(keep) > 1 and np.linalg.norm(keep[0] - keep[-1]) <= tol:
+        keep.pop()
+    return np.asarray(keep)
+
+
+def _point_in_triangle(p, a, b, c) -> bool:
+    """True if p lies inside triangle abc (2D, boundary excluded)."""
+    def side(u, v, w):
+        return (u[0] - w[0]) * (v[1] - w[1]) - (v[0] - w[0]) * (u[1] - w[1])
+    b1, b2, b3 = side(p, a, b) < 0.0, side(p, b, c) < 0.0, side(p, c, a) < 0.0
+    return (b1 == b2) and (b2 == b3)
+
+
+def _triangulate_polygon(poly: np.ndarray) -> list[tuple[int, int, int]]:
+    """Ear-clipping triangulation of a simple polygon -> vertex-index triples.
+
+    Robust to non-convex (but not self-intersecting) polygons such as the link
+    panels and the Bezier joint 'flowers'. `poly` should already be CCW and
+    de-duplicated; the returned triples index into `poly`.
+    """
+    n = len(poly)
+    if n < 3:
+        return []
+    idx = list(range(n))
+
+    def is_convex(i0, i1, i2):
+        a, b, c = poly[i0], poly[i1], poly[i2]
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) > 0.0
+
+    tris: list[tuple[int, int, int]] = []
+    guard = 0
+    while len(idx) > 3 and guard < 10000:
+        guard += 1
+        m = len(idx)
+        for ii in range(m):
+            i0, i1, i2 = idx[(ii - 1) % m], idx[ii], idx[(ii + 1) % m]
+            if not is_convex(i0, i1, i2):
+                continue
+            a, b, c = poly[i0], poly[i1], poly[i2]
+            if any(jj not in (i0, i1, i2)
+                   and _point_in_triangle(poly[jj], a, b, c) for jj in idx):
+                continue
+            tris.append((i0, i1, i2))
+            del idx[ii]
+            break
+        else:
+            break                               # no ear found (degenerate); stop
+    if len(idx) == 3:
+        tris.append((idx[0], idx[1], idx[2]))
+    return tris
+
+
+def _polygon_prism(poly2d: np.ndarray, z0: float, z1: float):
+    """Extrude a 2D polygon to a prism. Returns (T, 3, 3) triangles or None.
+
+    Builds the top cap (+z), bottom cap (-z) and the side walls, wound so the
+    outward normals point away from the solid.
+    """
+    poly = _clean_polygon(poly2d)
+    if len(poly) < 3:
+        return None
+    if _signed_area(poly) < 0.0:
+        poly = poly[::-1]                        # canonical CCW
+    n = len(poly)
+    caps = _triangulate_polygon(poly)
+    if not caps:
+        return None
+    z_lo, z_hi = (z0, z1) if z1 >= z0 else (z1, z0)
+    bottom = np.column_stack([poly, np.full(n, z_lo)])
+    top = np.column_stack([poly, np.full(n, z_hi)])
+    tris = []
+    for (i, j, k) in caps:
+        tris.append([top[i], top[j], top[k]])           # +z cap (CCW from above)
+        tris.append([bottom[i], bottom[k], bottom[j]])  # -z cap (reversed)
+    for ii in range(n):
+        a, b = ii, (ii + 1) % n
+        tris.append([bottom[a], bottom[b], top[b]])      # outward side wall
+        tris.append([bottom[a], top[b], top[a]])
+    return np.asarray(tris, dtype=float)
+
+
+def _write_stl_binary(path: str, tris: np.ndarray) -> None:
+    """Write triangles (T, 3, 3) to a binary STL file with computed normals."""
+    tris = np.asarray(tris, dtype=float)
+    v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
+    nrm = np.cross(v1 - v0, v2 - v0)
+    ln = np.linalg.norm(nrm, axis=1, keepdims=True)
+    nrm = np.divide(nrm, ln, out=np.zeros_like(nrm), where=ln > 1e-12)
+    rec = np.zeros(len(tris), dtype=np.dtype([
+        ("normal", "<f4", (3,)),
+        ("v", "<f4", (3, 3)),
+        ("attr", "<u2"),
+    ]))
+    rec["normal"] = nrm
+    rec["v"] = tris
+    with open(path, "wb") as f:
+        f.write(b"\x00" * 80)                    # 80-byte header
+        f.write(struct.pack("<I", len(tris)))    # triangle count
+        f.write(rec.tobytes())
+
+
+def export_stl(polygons, path: str, thickness: float) -> int:
+    """Extrude each 2D polygon by `thickness` (centred on z=0) and write binary STL.
+
+    `polygons` is an iterable of (N, 2) arrays (the rendered panels + joint
+    bridges). Overlapping prisms are written as a triangle 'soup' -- valid for
+    slicers that union solids on import. Returns the number of triangles written.
+    """
+    half = 0.5 * float(thickness)
+    chunks = []
+    for poly in polygons:
+        prism = _polygon_prism(np.asarray(poly, dtype=float).reshape(-1, 2), -half, half)
+        if prism is not None:
+            chunks.append(prism)
+    if not chunks:
+        return 0
+    tris = np.concatenate(chunks, axis=0)
+    _write_stl_binary(path, tris)
+    return len(tris)
+
+
+# ---------------------------------------------------------------------------
 # Interactive viewer.
 # ---------------------------------------------------------------------------
 def show(
@@ -825,9 +1013,14 @@ def show(
                 preserved) so the rigid links stay attached.
     * spin   -- rigid rotation of the WHOLE structure in world space
                 (about the centroid of the points), in degrees.
-    * fillet -- joint smoothing (0 = none, 1 = max): adds a quadratic-Bezier
-                bridge panel at each joint (where >=2 pieces meet at a point --
-                the T hinges, feet, and shared vertices) to weld them smoothly.
+    * fillet -- joint smoothing parameter d in [0, 1]. At each joint (a T
+                corner where >=2 pieces meet) the incident edges are rounded by
+                a quadratic-Bezier bridge whose control point is the corner.
+                Each arm is capped by its far end: an inner-triangle (T-to-T)
+                edge reaches that edge's MIDPOINT (M01), while an edge to a foot
+                point reaches the FULL point (P001). d = 0 -> sharp (panels meet
+                at the single joint point); d = 1 -> full midpoint-to-foot
+                curve.
 
     Radio buttons:
     * anchor -- point the T's shrink toward: "incenter" or "centroid".
@@ -843,6 +1036,11 @@ def show(
     Keys:
     * c -> print the current spun coordinates (points, T's, wings, links)
             to the console.
+    * e -> export the current (spun, actuated, filleted) structure to a binary
+            STL file in the working directory. Every rendered panel -- inner
+            triangles, wings, links and the Bezier joint bridges -- is extruded
+            into a thin slab (thickness 5% of the bounding-box diagonal); the
+            file name is timestamped so repeated exports don't clobber.
 
     Re-triangulating (moving or adding a point) resets any per-triangle c
     overrides, because triangle indices are not stable across triangulations.
@@ -982,7 +1180,7 @@ def show(
 
         # Sharp panels, then Bezier bridges welding the joints between them.
         # Junction wings are absorbed into the joint polygons, so skip drawing them.
-        ffrac = s_fillet.val
+        d_fillet = s_fillet.val
         quads = np.concatenate([Ts[:, :, None, :], ws], axis=2).reshape(-1, 4, 2)
         keep_wing = ~junction_wing_mask(geom).reshape(-1)
         inner_list = list(Ts)
@@ -990,7 +1188,7 @@ def show(
         inner_pc.set_verts(inner_list)
         wing_pc.set_verts(wing_list)
         link_pc.set_verts(link_list)
-        joint_pc.set_verts(build_joint_bridges(inner_list + wing_list + link_list, ffrac))
+        joint_pc.set_verts(build_joint_bridges(inner_list + wing_list + link_list, d_fillet))
 
         mn0, mx0 = _aabb(T0s, w0s)
         mnR, mxR = _aabb(Ts, ws)
@@ -1036,7 +1234,7 @@ def show(
     s_c      = Slider(ax_c,      "c",           0.0,    1.0,   valinit=c_init)
     s_th     = Slider(ax_th,     "theta (deg)", -180.0, 180.0, valinit=np.degrees(theta_init))
     s_spin   = Slider(ax_spin,   "spin (deg)",  -180.0, 180.0, valinit=0.0)
-    s_fillet = Slider(ax_fillet, "fillet",      0.0,    1.0,   valinit=0.0)
+    s_fillet = Slider(ax_fillet, "fillet (d)",  0.0,    1.0,   valinit=0.0)
 
     # ---- anchor radio ------------------------------------------------------
     ax_radio = plt.axes([0.005, 0.80, 0.135, 0.13])
@@ -1101,7 +1299,33 @@ def show(
     def on_release(_event) -> None:
         state["drag"] = None
 
+    def _export_stl_current() -> None:
+        """Extrude the current (spun, actuated, filleted) panels to a binary STL."""
+        geom = state["geom"]
+        theta = np.radians(s_th.val)
+        c = effective_c()
+        root = current_root()
+        T, wings = tile_state(geom, c, theta, root)
+        Ts, ws = spin_apply(T), spin_apply(wings)
+        quads = np.concatenate([Ts[:, :, None, :], ws], axis=2).reshape(-1, 4, 2)
+        keep_wing = ~junction_wing_mask(geom).reshape(-1)
+        inner_list = list(Ts)
+        wing_list = [q for q, k in zip(quads, keep_wing) if k]
+        link_list = [spin_apply(p) for p in compute_links(geom, c, theta, root)]
+        bridges = build_joint_bridges(inner_list + wing_list + link_list, s_fillet.val)
+        polys = inner_list + wing_list + link_list + bridges
+        # Slab thickness: 5% of the in-plane bounding-box diagonal.
+        allv = np.concatenate([np.asarray(p, float).reshape(-1, 2) for p in polys], axis=0)
+        diag = float(np.linalg.norm(allv.max(0) - allv.min(0)))
+        thickness = 0.05 * diag if diag > 1e-9 else 1.0
+        path = os.path.abspath(time.strftime("centroid_tile_%Y%m%d_%H%M%S.stl"))
+        ntri = export_stl(polys, path, thickness)
+        print(f"[STL] {ntri} triangles, thickness {thickness:.4f}  ->  {path}")
+
     def on_key(event) -> None:
+        if event.key == "e":
+            _export_stl_current()
+            return
         if event.key != "c":
             return
         geom = state["geom"]
@@ -1140,7 +1364,7 @@ def show(
 
     print("Controls: shift-click triangle = per-tri c | ctrl-drag = move point"
         " | alt-click = add point | fillet slider = smooth joints"
-        " | press 'c' = dump spun coords")
+        " | press 'c' = dump spun coords | press 'e' = export STL")
     refresh_static()
     redraw()
     plt.show()
@@ -1150,8 +1374,6 @@ if __name__ == "__main__":
     example_points = np.array([
         [0.0, 0.0],
         [1.0, 1.73],
-        [2.0, 0.0],
-        [3.0, 1.73],
-        [4.0, 0.0]
+        [2.0, 0.0]
     ])
     show(example_points, c_init=0.5)
