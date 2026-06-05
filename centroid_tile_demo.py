@@ -64,7 +64,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.patches import Rectangle
-from matplotlib.widgets import Slider, RadioButtons
+from matplotlib.widgets import Slider, RadioButtons, Button
 from scipy.spatial import Delaunay, QhullError
 
 
@@ -161,6 +161,50 @@ def _find_junctions(polys, tol: float) -> list:
     return [cl for cl in buckets.values() if len({c[0] for c in cl}) >= 2]
 
 
+def _joint_arms(junction, polys, n_inner: int = 0):
+    """Centre and angularly-sorted arms of one junction.
+
+    Returns ``(center, arms)`` where ``center`` is the mean of the coincident
+    corners and ``arms`` is a list of ``(unit_dir, leg_len, angle,
+    is_inner_edge)`` -- one per edge leaving the junction (both neighbours of
+    every participating corner), sorted by angle. An arm counts as an
+    inner-triangle edge when its source polygon is one of the first ``n_inner``
+    entries of ``polys``. Zero-length arms are dropped. Shared by the
+    Bezier-bridge builder and the fillet-radius read-out.
+    """
+    center = np.mean([c[2] for c in junction], axis=0)
+    arms = []                       # (unit_dir, leg_len, angle, is_inner_edge)
+    for pi, vi, _ in junction:
+        poly = np.asarray(polys[pi], dtype=float)
+        n = len(poly)
+        is_inner = pi < n_inner
+        for ni in ((vi - 1) % n, (vi + 1) % n):
+            vec = poly[ni] - center
+            L = float(np.linalg.norm(vec))
+            if L > 1e-9:
+                arms.append(
+                    (vec / L, L, float(np.arctan2(vec[1], vec[0])), is_inner)
+                )
+    arms.sort(key=lambda e: e[2])
+    return center, arms
+
+
+def _joint_radius_from_arms(arms, d: float) -> float:
+    """Uniform back-off radius for a joint from its arms and fillet fraction d.
+
+        radius = d * min(0.5 * shortest leg, 0.25 * shortest inner-triangle edge)
+
+    (see ``_build_joint_bridge`` for the rationale behind the two bounds).
+    Returns 0.0 when there are fewer than two arms.
+    """
+    if len(arms) < 2:
+        return 0.0
+    half_leg = 0.5 * min(e[1] for e in arms)
+    inner_lens = [e[1] for e in arms if e[3]]
+    quarter_inner = 0.25 * min(inner_lens) if inner_lens else float("inf")
+    return d * min(half_leg, quarter_inner)
+
+
 def _build_joint_bridge(junction, polys, d: float, samples: int = 10,
                         n_inner: int = 0):
     """Bezier 'flower' that welds the pieces meeting at one junction.
@@ -195,29 +239,13 @@ def _build_joint_bridge(junction, polys, d: float, samples: int = 10,
     ones are joined by a quadratic Bezier whose control point is the junction
     centre -- the arc D_i -> (centre) -> D_{i+1}. Returns (P, 2) or None.
     """
-    center = np.mean([c[2] for c in junction], axis=0)
-    arms = []                       # (unit_dir, leg_len, angle, is_inner_edge)
-    for pi, vi, _ in junction:
-        poly = np.asarray(polys[pi], dtype=float)
-        n = len(poly)
-        is_inner = pi < n_inner
-        for ni in ((vi - 1) % n, (vi + 1) % n):
-            vec = poly[ni] - center
-            L = float(np.linalg.norm(vec))
-            if L > 1e-9:
-                arms.append(
-                    (vec / L, L, float(np.arctan2(vec[1], vec[0])), is_inner)
-                )
+    center, arms = _joint_arms(junction, polys, n_inner)
     if len(arms) < 2:
         return None
-    arms.sort(key=lambda e: e[2])
 
     # Uniform back-off radius: the smaller of half the shortest leg and a
     # quarter of the shortest incident inner-triangle edge, scaled by d.
-    half_leg = 0.5 * min(e[1] for e in arms)
-    inner_lens = [e[1] for e in arms if e[3]]
-    quarter_inner = 0.25 * min(inner_lens) if inner_lens else float("inf")
-    radius = d * min(half_leg, quarter_inner)
+    radius = _joint_radius_from_arms(arms, d)
     if radius < 1e-9:
         return None
 
@@ -261,6 +289,35 @@ def build_joint_bridges(polys, d: float, n_inner: int = 0,
         if b is not None:
             bridges.append(b)
     return bridges
+
+
+def joint_radii(polys, d: float, n_inner: int = 0) -> dict:
+    """Fillet back-off radius at every joint, keyed by a c-independent id.
+
+    Discovers joints exactly like ``build_joint_bridges`` (corners where >= 2
+    panels coincide) but, instead of the Bezier 'flower', returns each joint's
+    radius = d * min(0.5 * shortest leg, 0.25 * shortest inner-triangle edge).
+
+    The key is the sorted tuple of the joint's ``(polygon_index, vertex_index)``
+    members. Those indices are fixed by the tiling topology -- the inner
+    triangle, its wings and the links always reference the same corner arrays --
+    so a given physical joint keeps the SAME id as c (or theta) changes. That
+    lets a caller track one joint's radius across a c sweep. Returns
+    ``{joint_id: radius}``.
+    """
+    if len(polys) < 2:
+        return {}
+    allv = np.concatenate([np.asarray(p, dtype=float) for p in polys], axis=0)
+    scale = float(np.linalg.norm(allv.max(axis=0) - allv.min(axis=0)))
+    if scale < 1e-12:
+        return {}
+    tol = scale * 1e-6
+    out: dict[tuple, float] = {}
+    for jn in _find_junctions(polys, tol):
+        jid = tuple(sorted((pi, vi) for pi, vi, _ in jn))
+        _, arms = _joint_arms(jn, polys, n_inner)
+        out[jid] = _joint_radius_from_arms(arms, d)
+    return out
 
 
 def _segments_cross(p1, p2, p3, p4) -> np.ndarray:
@@ -854,6 +911,28 @@ def junction_wing_mask(geom: TilingGeometry) -> np.ndarray:
     return mask
 
 
+def build_panels(
+    geom: TilingGeometry, c, theta: float = 0.0, root: int = 0,
+) -> tuple[list, list, list]:
+    """Rendered panel polygons for one (c, theta) state, in canonical order.
+
+    Returns ``(inner_list, wing_list, link_list)``: the inner triangles, the
+    wings that are NOT absorbed into joints, and the link polygons -- the same
+    panels (and order) the viewer draws and the STL export extrudes.
+    Concatenated, ``inner_list + wing_list + link_list`` with
+    ``n_inner = len(inner_list)`` is exactly what ``build_joint_bridges`` /
+    ``joint_radii`` expect. Coordinates are un-spun; spin is a view/export
+    transform applied separately.
+    """
+    T, wings = tile_state(geom, c, theta, root)
+    quads = np.concatenate([T[:, :, None, :], wings], axis=2).reshape(-1, 4, 2)
+    keep_wing = ~junction_wing_mask(geom).reshape(-1)
+    inner_list = list(T)
+    wing_list = [q for q, k in zip(quads, keep_wing) if k]
+    link_list = compute_links(geom, c, theta, root)
+    return inner_list, wing_list, link_list
+
+
 # ---------------------------------------------------------------------------
 # STL export: extrude the flat panels into a thin slab and write binary STL.
 # ---------------------------------------------------------------------------
@@ -1030,6 +1109,13 @@ def show(
 
     Radio buttons:
     * anchor -- point the T's shrink toward: "incenter" or "centroid".
+
+    Buttons:
+    * "radius vs c" -- opens a SEPARATE window plotting each joint's Bezier
+        fillet radius as the shrink c sweeps 0 -> 1, at the current fillet d
+        (or the d = 1 bound when the fillet slider sits at 0, since the radius
+        scales linearly with d). The binding (smallest) joint radius is drawn
+        bold and the current c is marked. The radius is theta/spin-invariant.
 
     Mouse (hold a modifier and click on the main plot):
     * Shift-click a triangle -> select it; the c slider then edits only
@@ -1233,6 +1319,73 @@ def show(
         redraw()
         return True
 
+    def _plot_radius_vs_c(_event=None) -> None:
+        """Pop up a separate window: each joint's fillet radius vs the shrink c.
+
+        Sweeps the global c over the open interval (0, 1) and, at the current
+        fillet d, records the back-off radius (= d * min(1/2 shortest leg,
+        1/4 shortest inner edge)) at every joint. The radius is independent of theta/spin (those
+        are rigid moves), so the sweep is taken at theta = 0. Each joint is
+        tracked by its stable id, so its curve is continuous across the sweep;
+        the binding (smallest) radius is drawn bold and the current c is marked.
+        When the fillet slider is at 0 the plot shows the MAX radius (the d = 1
+        bound) instead, since the actual radius is just d times this.
+        """
+        geom = state["geom"]
+        d = float(s_fillet.val)
+        d_plot = d if d > 1e-6 else 1.0
+        n = 200
+        # Sweep the OPEN interval: both endpoints are degenerate (c = 0 collapses
+        # each inner triangle to its anchor point; c = 1 puts T_i on P_i, which
+        # collapses the wings and merges joints at the shared Delaunay vertices).
+        cs = np.linspace(0.0, 1.0, n + 2)[1:-1]
+        per_joint: dict[tuple, np.ndarray] = {}
+        for ci, cval in enumerate(cs):
+            inner, wing, link = build_panels(geom, cval, 0.0, 0)
+            radii = joint_radii(inner + wing + link, d_plot, len(inner))
+            for jid, r in radii.items():
+                per_joint.setdefault(jid, np.full(n, np.nan))[ci] = r
+
+        if not per_joint:
+            print("[radius] No joints found (need >= 2 panels meeting at a point).")
+            return
+
+        curves = np.vstack(list(per_joint.values()))           # (J, n)
+        with np.errstate(invalid="ignore"):
+            rmin = np.nanmin(curves, axis=0)
+
+        fig2, ax2 = plt.subplots(figsize=(7, 5))
+        try:
+            fig2.canvas.manager.set_window_title("Fillet radius vs c")
+        except Exception:
+            pass
+        for i, row in enumerate(curves):
+            ax2.plot(cs, row, lw=0.9, alpha=0.45, color="#1f77b4",
+                     label="per-joint radius" if i == 0 else None)
+        ax2.plot(cs, rmin, lw=2.3, color="#d62728",
+                 label="min over joints (binding)")
+        c_now = float(state["c_global"])
+        ax2.axvline(c_now, color="#444444", ls="--", lw=1.0,
+                    label=f"current c = {c_now:.3f}")
+
+        ax2.set_xlabel("c  (shrink factor)")
+        if d > 1e-6:
+            ax2.set_ylabel("fillet radius")
+            ttl = f"Fillet radius vs c   (fillet d = {d:.3f}, {len(curves)} joints)"
+        else:
+            ax2.set_ylabel("max fillet radius (at d = 1)")
+            ttl = (f"Max fillet radius vs c   (d = 1; actual = d × this, "
+                   f"{len(curves)} joints)")
+        if state["c_over"]:
+            ttl += "\n[per-triangle c overrides ignored — global c sweep]"
+        ax2.set_title(ttl, fontsize=10)
+        ax2.set_xlim(0.0, 1.0)
+        ax2.set_ylim(bottom=0.0)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="upper left", fontsize=8)
+        fig2.tight_layout()
+        fig2.show()
+
     # ---- sliders -----------------------------------------------------------
     ax_c      = plt.axes([0.25, 0.175, 0.6, 0.025])
     ax_th     = plt.axes([0.25, 0.130, 0.6, 0.025])
@@ -1254,6 +1407,11 @@ def show(
         state["geom"] = TilingGeometry.build(state["pts"], anchor=label)
         redraw()
     radio.on_clicked(on_anchor)
+
+    # ---- radius-vs-c plot button -------------------------------------------
+    ax_btn = plt.axes([0.005, 0.66, 0.135, 0.055])
+    btn_radius = Button(ax_btn, "radius vs c")
+    btn_radius.on_clicked(_plot_radius_vs_c)
 
     def on_c(val: float) -> None:
         if state["syncing"]:
@@ -1372,6 +1530,7 @@ def show(
 
     print("Controls: shift-click triangle = per-tri c | ctrl-drag = move point"
         " | alt-click = add point | fillet slider = smooth joints"
+        " | 'radius vs c' button = plot fillet radius vs c"
         " | press 'c' = dump spun coords | press 'e' = export STL")
     refresh_static()
     redraw()
