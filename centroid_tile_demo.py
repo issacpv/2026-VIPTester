@@ -161,95 +161,205 @@ def _find_junctions(polys, tol: float) -> list:
     return [cl for cl in buckets.values() if len({c[0] for c in cl}) >= 2]
 
 
-def _joint_arms(junction, polys, n_inner: int = 0):
+def _inner_vertex_keys(polys, n_inner: int, tol: float):
+    """Quantized coords of every inner-triangle vertex -- O(1) "is this a T?" test.
+
+    Buckets the corners of the first ``n_inner`` polygons (the inner triangles)
+    on the SAME ``1/tol`` grid ``_find_junctions`` uses, so any point that
+    coincides with an inner-triangle vertex (every "T" at a joint, since the
+    inner triangle, its wings and the links reference the same T arrays) hashes
+    to a key present here. Returns ``(key_set, inv)`` with ``inv = 1/tol``.
+    """
+    inv = 1.0 / tol if tol > 0 else 1e12
+    keys = {
+        (int(round(v[0] * inv)), int(round(v[1] * inv)))
+        for poly in polys[:n_inner]
+        for v in np.asarray(poly, dtype=float)
+    }
+    return keys, inv
+
+
+def _joint_arms(junction, polys, n_inner: int = 0, inner_keys=None, inv=None):
     """Centre and angularly-sorted arms of one junction.
 
     Returns ``(center, arms)`` where ``center`` is the mean of the coincident
-    corners and ``arms`` is a list of ``(unit_dir, leg_len, angle,
-    is_inner_edge)`` -- one per edge leaving the junction (both neighbours of
-    every participating corner), sorted by angle. An arm counts as an
-    inner-triangle edge when its source polygon is one of the first ``n_inner``
-    entries of ``polys``. Zero-length arms are dropped. Shared by the
-    Bezier-bridge builder and the fillet-radius read-out.
+    corners and ``arms`` is a list of
+    ``(unit_dir, leg_len, angle, is_inner_edge, tt_edge)`` -- one per edge
+    leaving the junction (both neighbours of every participating corner), sorted
+    by angle. Zero-length arms are dropped. Shared by the Bezier-bridge builder
+    and the fillet-radius read-out.
+
+    * ``is_inner_edge`` -- the arm's source polygon is one of the first
+      ``n_inner`` entries of ``polys`` (a genuine inner-triangle edge).
+    * ``tt_edge`` -- BOTH endpoints are inner-triangle vertices ("T"s). This is
+      True for inner-triangle edges (two T's of the SAME triangle) AND for link
+      **cross-arms** (two T's of NEIGHBOURING triangles -- a face of a purple
+      link polygon). It is the discriminator the fillet bound uses: a T-to-T
+      edge caps at its midpoint, every other arm at its full length. Since both
+      ends of a T-to-T edge are themselves joints, the midpoint cap makes the
+      two fillets meet there instead of overrunning each other.
+
+    ``inner_keys``/``inv`` are the inner-vertex lookup from ``_inner_vertex_keys``;
+    when omitted they are built here from ``polys`` (a scale-relative tolerance).
     """
     center = np.mean([c[2] for c in junction], axis=0)
-    arms = []                       # (unit_dir, leg_len, angle, is_inner_edge)
+    if inner_keys is None:
+        allv = np.concatenate(
+            [np.asarray(p, dtype=float).reshape(-1, 2) for p in polys], axis=0
+        )
+        scale = float(np.linalg.norm(allv.max(axis=0) - allv.min(axis=0)))
+        inner_keys, inv = _inner_vertex_keys(
+            polys, n_inner, scale * 1e-6 if scale > 1e-12 else 1e-9
+        )
+    # The junction sits on an inner-triangle vertex (a "T") iff one of its
+    # coincident corners comes from an inner triangle.
+    center_is_T = any(pi < n_inner for (pi, _, _) in junction)
+
+    def _is_T(pt) -> bool:
+        return (int(round(pt[0] * inv)), int(round(pt[1] * inv))) in inner_keys
+
+    arms = []               # (unit_dir, leg_len, angle, is_inner_edge, tt_edge)
     for pi, vi, _ in junction:
         poly = np.asarray(polys[pi], dtype=float)
         n = len(poly)
         is_inner = pi < n_inner
         for ni in ((vi - 1) % n, (vi + 1) % n):
-            vec = poly[ni] - center
+            far = poly[ni]
+            vec = far - center
             L = float(np.linalg.norm(vec))
             if L > 1e-9:
+                tt_edge = center_is_T and _is_T(far)
                 arms.append(
-                    (vec / L, L, float(np.arctan2(vec[1], vec[0])), is_inner)
+                    (vec / L, L, float(np.arctan2(vec[1], vec[0])), is_inner, tt_edge)
                 )
     arms.sort(key=lambda e: e[2])
     return center, arms
 
 
-def _joint_radius_from_arms(arms, d: float) -> float:
-    """Uniform back-off radius for a joint from its arms and fillet fraction d.
+# Task-C fillet bounds. Each joint arm backs off from the joint centre by a
+# distance bounded by a fraction of its OWN length, set by the edge TYPE:
+#   * a T-to-T edge -- an inner-triangle edge (two T's of the SAME triangle) OR a
+#     link "cross-arm" (two T's of NEIGHBOURING triangles, a face of a purple
+#     link polygon) -- backs off by 0.5 * length: the edge MIDPOINT. Because both
+#     ends of such an edge are themselves joints, capping at the midpoint makes
+#     the two fillets meet there instead of overrunning each other.
+#   * a leg -- a perpendicular wing leg (T -> foot) or any other non-T-to-T link
+#     edge -- backs off by 1.0 * length (its full length).
+# (These replace the previous 0.25 * inner / 0.5 * leg bounds; the leg bound now
+# reaches the full leg, while every T-to-T edge -- not just same-triangle inner
+# edges -- is capped at its midpoint.)
+_FILLET_TT_FRAC = 0.5     # T-to-T edge (inner edge or link cross-arm) -> midpoint
+_FILLET_LEG_FRAC = 1.0    # perpendicular leg -> full length
 
-        radius = d * min(0.5 * shortest leg, 0.25 * shortest inner-triangle edge)
+# Fillet application modes (the UI toggle in show()).
+FILLET_UNIFORM = "uniform"
+FILLET_PER_ARM = "per-arm"
 
-    (see ``_build_joint_bridge`` for the rationale behind the two bounds).
-    Returns 0.0 when there are fewer than two arms.
+
+def _arm_backoff_bound(arm) -> float:
+    """Undamped (d = 1) back-off distance bound for a single joint arm.
+
+    ``arm`` is a ``(unit_dir, leg_len, angle, is_inner_edge, tt_edge)`` tuple from
+    ``_joint_arms``. A **T-to-T edge** (``tt_edge`` True -- an inner-triangle edge
+    or a link cross-arm, i.e. an edge whose two endpoints are both inner-triangle
+    vertices) is bounded by HALF its length (its midpoint, ``_FILLET_TT_FRAC``),
+    so two fillets sharing it meet in the middle rather than overlapping. Every
+    other arm (a "leg" -- a perpendicular wing leg or other link edge) is bounded
+    by its FULL length (``_FILLET_LEG_FRAC``).
+
+    Accepts a legacy 4-tuple with no ``tt_edge``; then the older ``is_inner_edge``
+    flag selects the fraction.
+    """
+    leg_len = arm[1]
+    tt_edge = arm[4] if len(arm) > 4 else arm[3]
+    return (_FILLET_TT_FRAC if tt_edge else _FILLET_LEG_FRAC) * leg_len
+
+
+def _arm_radii(arms, d: float, mode: str = FILLET_UNIFORM) -> list:
+    """Per-arm back-off distances for a joint's arms at fillet fraction ``d``.
+
+    * ``mode="uniform"`` -- every arm shares the SAME radius ``d * min_k(bound_k)``
+      (the binding arm's bound), so the back-off points lie on a circle and the
+      Bezier flower is symmetric.
+    * ``mode="per-arm"`` -- arm ``k`` backs off by ``d * bound_k`` (its OWN
+      bound), so T-to-T edges and legs reach different radii and the flower is
+      asymmetric.
+
+    ``bound_k`` is ``_arm_backoff_bound`` (0.5*len for a T-to-T edge -- inner edge
+    or link cross-arm -- and 1.0*len for a leg). Returns a list aligned with
+    ``arms`` (``[]`` when there are < 2 arms).
     """
     if len(arms) < 2:
-        return 0.0
-    half_leg = 0.5 * min(e[1] for e in arms)
-    inner_lens = [e[1] for e in arms if e[3]]
-    quarter_inner = 0.25 * min(inner_lens) if inner_lens else float("inf")
-    return d * min(half_leg, quarter_inner)
+        return []
+    bounds = [_arm_backoff_bound(a) for a in arms]
+    if mode == FILLET_PER_ARM:
+        return [d * b for b in bounds]
+    return [d * min(bounds)] * len(arms)
+
+
+def _joint_radius_from_arms(arms, d: float, mode: str = FILLET_UNIFORM) -> float:
+    """Representative back-off radius for a joint from its arms and fraction ``d``.
+
+    Uniform mode returns the single shared radius
+
+        radius = d * min( 0.5 * shortest T-to-T edge, 1.0 * shortest leg )
+
+    (the binding arm's bound; a T-to-T edge is an inner-triangle edge or a link
+    cross-arm). Per-arm mode returns the BINDING (minimum) arm
+    radius -- which, by construction, EQUALS the uniform radius; the non-binding
+    arms simply back off further. Either way this is the smallest radius at the
+    joint, so the "radius vs c" plot's per-joint curve stays well defined in both
+    modes. Returns 0.0 when there are fewer than two arms.
+    """
+    radii = _arm_radii(arms, d, mode)
+    return min(radii) if radii else 0.0
 
 
 def _build_joint_bridge(junction, polys, d: float, samples: int = 10,
-                        n_inner: int = 0):
+                        n_inner: int = 0, mode: str = FILLET_UNIFORM,
+                        inner_keys=None, inv=None):
     """Bezier 'flower' that welds the pieces meeting at one junction.
 
-    Uniform-radius fillet. Every arm leaving the joint centre backs off by the
-    SAME distance
+    Each arm leaving the joint centre backs off by a distance bounded by its own
+    length and edge TYPE (see ``_arm_backoff_bound``):
 
-        radius = d * min(0.5 * shortest_leg, 0.25 * shortest_inner_edge)
+    * a **T-to-T edge** -- an inner-triangle edge (two T's of the same triangle)
+      OR a link **cross-arm** (two T's of neighbouring triangles, a face of a
+      purple link polygon) -- by ``0.5 * (its length)``, the edge MIDPOINT. Both
+      ends of such an edge are joints, so the midpoint cap makes the two fillets
+      meet there rather than overlap.
+    * a **leg** (perpendicular wing leg ``T -> foot`` or other link edge) by
+      ``1.0 * (its full length)``.
 
-    so the back-off points sit on a circle around the corner and the resulting
-    Bezier flower is symmetric. The two bounds, whichever is smaller:
+    ``mode`` selects how those bounds are applied (see ``_arm_radii``):
 
-    * 0.5 * shortest_leg -- half the shortest arm of any kind at the joint, i.e.
-      the MIDPOINT of the shortest leg. Keeps the flower from overrunning the
-      nearest panel edge (two fillets sharing a leg meet no further than its
-      midpoint).
-    * 0.25 * shortest_inner_edge -- a quarter of the shortest inner-triangle
-      edge incident at this corner. Inner-triangle edges are identified by their
-      source polygon: the first `n_inner` entries of `polys` are the inner
-      triangles, so an arm coming from one of those is a genuine inner-triangle
-      edge (a T-to-T edge of the SAME inner triangle) -- as opposed to a link
-      cross-arm to a NEIGHBOUR's T, which is also T-to-T but is NOT an inner
-      edge. Under the uniform radius each wing-foot arm pairs with one of the
-      corner's two incident inner edges, so the binding value is their shorter.
+    * ``"uniform"`` -- one shared radius ``d * min`` of all the arm bounds, so
+      the back-off points sit on a circle and the flower is symmetric.
+    * ``"per-arm"`` -- each arm backs off by ``d *`` its OWN bound, so T-to-T
+      edges and legs land at different radii and the flower is asymmetric.
 
-    `d` in [0, 1] scales the radius: d = 0 collapses every arm onto the centre
-    (a sharp join); larger d grows the flower until it reaches the shortest
-    leg's midpoint or a quarter of the shortest inner edge, whichever comes
-    first.
+    ``d`` in [0, 1] scales the radii: ``d = 0`` collapses every arm onto the
+    centre (a sharp join); larger ``d`` grows the flower until each arm reaches
+    its own bound (a T-to-T edge's midpoint / a leg's full length).
 
-    The back-off points are sorted by angle around the junction and consecutive
+    ``inner_keys``/``inv`` are the optional inner-vertex lookup forwarded to
+    ``_joint_arms`` (built once by the caller for the whole tiling).
+
+    The back-off points are taken in the arms' angular order and consecutive
     ones are joined by a quadratic Bezier whose control point is the junction
     centre -- the arc D_i -> (centre) -> D_{i+1}. Returns (P, 2) or None.
     """
-    center, arms = _joint_arms(junction, polys, n_inner)
+    center, arms = _joint_arms(junction, polys, n_inner, inner_keys, inv)
     if len(arms) < 2:
         return None
 
-    # Uniform back-off radius: the smaller of half the shortest leg and a
-    # quarter of the shortest incident inner-triangle edge, scaled by d.
-    radius = _joint_radius_from_arms(arms, d)
-    if radius < 1e-9:
+    # Per-arm back-off distances (all equal in uniform mode; T-to-T edges vs legs
+    # differ in per-arm mode), each scaled by d.
+    radii = _arm_radii(arms, d, mode)
+    if not radii or max(radii) < 1e-9:
         return None
 
-    backoffs = [center + e[0] * radius for e in arms]
+    backoffs = [center + e[0] * r for e, r in zip(arms, radii)]
     pts = []
     for i in range(len(backoffs)):
         bez = _quadratic_bezier(
@@ -260,20 +370,25 @@ def _build_joint_bridge(junction, polys, d: float, samples: int = 10,
 
 
 def build_joint_bridges(polys, d: float, n_inner: int = 0,
-                        samples: int = 10) -> list[np.ndarray]:
+                        samples: int = 10,
+                        mode: str = FILLET_UNIFORM) -> list[np.ndarray]:
     """Bezier bridge polygons welding every joint where >=2 polygons meet.
 
     `polys` is the full set of rendered panels. The FIRST `n_inner` of them must
     be the inner-triangle polygons (the caller concatenates inner + wings +
-    links in that order); an arm sourced from one of those counts as an
-    inner-triangle edge for the "quarter of the inner triangle" bound, which
-    excludes link cross-arms that are also T-to-T. `d` in [0, 1] is the fillet
-    fraction.
+    links in that order); their corners are the inner-triangle vertices ("T"s)
+    used to classify each arm's edge type. `d` in [0, 1] is the fillet fraction.
 
-    At each joint every incident arm backs off from the corner by the same
-    radius = d * min(0.5 * shortest leg, 0.25 * shortest inner-triangle edge),
-    and a quadratic-Bezier arc (control point = the corner) joins consecutive
-    back-off points. d = 0 -> sharp single-point join. See `_build_joint_bridge`.
+    Each incident arm backs off from the corner by a fraction of its own length:
+    0.5 for a T-to-T edge -- an inner-triangle edge OR a link cross-arm between
+    neighbouring T's -- (its midpoint), 1.0 for a leg (T -> foot). The midpoint
+    cap on T-to-T edges keeps the two fillets that share such an edge from
+    overrunning each other. `mode` selects how those bounds combine: ``"uniform"``
+    gives every arm the single binding radius `d * min` of all arm bounds
+    (symmetric flower); ``"per-arm"`` lets each arm reach its own bound
+    (asymmetric flower). A quadratic-Bezier arc (control point = the corner)
+    joins consecutive back-off points. d = 0 -> sharp single-point join. See
+    `_build_joint_bridge`.
     """
     if d <= 1e-6 or len(polys) < 2:
         return []
@@ -282,21 +397,28 @@ def build_joint_bridges(polys, d: float, n_inner: int = 0,
     if scale < 1e-12:
         return []
     tol = scale * 1e-6
+    inner_keys, inv = _inner_vertex_keys(polys, n_inner, tol)
     juncs = _find_junctions(polys, tol)
     bridges = []
     for jn in juncs:
-        b = _build_joint_bridge(jn, polys, d, samples, n_inner)
+        b = _build_joint_bridge(jn, polys, d, samples, n_inner, mode, inner_keys, inv)
         if b is not None:
             bridges.append(b)
     return bridges
 
 
-def joint_radii(polys, d: float, n_inner: int = 0) -> dict:
+def joint_radii(polys, d: float, n_inner: int = 0,
+                mode: str = FILLET_UNIFORM) -> dict:
     """Fillet back-off radius at every joint, keyed by a c-independent id.
 
     Discovers joints exactly like ``build_joint_bridges`` (corners where >= 2
     panels coincide) but, instead of the Bezier 'flower', returns each joint's
-    radius = d * min(0.5 * shortest leg, 0.25 * shortest inner-triangle edge).
+    representative radius (see ``_joint_radius_from_arms``): in ``"uniform"``
+    mode the single shared radius ``d * min`` of all arm bounds (0.5*len for a
+    T-to-T edge, 1.0*len for a leg); in ``"per-arm"`` mode the BINDING (minimum)
+    arm radius -- numerically the same value, with the other arms backing off
+    further. Either way it is the smallest radius at the joint, so the curve
+    stays well defined under both modes.
 
     The key is the sorted tuple of the joint's ``(polygon_index, vertex_index)``
     members. Those indices are fixed by the tiling topology -- the inner
@@ -312,11 +434,12 @@ def joint_radii(polys, d: float, n_inner: int = 0) -> dict:
     if scale < 1e-12:
         return {}
     tol = scale * 1e-6
+    inner_keys, inv = _inner_vertex_keys(polys, n_inner, tol)
     out: dict[tuple, float] = {}
     for jn in _find_junctions(polys, tol):
         jid = tuple(sorted((pi, vi) for pi, vi, _ in jn))
-        _, arms = _joint_arms(jn, polys, n_inner)
-        out[jid] = _joint_radius_from_arms(arms, d)
+        _, arms = _joint_arms(jn, polys, n_inner, inner_keys, inv)
+        out[jid] = _joint_radius_from_arms(arms, d, mode)
     return out
 
 
@@ -374,6 +497,56 @@ def _triangle_at(geom: "TilingGeometry", xy) -> int:
     inside = (u >= -1e-9) & (v >= -1e-9) & (w >= -1e-9)
     idx = np.where(inside)[0]
     return int(idx[0]) if idx.size else -1
+
+
+# Pixel radius for a ctrl-press "hit" -- both the vertex-pick (Task B) and the
+# legacy point-drag use the same threshold so they disambiguate consistently.
+_PICK_RADIUS_PX = 15.0
+
+
+def _classify_ctrl_press(
+    click_px, sel_vertices_px, all_points_px, threshold: float = _PICK_RADIUS_PX,
+):
+    """Disambiguate a ctrl-press into a per-vertex c-pick or a point-drag.
+
+    All coordinates are in pixel / screen space (matplotlib display coords):
+
+      click_px        : (2,)   the cursor position.
+      sel_vertices_px : (3, 2) screen positions of the *selected* triangle's
+                        three vertices, or ``None`` when no triangle is selected.
+      all_points_px   : (N, 2) screen positions of every Delaunay point.
+      threshold       : pixel radius for a hit (default ``_PICK_RADIUS_PX``).
+
+    Returns one of:
+
+      ``("vertex", local_index)`` -- the press is within ``threshold`` of one of
+            the selected triangle's vertices (the nearest such vertex). This
+            takes PRIORITY: even though that corner is also a draggable point,
+            and even if some other point is marginally closer, proximity to a
+            selected-triangle vertex always wins and yields a c-edit target
+            (no drag).
+      ``("drag", point_index)``  -- otherwise, the nearest of all points within
+            ``threshold`` -- the unchanged move-a-point behaviour.
+      ``(None, -1)``             -- nothing within ``threshold``.
+
+    Factored out of the GUI ``on_press`` so the pick-vs-drag rule is unit
+    testable without a live matplotlib canvas.
+    """
+    click = np.asarray(click_px, dtype=float)
+    if sel_vertices_px is not None:
+        sv = np.asarray(sel_vertices_px, dtype=float)
+        if sv.size:
+            dv = np.hypot(sv[:, 0] - click[0], sv[:, 1] - click[1])
+            j = int(np.argmin(dv))
+            if dv[j] <= threshold:
+                return ("vertex", j)
+    ap = np.asarray(all_points_px, dtype=float)
+    if ap.size:
+        dp = np.hypot(ap[:, 0] - click[0], ap[:, 1] - click[1])
+        i = int(np.argmin(dp))
+        if dp[i] <= threshold:
+            return ("drag", i)
+    return (None, -1)
 
 
 def _incenter(P: np.ndarray) -> np.ndarray:
@@ -633,13 +806,33 @@ def _build_link_indexing(
 def compute_T(geom: TilingGeometry, c) -> np.ndarray:
     """Inner-triangle vertices for every Delaunay triangle. Shape (M, 3, 2).
 
-    `c` may be a scalar (same shrink for all triangles) or a length-M array
-    (per-triangle shrink). T's depend only on c; theta does NOT move them.
+    `c` is the shrink factor and may be one of three shapes:
+
+    * **scalar**  -- one global shrink for every triangle/vertex.
+    * **(M,)**    -- per-triangle shrink: every vertex of triangle m uses c[m].
+    * **(M, 3)**  -- per-vertex shrink (Task B): ``T_i = C + c_i * (P_i - C)``
+                     with the three ``c_i`` of a triangle independent. Under a
+                     ``(M, 3)`` c the uniform-scaling identity
+                     ``T_i - T_j = c * (P_i - P_j)`` no longer holds and the
+                     inner triangle's edges change length independently.
+
+    The scalar and ``(M,)`` paths are unchanged from the per-triangle model.
+    T's depend only on c; theta does NOT move them.
     """
     c_arr = np.asarray(c, dtype=float)
     if c_arr.ndim == 0:
         return geom.C[:, None, :] + c_arr * geom.v
-    return geom.C[:, None, :] + c_arr[:, None, None] * geom.v
+    if c_arr.ndim == 1:
+        return geom.C[:, None, :] + c_arr[:, None, None] * geom.v
+    if c_arr.ndim == 2:
+        if c_arr.shape != geom.v.shape[:2]:
+            raise ValueError(
+                f"per-vertex c must have shape (M, 3) = {geom.v.shape[:2]}; "
+                f"got {tuple(c_arr.shape)}"
+            )
+        # Per-vertex: broadcast c_i over the xy axis. (M,1,2) + (M,3,1)*(M,3,2).
+        return geom.C[:, None, :] + c_arr[:, :, None] * geom.v
+    raise ValueError(f"c must be scalar, (M,), or (M, 3); got {c_arr.ndim}-D")
 
 
 def compute_feet(geom: TilingGeometry, T: np.ndarray) -> np.ndarray:
@@ -1100,15 +1293,23 @@ def show(
     * fillet -- joint smoothing fraction d in [0, 1]. At each joint (a T
                 corner where >=2 pieces meet) the incident edges are rounded by
                 a quadratic-Bezier bridge whose control point is the corner.
-                Every arm backs off from the corner by the SAME radius
-                d * min(1/2 * shortest leg, 1/4 * shortest inner-triangle edge),
-                whichever bound is smaller -- so the flower is symmetric and
-                never overruns the shortest leg's midpoint or a quarter of the
-                inner triangle. d = 0 -> sharp (panels meet at the single joint
-                point).
+                Each arm backs off from the corner by a fraction of its OWN
+                length and edge type: a T-to-T edge -- an inner-triangle edge OR
+                a link "cross-arm" joining two neighbouring inner triangles (a
+                purple-polygon face) -- by 1/2 its length (its MIDPOINT); a leg
+                (T -> foot) by its FULL length. Capping the T-to-T edges at their
+                midpoint stops the fillets sharing them from overlapping. How
+                those bounds combine depends on the "fillet mode" radio (below).
+                d = 0 -> sharp (panels meet at the single joint point).
 
     Radio buttons:
     * anchor -- point the T's shrink toward: "incenter" or "centroid".
+    * fillet mode -- how each joint's arms back off:
+        - "uniform": one shared radius d * min(1/2 * shortest T-to-T edge,
+          1.0 * shortest leg) for every arm -> a SYMMETRIC Bezier flower.
+        - "per-arm": each arm reaches its own bound (T-to-T edges -- inner edges
+          and link cross-arms -- to their midpoint, legs to their full length)
+          -> an ASYMMETRIC flower whose back-off points sit at different radii.
 
     Buttons:
     * "radius vs c" -- opens a SEPARATE window plotting each joint's Bezier
@@ -1121,8 +1322,15 @@ def show(
     * Shift-click a triangle -> select it; the c slider then edits only
         that triangle's c, AND that triangle becomes the BFS root that
         stays fixed during the theta sweep. Shift-click empty space to
-        deselect (root falls back to triangle 0).
-    * Ctrl-click-drag a point -> move it; re-triangulates live.
+        deselect (root falls back to triangle 0). Re-selecting clears any
+        active per-vertex c target.
+    * Ctrl-click NEAR one of the SELECTED triangle's three corners (within
+        15 px) -> pick that vertex as the per-vertex c target: the c slider
+        then edits only that vertex's c_i (T_i = C + c_i*(P_i - C)), leaving
+        the other two corners' c unchanged. The picked corner is starred.
+    * Ctrl-click-drag elsewhere (not within 15 px of a selected-triangle
+        corner) -> move the nearest point; re-triangulates live. With no
+        triangle selected, ctrl always drags (the legacy behaviour).
     * Alt-click -> add a new point at the cursor.
 
     Keys:
@@ -1148,10 +1356,13 @@ def show(
         "pts": np.asarray(points, dtype=float).copy(),
         "anchor": "incenter",
         "c_global": float(c_init),
-        "c_over": {},        # triangle index -> c override
+        "c_over": {},        # triangle index -> per-triangle c override
+        "c_vert_over": {},   # (triangle index, local vertex 0/1/2) -> per-vertex c
         "sel_tri": None,     # selected triangle (c editing target)
+        "sel_vtx": None,     # local vertex 0/1/2 of sel_tri picked as c target
         "drag": None,        # index of point currently being dragged
         "syncing": False,    # guard against slider set_val feedback
+        "fillet_mode": FILLET_UNIFORM,   # "uniform" | "per-arm" back-off
     }
 
     fig, ax = plt.subplots(figsize=(8, 8))
@@ -1198,6 +1409,12 @@ def show(
     ax.add_collection(inner_pc)
     ax.add_collection(joint_pc)
     pts_scatter = ax.scatter([], [], s=25, c="black", zorder=6)
+    # Highlight for the per-vertex c-edit target (Task B): a star on the picked
+    # corner of the selected triangle. Empty (hidden) until a vertex is picked.
+    vtx_marker = ax.scatter(
+        [], [], s=170, marker="*", facecolors="#ff3da6",
+        edgecolors="black", linewidths=0.7, zorder=9,
+    )
     title = ax.set_title("")
 
     # Generous fixed axis limits (extra room so spin doesn't clip the corners).
@@ -1208,13 +1425,38 @@ def show(
     ax.set_xlim(lo[0] - pad, hi[0] + pad)
     ax.set_ylim(lo[1] - pad, hi[1] + pad)
 
+    def tri_c_value(ti: int) -> float:
+        """Representative scalar c for a triangle: per-triangle override, else global."""
+        return float(state["c_over"].get(ti, state["c_global"]))
+
+    def vert_c_value(ti: int, lv: int) -> float:
+        """c for one vertex: per-vertex override, else the triangle's value."""
+        if (ti, lv) in state["c_vert_over"]:
+            return float(state["c_vert_over"][(ti, lv)])
+        return tri_c_value(ti)
+
     def effective_c() -> np.ndarray:
+        """Resolve the active shrink: scalar/(M,) fast path, or (M,3) per-vertex.
+
+        With no per-vertex overrides this returns the same length-M
+        per-triangle array as before (so compute_T takes the unchanged path).
+        Once any vertex is overridden it promotes to a (M, 3) array whose rows
+        start from each triangle's per-triangle/global c, then apply the
+        per-vertex overrides on top.
+        """
         geom = state["geom"]
-        arr = np.full(len(geom.triangles), state["c_global"], dtype=float)
+        M = len(geom.triangles)
+        base = np.full(M, state["c_global"], dtype=float)
         for i, cv in state["c_over"].items():
-            if 0 <= i < arr.size:
-                arr[i] = cv
-        return arr
+            if 0 <= i < M:
+                base[i] = cv
+        if not state["c_vert_over"]:
+            return base                                  # (M,) -- unchanged path
+        per_vertex = np.repeat(base[:, None], 3, axis=1)  # (M, 3)
+        for (i, lv), cv in state["c_vert_over"].items():
+            if 0 <= i < M and 0 <= lv < 3:
+                per_vertex[i, lv] = cv
+        return per_vertex
 
     def current_root() -> int:
         """Selected triangle becomes the BFS root; default 0."""
@@ -1254,6 +1496,13 @@ def show(
         else:
             P = spin_apply(geom.P[sel])
             sel_lc.set_segments([P[[0, 1]], P[[1, 2]], P[[2, 0]]])
+        # Picked-vertex highlight (Task B): star on the corner under c-edit.
+        lv = state["sel_vtx"]
+        if (sel is not None and lv is not None
+                and sel < len(geom.triangles) and 0 <= lv < 3):
+            vtx_marker.set_offsets(spin_apply(geom.P[sel, lv][None, :]))
+        else:
+            vtx_marker.set_offsets(np.empty((0, 2)))
 
     def redraw() -> None:
         geom = state["geom"]
@@ -1281,7 +1530,8 @@ def show(
         wing_pc.set_verts(wing_list)
         link_pc.set_verts(link_list)
         joint_pc.set_verts(build_joint_bridges(
-            inner_list + wing_list + link_list, d_fillet, len(inner_list)))
+            inner_list + wing_list + link_list, d_fillet, len(inner_list),
+            mode=state["fillet_mode"]))
 
         mn0, mx0 = _aabb(T0s, w0s)
         mnR, mxR = _aabb(Ts, ws)
@@ -1294,12 +1544,16 @@ def show(
         ratio = f" = {dw / dh:+.1f}" if abs(dh) > 1e-9 else ""
 
         sel = state["sel_tri"]
+        lv = state["sel_vtx"]
         if sel is None:
             ctxt = f"c = {state['c_global']:.3f}"
-            if state["c_over"]:
-                ctxt += f" (+{len(state['c_over'])} overrides)"
+            n_over = len(state["c_over"]) + len(state["c_vert_over"])
+            if n_over:
+                ctxt += f" (+{n_over} overrides)"
+        elif lv is not None:
+            ctxt = f"c[tri {sel}, v{lv}] = {vert_c_value(sel, lv):.3f}"
         else:
-            ctxt = f"c[tri {sel}] = {effective_c()[sel]:.3f}"
+            ctxt = f"c[tri {sel}] = {tri_c_value(sel):.3f}"
         title.set_text(
             f"{ctxt},  theta = {np.degrees(theta):5.1f},  spin = {s_spin.val:5.1f} deg,"
         )
@@ -1315,7 +1569,9 @@ def show(
         state["pts"] = np.asarray(new_pts, dtype=float)
         state["geom"] = geom
         state["c_over"] = {}
+        state["c_vert_over"] = {}
         state["sel_tri"] = None
+        state["sel_vtx"] = None
         redraw()
         return True
 
@@ -1323,15 +1579,20 @@ def show(
         """Pop up a separate window: each joint's fillet radius vs the shrink c.
 
         Sweeps the global c over the open interval (0, 1) and, at the current
-        fillet d, records the back-off radius (= d * min(1/2 shortest leg,
-        1/4 shortest inner edge)) at every joint. The radius is independent of theta/spin (those
-        are rigid moves), so the sweep is taken at theta = 0. Each joint is
-        tracked by its stable id, so its curve is continuous across the sweep;
-        the binding (smallest) radius is drawn bold and the current c is marked.
-        When the fillet slider is at 0 the plot shows the MAX radius (the d = 1
-        bound) instead, since the actual radius is just d times this.
+        fillet d, records each joint's representative back-off radius
+        (= d * min(1/2 shortest inner edge, 1.0 shortest leg)) at every joint.
+        In per-arm mode that representative value is the joint's BINDING
+        (minimum) arm radius -- which equals the uniform radius, with the other
+        arms reaching further -- so the curve is well defined in both modes (the
+        active mode is noted in the title). The radius is independent of
+        theta/spin (those are rigid moves), so the sweep is taken at theta = 0.
+        Each joint is tracked by its stable id, so its curve is continuous across
+        the sweep; the binding (smallest) radius is drawn bold and the current c
+        is marked. When the fillet slider is at 0 the plot shows the MAX radius
+        (the d = 1 bound) instead, since the actual radius is just d times this.
         """
         geom = state["geom"]
+        mode = state["fillet_mode"]
         d = float(s_fillet.val)
         d_plot = d if d > 1e-6 else 1.0
         n = 200
@@ -1342,7 +1603,7 @@ def show(
         per_joint: dict[tuple, np.ndarray] = {}
         for ci, cval in enumerate(cs):
             inner, wing, link = build_panels(geom, cval, 0.0, 0)
-            radii = joint_radii(inner + wing + link, d_plot, len(inner))
+            radii = joint_radii(inner + wing + link, d_plot, len(inner), mode)
             for jid, r in radii.items():
                 per_joint.setdefault(jid, np.full(n, np.nan))[ci] = r
 
@@ -1369,15 +1630,18 @@ def show(
                     label=f"current c = {c_now:.3f}")
 
         ax2.set_xlabel("c  (shrink factor)")
+        mode_lbl = ("per-arm: binding (min) arm radius"
+                    if mode == FILLET_PER_ARM else "uniform")
         if d > 1e-6:
             ax2.set_ylabel("fillet radius")
-            ttl = f"Fillet radius vs c   (fillet d = {d:.3f}, {len(curves)} joints)"
+            ttl = (f"Fillet radius vs c   (fillet d = {d:.3f}, mode = {mode_lbl}, "
+                   f"{len(curves)} joints)")
         else:
             ax2.set_ylabel("max fillet radius (at d = 1)")
             ttl = (f"Max fillet radius vs c   (d = 1; actual = d × this, "
-                   f"{len(curves)} joints)")
-        if state["c_over"]:
-            ttl += "\n[per-triangle c overrides ignored — global c sweep]"
+                   f"mode = {mode_lbl}, {len(curves)} joints)")
+        if state["c_over"] or state["c_vert_over"]:
+            ttl += "\n[per-triangle / per-vertex c overrides ignored — global c sweep]"
         ax2.set_title(ttl, fontsize=10)
         ax2.set_xlim(0.0, 1.0)
         ax2.set_ylim(bottom=0.0)
@@ -1413,13 +1677,34 @@ def show(
     btn_radius = Button(ax_btn, "radius vs c")
     btn_radius.on_clicked(_plot_radius_vs_c)
 
+    # ---- fillet-mode radio -------------------------------------------------
+    # uniform: one shared back-off radius per joint (symmetric flower).
+    # per-arm: each arm backs off by its own bound (asymmetric flower) --
+    #          inner edges to their midpoint, legs to their full length.
+    ax_fmode = plt.axes([0.005, 0.49, 0.135, 0.12])
+    ax_fmode.set_title("fillet mode", fontsize=9)
+    fmode_radio = RadioButtons(ax_fmode, (FILLET_UNIFORM, FILLET_PER_ARM), active=0)
+
+    def on_fillet_mode(label: str) -> None:
+        state["fillet_mode"] = label
+        redraw()
+    fmode_radio.on_clicked(on_fillet_mode)
+
     def on_c(val: float) -> None:
         if state["syncing"]:
             return
-        if state["sel_tri"] is not None:
-            state["c_over"][state["sel_tri"]] = val
+        sel = state["sel_tri"]
+        if sel is None:
+            state["c_global"] = val                       # global shrink
+        elif state["sel_vtx"] is not None:
+            state["c_vert_over"][(sel, state["sel_vtx"])] = val   # one vertex
         else:
-            state["c_global"] = val
+            # Triangle-level edit sets all three vertices uniformly, so drop any
+            # per-vertex overrides on this triangle (the inner triangle scales
+            # as a whole again).
+            state["c_over"][sel] = val
+            for k in [k for k in state["c_vert_over"] if k[0] == sel]:
+                del state["c_vert_over"][k]
         redraw()
     s_c.on_changed(on_c)
     s_th.on_changed(lambda _: redraw())
@@ -1436,19 +1721,34 @@ def show(
             return
         shift, ctrl, alt = _mods(event)
         if ctrl:
-            px = ax.transData.transform(spin_apply(state["pts"]))
-            d = np.hypot(px[:, 0] - event.x, px[:, 1] - event.y)
-            i = int(np.argmin(d))
-            if d[i] <= 15.0:
-                state["drag"] = i
+            geom = state["geom"]
+            pts_px = ax.transData.transform(spin_apply(state["pts"]))
+            sel = state["sel_tri"]
+            sel_px = None
+            if sel is not None and 0 <= sel < len(geom.triangles):
+                # The selected triangle's three corners, in local 0/1/2 order.
+                sel_px = ax.transData.transform(spin_apply(geom.P[sel]))
+            kind, idx = _classify_ctrl_press(
+                (event.x, event.y), sel_px, pts_px, _PICK_RADIUS_PX)
+            if kind == "vertex":
+                # Near a selected-triangle corner -> pick it as the c-edit
+                # target (no drag); sync the slider to that vertex's current c.
+                state["sel_vtx"] = idx
+                state["syncing"] = True
+                s_c.set_val(vert_c_value(sel, idx))
+                state["syncing"] = False
+                redraw()
+            elif kind == "drag":
+                state["drag"] = idx
         elif alt:
             rebuild(np.vstack([state["pts"], unspin(event.xdata, event.ydata)]))
         elif shift:
             ti = _triangle_at(state["geom"], unspin(event.xdata, event.ydata))
             state["sel_tri"] = ti if ti >= 0 else None
+            state["sel_vtx"] = None         # (re)selecting clears the vertex target
             if state["sel_tri"] is not None:
                 state["syncing"] = True
-                s_c.set_val(effective_c()[state["sel_tri"]])
+                s_c.set_val(tri_c_value(state["sel_tri"]))
                 state["syncing"] = False
             redraw()
 
@@ -1478,7 +1778,8 @@ def show(
         wing_list = [q for q, k in zip(quads, keep_wing) if k]
         link_list = [spin_apply(p) for p in compute_links(geom, c, theta, root)]
         bridges = build_joint_bridges(
-            inner_list + wing_list + link_list, s_fillet.val, len(inner_list))
+            inner_list + wing_list + link_list, s_fillet.val, len(inner_list),
+            mode=state["fillet_mode"])
         polys = inner_list + wing_list + link_list + bridges
         # Slab thickness: 5% of the in-plane bounding-box diagonal.
         allv = np.concatenate([np.asarray(p, float).reshape(-1, 2) for p in polys], axis=0)
@@ -1507,6 +1808,9 @@ def show(
             f"anchor={state['anchor']}  c_global={state['c_global']:.3f}  root={root}")
         if state["c_over"]:
             print("  c overrides:", {k: round(v, 3) for k, v in state["c_over"].items()})
+        if state["c_vert_over"]:
+            print("  c per-vertex overrides:",
+                  {f"t{k[0]}v{k[1]}": round(v, 3) for k, v in state["c_vert_over"].items()})
         print(f"\npoints ({len(pts_s)}):")
         for i, p in enumerate(pts_s):
             print(f"  P{i}: [{p[0]:.4f}, {p[1]:.4f}]")
@@ -1528,8 +1832,10 @@ def show(
     fig.canvas.mpl_connect("button_release_event", on_release)
     fig.canvas.mpl_connect("key_press_event", on_key)
 
-    print("Controls: shift-click triangle = per-tri c | ctrl-drag = move point"
+    print("Controls: shift-click triangle = per-tri c"
+        " | ctrl-click near selected-tri corner = per-vertex c | ctrl-drag = move point"
         " | alt-click = add point | fillet slider = smooth joints"
+        " | fillet-mode radio = uniform/per-arm back-off"
         " | 'radius vs c' button = plot fillet radius vs c"
         " | press 'c' = dump spun coords | press 'e' = export STL")
     refresh_static()

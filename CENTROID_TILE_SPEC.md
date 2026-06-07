@@ -146,25 +146,45 @@ Rigid kirigami opening, currently parameterized by a single angle `θ`:
 
 At each joint the incident edges are rounded by a quadratic-Bézier "flower":
 1. Collect the joint's **arms** — every edge leaving the joint centre. Each arm
-   carries `(unit_dir, leg_len, angle, is_inner_edge)`. An arm is an
-   **inner-triangle edge** (`is_inner_edge=True`) iff its source polygon is one
-   of the inner triangles (`pi < n_inner`); otherwise it is a **leg**
-   (a perpendicular wing leg, or a link cross-arm).
-2. Back every arm off from the centre by a **uniform radius**
+   carries `(unit_dir, leg_len, angle, is_inner_edge, tt_edge)`. `is_inner_edge`
+   is True iff the source polygon is one of the inner triangles (`pi < n_inner`).
+   `tt_edge` ("T-to-T") is True iff **both** endpoints are inner-triangle
+   vertices (T's) — that is, an inner-triangle edge **or** a link **cross-arm**
+   joining two T's of neighbouring triangles (a face of a purple link polygon).
+   Anything else is a **leg** (a perpendicular wing leg `T → foot`, etc.).
+2. Back every arm off from the centre by a distance bounded by a fraction of its
+   **own** length, set by the edge type (Task C bounds, now implemented):
+   - **T-to-T edge** (inner edge **or** link cross-arm) → `0.5 · (its length)`
+     (its **midpoint**). Both ends of a T-to-T edge are joints, so the midpoint
+     cap makes the two fillets meet there instead of **overrunning** each other.
+   - **leg** → `1.0 · (its full length)`.
+
+   How the per-arm bounds combine is set by the **fillet-mode** toggle
+   (`uniform` | `per-arm`):
    ```
-   radius = d · min( 0.5 · (shortest leg) , 0.25 · (shortest inner edge) )   (CURRENT)
+   uniform:  radius = d · min( 0.5 · (shortest T-to-T edge) , 1.0 · (shortest leg) )
+             (one shared radius → symmetric flower)
+   per-arm:  radius_k = d · bound_k                       (each arm its own bound
+             → asymmetric flower; back-off points at different radii)
    ```
-   where `d ∈ [0,1]` is the fillet slider.
-3. Sort the back-off points by angle; join consecutive ones with a quadratic
-   Bézier whose **control point is the joint centre**: arc
+   where `d ∈ [0,1]` is the fillet slider. (These replace the previous
+   `0.5·leg / 0.25·inner` uniform bounds. The leg bound now reaches the full
+   leg; every T-to-T edge — not just same-triangle inner edges — is capped at
+   its midpoint, which is what stops the per-arm/uniform flowers from
+   overlapping along the purple link faces at `d = 1`.)
+3. Take the back-off points in angular order; join consecutive ones with a
+   quadratic Bézier whose **control point is the joint centre**: arc
    `D_i → centre → D_{i+1}`.
 
 Sampling: `_quadratic_bezier(p0, p1, p2, n) = (1−t)²p0 + 2(1−t)t·p1 + t²p2`,
-`t ∈ [0,1]` linspace. Relevant functions: `_joint_arms`,
-`_joint_radius_from_arms`, `_build_joint_bridge`, `build_joint_bridges`,
-`joint_radii`.
+`t ∈ [0,1]` linspace. Relevant functions: `_joint_arms`, `_inner_vertex_keys`,
+`_arm_backoff_bound`, `_arm_radii`, `_joint_radius_from_arms`,
+`_build_joint_bridge`, `build_joint_bridges`, `joint_radii` (all take a `mode` of
+`"uniform"` | `"per-arm"`). The "radius vs c" plot reports, per joint, the
+**binding (min)** arm radius — which equals the uniform radius — and labels the
+active mode.
 
-> **Task C changes the bounds and adds a uniform/per-arm toggle (§4.3, §6).**
+> **Task C (new bounds + uniform/per-arm toggle) is implemented — see §4.3.**
 
 ### 2.8 STL export
 
